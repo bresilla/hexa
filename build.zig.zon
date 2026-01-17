@@ -1,0 +1,14 @@
+.{
+    .name = .blox,
+    .version = "0.1.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "shell",
+        "README.md",
+        "PLAN.md",
+    },
+    .dependencies = .{},
+    .fingerprint = 0x4d1d5cb6a52959c4,
+}
