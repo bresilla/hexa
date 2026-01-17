@@ -4,6 +4,7 @@ const c = @cImport({
     @cInclude("pty.h");
     @cInclude("unistd.h");
     @cInclude("stdlib.h");
+    @cInclude("sys/ioctl.h");
 });
 
 pub const Pty = struct {
@@ -11,16 +12,37 @@ pub const Pty = struct {
     child_pid: posix.pid_t,
 
     pub fn spawn(shell: []const u8) !Pty {
+        return spawnWithEnv(shell);
+    }
+
+    pub fn spawnWithEnv(shell: []const u8) !Pty {
         var master_fd: c_int = 0;
         var slave_fd: c_int = 0;
 
-        if (c.openpty(&master_fd, &slave_fd, null, null, null) != 0) {
+        // Get current terminal size to pass to the new PTY
+        var ws: c.winsize = undefined;
+        if (c.ioctl(posix.STDOUT_FILENO, c.TIOCGWINSZ, &ws) != 0) {
+            // Fallback to reasonable defaults
+            ws.ws_col = 80;
+            ws.ws_row = 24;
+            ws.ws_xpixel = 0;
+            ws.ws_ypixel = 0;
+        }
+
+        if (c.openpty(&master_fd, &slave_fd, null, null, &ws) != 0) {
             return error.OpenPtyFailed;
         }
 
         const pid = try posix.fork();
         if (pid == 0) {
+            // Create new session, becoming session leader
             _ = posix.setsid() catch posix.exit(1);
+
+            // Set the slave PTY as the controlling terminal
+            // TIOCSCTTY with arg 0 means "steal" controlling terminal if needed
+            if (c.ioctl(slave_fd, c.TIOCSCTTY, @as(c_int, 0)) != 0) {
+                // Non-fatal, some systems don't require this
+            }
 
             posix.dup2(@intCast(slave_fd), posix.STDIN_FILENO) catch posix.exit(1);
             posix.dup2(@intCast(slave_fd), posix.STDOUT_FILENO) catch posix.exit(1);
@@ -30,9 +52,11 @@ pub const Pty = struct {
 
             const shell_z = std.heap.c_allocator.dupeZ(u8, shell) catch posix.exit(1);
             var argv = [_:null]?[*:0]const u8{ shell_z, null };
-            var envp = [_:null]?[*:0]const u8{null};
 
-            posix.execvpeZ(shell_z, &argv, &envp) catch posix.exit(1);
+            // Build environment: inherit parent env + BOX=1 + TERM override
+            const envp = buildEnv() catch posix.exit(1);
+
+            posix.execvpeZ(shell_z, &argv, envp) catch posix.exit(1);
             unreachable;
         }
 
@@ -42,6 +66,31 @@ pub const Pty = struct {
             .master_fd = @intCast(master_fd),
             .child_pid = pid,
         };
+    }
+
+    fn buildEnv() ![*:null]const ?[*:0]const u8 {
+        const allocator = std.heap.c_allocator;
+        var env_list: std.ArrayList(?[*:0]const u8) = .empty;
+
+        // Copy parent environment, filtering out BOX and TERM
+        const environ = std.os.environ;
+        for (environ) |env_ptr| {
+            const env_str = std.mem.span(env_ptr);
+            // Skip BOX and TERM - we'll add our own
+            if (std.mem.startsWith(u8, env_str, "BOX=")) continue;
+            if (std.mem.startsWith(u8, env_str, "TERM=")) continue;
+            try env_list.append(allocator, env_ptr);
+        }
+
+        // Add our environment variables
+        try env_list.append(allocator, "BOX=1");
+        try env_list.append(allocator, "TERM=xterm-256color");
+
+        // Null-terminate
+        try env_list.append(allocator, null);
+
+        const slice = try env_list.toOwnedSlice(allocator);
+        return @ptrCast(slice.ptr);
     }
 
     pub fn read(self: Pty, buffer: []u8) !usize {
@@ -61,5 +110,44 @@ pub const Pty = struct {
     pub fn close(self: Pty) void {
         _ = posix.close(self.master_fd);
         _ = posix.waitpid(self.child_pid, 0);
+    }
+
+    // Set the terminal size (for window resize handling)
+    pub fn setSize(self: Pty, cols: u16, rows: u16) !void {
+        var ws: c.winsize = .{
+            .ws_col = cols,
+            .ws_row = rows,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
+        };
+        if (c.ioctl(self.master_fd, c.TIOCSWINSZ, &ws) != 0) {
+            return error.SetSizeFailed;
+        }
+    }
+
+    // Get current terminal size
+    pub fn getSize(self: Pty) !struct { cols: u16, rows: u16 } {
+        var ws: c.winsize = undefined;
+        if (c.ioctl(self.master_fd, c.TIOCGWINSZ, &ws) != 0) {
+            return error.GetSizeFailed;
+        }
+        return .{ .cols = ws.ws_col, .rows = ws.ws_row };
+    }
+};
+
+// Terminal size utilities
+pub const TermSize = struct {
+    cols: u16,
+    rows: u16,
+
+    pub fn fromStdout() TermSize {
+        var ws: c.winsize = undefined;
+        if (c.ioctl(posix.STDOUT_FILENO, c.TIOCGWINSZ, &ws) == 0) {
+            return .{
+                .cols = if (ws.ws_col > 0) ws.ws_col else 80,
+                .rows = if (ws.ws_row > 0) ws.ws_row else 24,
+            };
+        }
+        return .{ .cols = 80, .rows = 24 };
     }
 };

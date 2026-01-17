@@ -46,7 +46,8 @@ pub const Decorator = struct {
         var buttons: std.ArrayList(ButtonRegion) = .empty;
         defer buttons.deinit(self.allocator);
 
-        try output.append(self.allocator, '\n');
+        // Use \r\n for raw mode compatibility
+        try output.appendSlice(self.allocator, "\r\n");
 
         const status = if (block.exit_code orelse 0 == 0) "✓" else "✗";
         try output.appendSlice(self.allocator, status);
@@ -84,9 +85,9 @@ pub const Decorator = struct {
             });
         }
 
-        const remaining = if (width > output.items.len - 1) width - (output.items.len - 1) else 0;
+        const remaining = if (width > output.items.len - 2) width - (output.items.len - 2) else 0;
         try output.appendNTimes(self.allocator, self.separator_char, remaining);
-        try output.append(self.allocator, '\n');
+        try output.appendSlice(self.allocator, "\r\n");
 
         const y = self.cursor_row;
         self.cursor_row += 2;
@@ -146,11 +147,11 @@ pub const Decorator = struct {
         while (i < fill) : (i += 1) {
             try line1.appendSlice(self.allocator, "─");
         }
-        try line1.appendSlice(self.allocator, "┐\n");
+        try line1.appendSlice(self.allocator, "┐\r\n");
 
-        try output.appendSlice(self.allocator, "│\n");
+        try output.appendSlice(self.allocator, "│\r\n");
         try output.appendSlice(self.allocator, line1.items);
-        try output.appendSlice(self.allocator, "│\n");
+        try output.appendSlice(self.allocator, "│\r\n");
 
         const y = self.cursor_row;
         self.cursor_row += 3;
@@ -173,7 +174,7 @@ pub const Decorator = struct {
         var buttons: std.ArrayList(ButtonRegion) = .empty;
         defer buttons.deinit(self.allocator);
 
-        try output.append(self.allocator, '\n');
+        try output.appendSlice(self.allocator, "\r\n");
 
         const status = if (block.exit_code orelse 0 == 0) "✓" else "✗";
         try output.appendSlice(self.allocator, status);
@@ -206,7 +207,7 @@ pub const Decorator = struct {
             });
         }
 
-        try output.append(self.allocator, '\n');
+        try output.appendSlice(self.allocator, "\r\n");
 
         const y = self.cursor_row;
         self.cursor_row += 2;

@@ -129,18 +129,36 @@ fn printHelp() void {
         \\  mux help         Show this help
         \\
         \\Key bindings (prefix: Ctrl+A):
-        \\  prefix+|         Split horizontal
-        \\  prefix+-         Split vertical
-        \\  prefix+o         Next pane
-        \\  prefix+x         Close pane
-        \\  prefix+w         Next window
-        \\  prefix+W         Previous window
-        \\  prefix+n         New window
-        \\  prefix+s         New session
-        \\  prefix+l         List sessions
-        \\  prefix+0-9      Switch to session
-        \\  prefix+f         New floating pane
-        \\  prefix+F         Close floating pane
+        \\  Panes:
+        \\    prefix+|       Split horizontal
+        \\    prefix+-       Split vertical
+        \\    prefix+o       Next pane
+        \\    prefix+x       Close pane
+        \\    prefix+z       Zoom/unzoom pane (fullscreen)
+        \\
+        \\  Windows:
+        \\    prefix+n       New window
+        \\    prefix+w       Next window
+        \\    prefix+W       Previous window
+        \\
+        \\  Sessions:
+        \\    prefix+s       New session
+        \\    prefix+l       List sessions
+        \\    prefix+0-9     Switch to session
+        \\    prefix+d       Detach from session
+        \\
+        \\  Floating:
+        \\    prefix+f       New floating pane
+        \\    prefix+F       Close floating pane
+        \\
+        \\  Scrollback:
+        \\    prefix+[       Enter copy/scroll mode
+        \\    prefix+k       Scroll up
+        \\    prefix+j       Scroll down
+        \\    prefix+u       Page up
+        \\    prefix+D       Page down
+        \\    prefix+g       Scroll to top
+        \\    prefix+G       Scroll to bottom
         \\
     , .{});
 }

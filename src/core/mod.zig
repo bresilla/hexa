@@ -5,3 +5,4 @@ pub const mouse = @import("mouse.zig");
 pub const config = @import("config.zig");
 
 pub const Pty = pty.Pty;
+pub const TermSize = pty.TermSize;

@@ -40,4 +40,44 @@ pub const Block = struct {
         }
         return null;
     }
+
+    // Export block to markdown format
+    pub fn toMarkdown(self: *const Block, allocator: std.mem.Allocator) ![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(allocator);
+
+        // Header with block ID and exit code
+        _ = try output.writer(allocator).print("## Block {d}\n\n", .{self.id});
+
+        // Exit status
+        if (self.exit_code) |code| {
+            if (code == 0) {
+                try output.appendSlice(allocator, "**Status:** Success (exit code 0)\n\n");
+            } else {
+                _ = try output.writer(allocator).print("**Status:** Failed (exit code {d})\n\n", .{code});
+            }
+        } else {
+            try output.appendSlice(allocator, "**Status:** Unknown\n\n");
+        }
+
+        // Duration
+        if (self.durationSeconds()) |duration| {
+            _ = try output.writer(allocator).print("**Duration:** {d:.2}s\n\n", .{duration});
+        }
+
+        // Output in code block
+        try output.appendSlice(allocator, "```\n");
+        try output.appendSlice(allocator, self.output.items);
+        if (self.output.items.len > 0 and self.output.items[self.output.items.len - 1] != '\n') {
+            try output.append(allocator, '\n');
+        }
+        try output.appendSlice(allocator, "```\n\n");
+
+        return try output.toOwnedSlice(allocator);
+    }
+
+    // Export block output as plain text
+    pub fn toPlainText(self: *const Block) []const u8 {
+        return self.output.items;
+    }
 };

@@ -12,6 +12,15 @@ pub const Action = enum {
     switch_session,
     new_float,
     close_float,
+    detach,
+    scroll_up,
+    scroll_down,
+    scroll_page_up,
+    scroll_page_down,
+    scroll_top,
+    scroll_bottom,
+    zoom_pane,
+    copy_mode,
 };
 
 pub const InputHandler = struct {
@@ -53,6 +62,15 @@ pub const InputHandler = struct {
             if (key == 'l') return .list_sessions;
             if (key == 'f') return .new_float;
             if (key == 'F') return .close_float;
+            if (key == 'd') return .detach;
+            if (key == 'z') return .zoom_pane;
+            if (key == '[') return .copy_mode; // Enter scroll/copy mode
+            if (key == 'k') return .scroll_up;
+            if (key == 'j') return .scroll_down;
+            if (key == 'u') return .scroll_page_up; // Page up (half screen)
+            if (key == 'D') return .scroll_page_down; // Page down (half screen)
+            if (key == 'g') return .scroll_top;
+            if (key == 'G') return .scroll_bottom;
             if (key >= '0' and key <= '9') {
                 self.switch_session_index = key - '0';
                 return .none;

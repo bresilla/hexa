@@ -1,33 +1,71 @@
-#! /usr/bin/env bash
 # Box shell integration for bash
-# Add to ~/.config/blox/box.bash or source this file directly
+# Add to ~/.bashrc or source this file directly
 
 if [[ -n "$BOX" ]]; then
     # OSC 133 shell integration for box
 
+    # Store original PROMPT_COMMAND
+    __box_original_prompt_command="$PROMPT_COMMAND"
+
     # Prompt started (before prompt is displayed)
-    precmd() {
+    __box_prompt_start() {
         printf '\e]133;A\e\\'
     }
 
-    # Command started (after prompt, before user input)
-    # Bash doesn't have a direct hook for this, so we rely on PS1
-    PS1='$(printf '\''\e]133;B\e\\%s'\'' "$PS1")'
+    # Command finished (after command completes)
+    __box_command_end() {
+        local exit_code=$?
+        printf '\e]133;D;%d\e\\' "$exit_code"
+        return $exit_code
+    }
+
+    # Combined prompt command
+    __box_prompt_command() {
+        __box_command_end
+        __box_prompt_start
+        # Run original prompt command if it exists
+        if [[ -n "$__box_original_prompt_command" ]]; then
+            eval "$__box_original_prompt_command"
+        fi
+    }
+
+    PROMPT_COMMAND=__box_prompt_command
 
     # Command output started (after user presses Enter)
-    # In bash, we use DEBUG trap for this
-    trap '__box_preexec' DEBUG
+    # Using DEBUG trap to detect when a command is about to run
+    __box_preexec_enabled=1
     __box_preexec() {
-        if [[ -n "$COMP_LINE" ]]; then
-            # Not a command execution, skip
-            return
-        fi
+        # Skip if disabled or during prompt command
+        [[ -z "$__box_preexec_enabled" ]] && return
+        # Skip completion
+        [[ -n "$COMP_LINE" ]] && return
+        # Skip prompt command itself
+        [[ "$BASH_COMMAND" == "__box_prompt_command" ]] && return
+        [[ "$BASH_COMMAND" == "__box_command_end" ]] && return
+        [[ "$BASH_COMMAND" == "__box_prompt_start" ]] && return
+
         printf '\e]133;C\e\\'
+        # Disable until next prompt to avoid multiple emissions
+        __box_preexec_enabled=
     }
 
-    # Command finished (after command completes)
-    __box_precmd() {
-        printf '\e]133;D;%d\e\\' $?
+    # Re-enable preexec after prompt
+    __box_reenable_preexec() {
+        __box_preexec_enabled=1
     }
-    PROMPT_COMMAND='__box_precmd'
+
+    trap '__box_preexec' DEBUG
+
+    # Update prompt command to re-enable preexec
+    __box_prompt_command() {
+        __box_command_end
+        __box_prompt_start
+        __box_reenable_preexec
+        if [[ -n "$__box_original_prompt_command" ]]; then
+            eval "$__box_original_prompt_command"
+        fi
+    }
+
+    # Initial prompt start
+    __box_prompt_start
 fi

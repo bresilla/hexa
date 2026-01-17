@@ -11,6 +11,7 @@ pub const Window = struct {
     floating: std.ArrayList(FloatingPane) = .empty,
     active_index: usize = 0,
     active_floating: ?usize = null,
+    zoomed_pane: ?usize = null, // If set, this pane is fullscreen
 
     pub fn init(allocator: std.mem.Allocator, id: usize) !Window {
         var window = Window{
@@ -105,5 +106,47 @@ pub const Window = struct {
         if (self.active_index >= self.panes.items.len) {
             self.active_index = self.panes.items.len - 1;
         }
+    }
+
+    // Resize all panes in this window based on total terminal size
+    pub fn resizePanes(self: *Window, total_width: u16, total_height: u16) void {
+        if (self.panes.items.len == 0) return;
+
+        // If a pane is zoomed, give it full size
+        if (self.zoomed_pane) |zoomed_idx| {
+            if (zoomed_idx < self.panes.items.len) {
+                const pane_height = total_height -| 2;
+                self.panes.items[zoomed_idx].pty.setSize(total_width, pane_height) catch {};
+            }
+            return;
+        }
+
+        // Calculate layout (horizontal split for now)
+        const pane_count = self.panes.items.len;
+        const pane_width = total_width / @as(u16, @intCast(pane_count));
+        const pane_height = total_height -| 2; // Reserve space for tab bar and status
+
+        for (self.panes.items) |*pane| {
+            pane.pty.setSize(pane_width, pane_height) catch {};
+        }
+
+        // Resize floating panes too
+        for (self.floating.items) |*float| {
+            float.pty.setSize(float.rect.width -| 2, float.rect.height -| 2) catch {};
+        }
+    }
+
+    // Toggle zoom for the active pane
+    pub fn toggleZoom(self: *Window) void {
+        if (self.zoomed_pane != null) {
+            self.zoomed_pane = null;
+        } else {
+            self.zoomed_pane = self.active_index;
+        }
+    }
+
+    // Check if window is currently zoomed
+    pub fn isZoomed(self: *Window) bool {
+        return self.zoomed_pane != null;
     }
 };

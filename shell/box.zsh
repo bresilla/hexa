@@ -1,5 +1,5 @@
-//! Box shell integration for zsh
-/// Add to ~/.zshrc or source this file directly
+# Box shell integration for zsh
+# Add to ~/.zshrc or source this file directly
 
 if [[ -n "$BOX" ]]; then
     # OSC 133 shell integration for box

@@ -1,5 +1,5 @@
-//! Box shell integration for fish
-/// Add to ~/.config/fish/conf.d/box.fish
+# Box shell integration for fish
+# Add to ~/.config/fish/conf.d/box.fish
 
 if set -q BOX
     # Prompt started

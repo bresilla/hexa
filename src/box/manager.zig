@@ -5,6 +5,7 @@ pub const BlockManager = struct {
     allocator: std.mem.Allocator,
     blocks: std.ArrayList(Block) = .empty,
     current: ?usize = null,
+    selected: ?usize = null, // Currently selected block for navigation
     next_id: usize = 1,
 
     pub fn init(allocator: std.mem.Allocator) BlockManager {
@@ -59,5 +60,58 @@ pub const BlockManager = struct {
             }
         }
         return count;
+    }
+
+    // Navigate to previous block (Ctrl+Up)
+    pub fn selectPrev(self: *BlockManager) ?*Block {
+        if (self.blocks.items.len == 0) return null;
+
+        if (self.selected) |idx| {
+            if (idx > 0) {
+                self.selected = idx - 1;
+            }
+        } else {
+            // Start from the last block
+            self.selected = self.blocks.items.len - 1;
+        }
+
+        if (self.selected) |idx| {
+            return &self.blocks.items[idx];
+        }
+        return null;
+    }
+
+    // Navigate to next block (Ctrl+Down)
+    pub fn selectNext(self: *BlockManager) ?*Block {
+        if (self.blocks.items.len == 0) return null;
+
+        if (self.selected) |idx| {
+            if (idx + 1 < self.blocks.items.len) {
+                self.selected = idx + 1;
+            }
+        } else {
+            // Start from the first block
+            self.selected = 0;
+        }
+
+        if (self.selected) |idx| {
+            return &self.blocks.items[idx];
+        }
+        return null;
+    }
+
+    // Get currently selected block
+    pub fn getSelected(self: *BlockManager) ?*Block {
+        if (self.selected) |idx| {
+            if (idx < self.blocks.items.len) {
+                return &self.blocks.items[idx];
+            }
+        }
+        return null;
+    }
+
+    // Clear selection
+    pub fn clearSelection(self: *BlockManager) void {
+        self.selected = null;
     }
 };
