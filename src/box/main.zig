@@ -32,10 +32,13 @@ pub fn main() !void {
     defer manager.deinit();
     var decorator = Decorator.init(allocator);
     var keyboard = Keyboard.KeyboardHandler.init();
-    var mouse = Mouse.MouseHandler.init();
+    var mouse = Mouse.MouseHandler.init(allocator);
+    defer mouse.deinit();
 
-    const config = @import("config.zig").BoxConfig.load(allocator) catch .{};
+    const Config = @import("config.zig");
+    const config = Config.BoxConfig.load(allocator) catch Config.BoxConfig{};
     decorator.separator_char = config.separator_char;
+    decorator.style = if (std.mem.eql(u8, config.style, "box")) .box else if (std.mem.eql(u8, config.style, "minimal")) .minimal else .separator;
 
     try manager.startBlock();
 
@@ -57,7 +60,20 @@ pub fn main() !void {
             const bytes_read = try std.fs.File.stdin().read(&buffer);
             if (bytes_read > 0) {
                 if (Mouse.MouseHandler.isMouse(buffer[0..bytes_read])) {
-                    mouse.handle(buffer[0..bytes_read]);
+                    const action = mouse.handle(buffer[0..bytes_read]);
+                    switch (action) {
+                        .copy_latest => {
+                            if (manager.latest()) |block| {
+                                const osc52 = try Clipboard.buildOsc52(allocator, block.output.items);
+                                defer allocator.free(osc52);
+                                _ = try stdout.write(osc52);
+                            }
+                        },
+                        .toggle_collapse => {
+                            manager.toggleLatestCollapse();
+                        },
+                        .none => {},
+                    }
                     continue;
                 }
 
@@ -107,9 +123,10 @@ pub fn main() !void {
                         .command_end => {
                             manager.finishBlock(event.exit_code);
                             if (manager.latest()) |block| {
-                                const decoration = try decorator.render(block, 60);
-                                defer allocator.free(decoration);
-                                _ = try stdout.write(decoration);
+                                const result = try decorator.render(block, 60, &mouse);
+                                defer allocator.free(result.output);
+                                defer allocator.free(result.buttons);
+                                _ = try stdout.write(result.output);
                             }
                         },
                     }

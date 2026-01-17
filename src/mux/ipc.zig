@@ -20,7 +20,7 @@ pub const IpcServer = struct {
         const addr = try std.net.Address.initUnix(path);
 
         try posix.bind(fd, @ptrCast(&addr.any), addr.getOsSockLen());
-        try posix.listen(fd, 8);
+        try posix.listen(fd, 16);
         return IpcServer{ .fd = fd };
     }
 
@@ -29,6 +29,8 @@ pub const IpcServer = struct {
     }
 
     pub fn deinit(self: *IpcServer) void {
+        const path = SocketPath.get();
+        std.fs.deleteFileAbsolute(path) catch {};
         _ = posix.close(self.fd);
     }
 };
@@ -45,7 +47,13 @@ pub const IpcClient = struct {
         return IpcClient{ .fd = fd };
     }
 
-    pub fn deinit(self: *IpcClient) void {
+    pub fn deinit(self: *const IpcClient) void {
         _ = posix.close(self.fd);
+    }
+
+    pub fn isServerRunning() bool {
+        const path = SocketPath.get();
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
     }
 };

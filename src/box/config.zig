@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const BoxConfig = struct {
     separator_char: u8 = '=',
+    style: []const u8 = "separator",
 
     pub fn load(allocator: std.mem.Allocator) !BoxConfig {
         const path = try resolvePath(allocator);
@@ -19,6 +20,11 @@ pub const BoxConfig = struct {
             if (std.mem.startsWith(u8, line, "separator_char")) {
                 if (std.mem.indexOfScalar(u8, line, '"')) |idx| {
                     if (idx + 1 < line.len) config.separator_char = line[idx + 1];
+                }
+            } else if (std.mem.startsWith(u8, line, "style")) {
+                if (std.mem.indexOfScalar(u8, line, '"')) |idx| {
+                    const end = std.mem.indexOfScalarPos(u8, line, idx + 1, '"') orelse line.len;
+                    if (idx + 1 < end) config.style = try allocator.dupe(u8, line[idx + 1 .. end]);
                 }
             }
         }

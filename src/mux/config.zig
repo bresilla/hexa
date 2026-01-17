@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const MuxConfig = struct {
     shell: []const u8 = "/bin/sh",
+    use_box: bool = false,
 
     pub fn load(allocator: std.mem.Allocator) !MuxConfig {
         const path = try resolvePath(allocator);
@@ -23,6 +24,8 @@ pub const MuxConfig = struct {
                         config.shell = try allocator.dupe(u8, line[idx + 1 .. end]);
                     }
                 }
+            } else if (std.mem.startsWith(u8, line, "use_box")) {
+                config.use_box = std.mem.indexOf(u8, line, "true") != null;
             }
         }
         return config;
@@ -36,5 +39,13 @@ pub const MuxConfig = struct {
             return std.fs.path.join(allocator, &.{ dir, ".config", "blox", "mux.toml" });
         }
         return error.ConfigNotFound;
+    }
+
+    pub fn getShellCommand(self: MuxConfig, allocator: std.mem.Allocator) ![]const u8 {
+        if (self.use_box) {
+            const box_path = try allocator.dupeZ(u8, "box");
+            return std.fmt.allocPrint(allocator, "{s} {s}", .{ box_path, self.shell });
+        }
+        return allocator.dupe(u8, self.shell);
     }
 };
