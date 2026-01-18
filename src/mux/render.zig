@@ -210,9 +210,14 @@ pub const Renderer = struct {
                 var render_cell = Cell{};
                 render_cell.char = raw.codepoint();
 
+                // Ghostty uses codepoint 0 to represent an empty cell.
+                // We render that as a space so it actively clears old content.
+                if (render_cell.char == 0) {
+                    render_cell.char = ' ';
+                }
+
                 // Filter out control characters (including ESC).
-                // Note: we reserve codepoint 0 as an internal "do not render" sentinel.
-                if (render_cell.char != 0 and (render_cell.char < 32 or render_cell.char == 127)) {
+                if (render_cell.char < 32 or render_cell.char == 127) {
                     render_cell.char = ' ';
                 }
 
@@ -234,28 +239,29 @@ pub const Renderer = struct {
                     render_cell.char = ' ';
                 }
 
-                if (raw.style_id != 0) {
-                    const style = styles[xi];
-                    render_cell.fg = Color.fromStyleColor(style.fg_color);
-                    render_cell.bg = Color.fromStyleColor(style.bg_color);
-                    render_cell.bold = style.flags.bold;
-                    render_cell.italic = style.flags.italic;
-                    render_cell.faint = style.flags.faint;
-                    render_cell.underline = @enumFromInt(@intFromEnum(style.flags.underline));
-                    render_cell.strikethrough = style.flags.strikethrough;
-                    render_cell.inverse = style.flags.inverse;
-                } else {
-                    // Background-only cells can exist with default style
-                    switch (raw.content_tag) {
-                        .bg_color_palette => {
-                            render_cell.bg = .{ .palette = raw.content.color_palette };
-                        },
-                        .bg_color_rgb => {
-                            const rgb = raw.content.color_rgb;
-                            render_cell.bg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } };
-                        },
-                        else => {},
-                    }
+                // NOTE: always use the resolved style coming from RenderState.
+                // Even when `raw.style_id == 0`, the background/attributes can still
+                // differ due to erase operations (EL/ED) and default style changes.
+                const style = styles[xi];
+                render_cell.fg = Color.fromStyleColor(style.fg_color);
+                render_cell.bg = Color.fromStyleColor(style.bg_color);
+                render_cell.bold = style.flags.bold;
+                render_cell.italic = style.flags.italic;
+                render_cell.faint = style.flags.faint;
+                render_cell.underline = @enumFromInt(@intFromEnum(style.flags.underline));
+                render_cell.strikethrough = style.flags.strikethrough;
+                render_cell.inverse = style.flags.inverse;
+
+                // Background-only cells can exist and should override bg.
+                switch (raw.content_tag) {
+                    .bg_color_palette => {
+                        render_cell.bg = .{ .palette = raw.content.color_palette };
+                    },
+                    .bg_color_rgb => {
+                        const rgb = raw.content.color_rgb;
+                        render_cell.bg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } };
+                    },
+                    else => {},
                 }
 
                 self.setCell(offset_x + x, offset_y + y, render_cell);
@@ -268,13 +274,37 @@ pub const Renderer = struct {
     pub fn endFrame(self: *Renderer, force_full: bool) ![]const u8 {
         self.output.clearRetainingCapacity();
 
+        const width = self.next.width;
+        const height = self.next.height;
+
+        // Fast path: if nothing changed, emit nothing.
+        if (!force_full) {
+            var changed = false;
+            for (0..height) |yi| {
+                const y: u16 = @intCast(yi);
+                for (0..width) |xi| {
+                    const x: u16 = @intCast(xi);
+                    if (!self.current.getConst(x, y).eql(self.next.getConst(x, y))) {
+                        changed = true;
+                        break;
+                    }
+                }
+                if (changed) break;
+            }
+
+            if (!changed) {
+                std.mem.swap(CellBuffer, &self.current, &self.next);
+                return self.output.items;
+            }
+        }
+
         // Pre-allocate enough space for worst case (every cell changes with full color sequences)
         // Estimate: ~30 bytes per cell (position + color + char)
-        const estimated_size = @as(usize, self.next.width) * @as(usize, self.next.height) * 30;
+        const estimated_size = @as(usize, width) * @as(usize, height) * 30;
         try self.output.ensureTotalCapacity(self.allocator, estimated_size);
 
-        // Begin synchronized update, hide cursor, reset all attributes
-        // The SGR reset ensures we start from a known state
+        // Begin synchronized update, hide cursor, reset all attributes.
+        // The SGR reset ensures we start from a known state.
         try writeCSI(&self.output, self.allocator, "?2026h"); // begin sync
         try writeCSI(&self.output, self.allocator, "?25l"); // hide cursor
         try writeCSI(&self.output, self.allocator, "0m"); // reset attributes
@@ -287,40 +317,97 @@ pub const Renderer = struct {
         self.current_strikethrough = false;
         self.current_inverse = false;
 
-        const width = self.next.width;
-        const height = self.next.height;
-
         // Use a fixed buffer for building escape sequences to ensure atomic writes
         var seq_buf: [64]u8 = undefined;
 
         for (0..height) |yi| {
             const y: u16 = @intCast(yi);
 
-            // Position cursor at start of each row
+            var start_x: usize = 0;
+            if (!force_full) {
+                // Find the first differing cell in this row.
+                start_x = width;
+                for (0..width) |xi| {
+                    const old = self.current.getConst(@intCast(xi), y);
+                    const new = self.next.getConst(@intCast(xi), y);
+                    if (!old.eql(new)) {
+                        start_x = xi;
+                        break;
+                    }
+                }
+
+                if (start_x == width) {
+                    // No changes in this row.
+                    continue;
+                }
+            }
+
+            // Position cursor at start of the row.
             try writeCSIFmt(&self.output, self.allocator, &seq_buf, "{d};1H", .{y + 1});
 
-            for (0..width) |xi| {
-                const x: u16 = @intCast(xi);
+            var cursor_x: usize = 0;
 
-                const old = self.current.getConst(x, y);
-                const new = self.next.getConst(x, y);
+            // Skip to the first changed cell.
+            if (start_x > 0) {
+                try writeCSIFmt(&self.output, self.allocator, &seq_buf, "{d}C", .{start_x});
+                cursor_x = start_x;
+            }
 
-                // Always redraw all cells for debugging
-                _ = old;
-                _ = force_full;
+            var pending_skip: usize = 0;
+            for (start_x..width) |xi| {
+                const old = self.current.getConst(@intCast(xi), y);
+                const new = self.next.getConst(@intCast(xi), y);
 
-                // Wide-character spacer cells must still advance the cursor,
-                // but must not overwrite the wide glyph by printing anything.
-                if (new.char == 0) {
-                    try writeCSI(&self.output, self.allocator, "1C");
+                if (!force_full and old.eql(new)) {
+                    pending_skip += 1;
                     continue;
                 }
 
-                // Emit style changes
-                try self.emitStyleChanges(&seq_buf, new);
+                if (pending_skip > 0) {
+                    try writeCSIFmt(&self.output, self.allocator, &seq_buf, "{d}C", .{pending_skip});
+                    cursor_x += pending_skip;
+                    pending_skip = 0;
+                }
 
-                // Emit character - cursor auto-advances
+                // Wide-character spacer tail: advance cursor but don't overwrite.
+                if (new.char == 0) {
+                    try writeCSI(&self.output, self.allocator, "1C");
+                    cursor_x += 1;
+                    continue;
+                }
+
+                try self.emitStyleChanges(&seq_buf, new);
                 try self.emitChar(new.char);
+                cursor_x += 1;
+            }
+
+            // If the remainder of the row should be default blanks, explicitly
+            // clear it. This prevents style "spill" where background/underline
+            // can remain visible in unchanged trailing columns.
+            if (!force_full and cursor_x < width) {
+                var tail_is_default = true;
+                for (cursor_x..width) |xi| {
+                    const cell = self.next.getConst(@intCast(xi), y);
+                    if (cell.char != ' ' or cell.bold or cell.italic or cell.faint or cell.underline != .none or cell.strikethrough or cell.inverse or cell.fg != .none or cell.bg != .none) {
+                        tail_is_default = false;
+                        break;
+                    }
+                }
+
+                if (tail_is_default) {
+                    try writeCSI(&self.output, self.allocator, "0m");
+                    self.current_fg = .none;
+                    self.current_bg = .none;
+                    self.current_bold = false;
+                    self.current_italic = false;
+                    self.current_faint = false;
+                    self.current_underline = .none;
+                    self.current_strikethrough = false;
+                    self.current_inverse = false;
+
+                    // EL: erase to end of line using current (reset) SGR.
+                    try writeCSI(&self.output, self.allocator, "K");
+                }
             }
         }
 
