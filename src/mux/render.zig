@@ -239,20 +239,21 @@ pub const Renderer = struct {
                     render_cell.char = ' ';
                 }
 
-                // NOTE: always use the resolved style coming from RenderState.
-                // Even when `raw.style_id == 0`, the background/attributes can still
-                // differ due to erase operations (EL/ED) and default style changes.
-                const style = styles[xi];
-                render_cell.fg = Color.fromStyleColor(style.fg_color);
-                render_cell.bg = Color.fromStyleColor(style.bg_color);
-                render_cell.bold = style.flags.bold;
-                render_cell.italic = style.flags.italic;
-                render_cell.faint = style.flags.faint;
-                render_cell.underline = @enumFromInt(@intFromEnum(style.flags.underline));
-                render_cell.strikethrough = style.flags.strikethrough;
-                render_cell.inverse = style.flags.inverse;
+                // RenderState's per-cell `style` is only valid when `style_id != 0`.
+                // For default-style cells, the contents of `styles[xi]` are undefined.
+                if (raw.style_id != 0) {
+                    const style = styles[xi];
+                    render_cell.fg = Color.fromStyleColor(style.fg_color);
+                    render_cell.bg = Color.fromStyleColor(style.bg_color);
+                    render_cell.bold = style.flags.bold;
+                    render_cell.italic = style.flags.italic;
+                    render_cell.faint = style.flags.faint;
+                    render_cell.underline = @enumFromInt(@intFromEnum(style.flags.underline));
+                    render_cell.strikethrough = style.flags.strikethrough;
+                    render_cell.inverse = style.flags.inverse;
+                }
 
-                // Background-only cells can exist and should override bg.
+                // Background-only cells can exist with default style.
                 switch (raw.content_tag) {
                     .bg_color_palette => {
                         render_cell.bg = .{ .palette = raw.content.color_palette };
@@ -386,32 +387,29 @@ pub const Renderer = struct {
                 cursor_x += 1;
             }
 
-            // If the remainder of the row should be default blanks, explicitly
-            // clear it. This prevents style "spill" where background/underline
-            // can remain visible in unchanged trailing columns.
+            // If the remainder of the row is a uniform blank run, explicitly
+            // clear it via EL (erase to end of line). This prevents stale
+            // backgrounds/attrs from previous content from persisting when the
+            // model is "blank" but we didn't overwrite every trailing cell.
             if (!force_full and cursor_x < width) {
-                var tail_is_default = true;
-                for (cursor_x..width) |xi| {
-                    const cell = self.next.getConst(@intCast(xi), y);
-                    if (cell.char != ' ' or cell.bold or cell.italic or cell.faint or cell.underline != .none or cell.strikethrough or cell.inverse or cell.fg != .none or cell.bg != .none) {
-                        tail_is_default = false;
-                        break;
+                const base = self.next.getConst(@intCast(cursor_x), y);
+
+                // Only do this optimization for trailing blanks.
+                if (base.char == ' ') {
+                    var tail_uniform = true;
+                    for (cursor_x..width) |xi| {
+                        const cell = self.next.getConst(@intCast(xi), y);
+                        if (!cell.eql(base)) {
+                            tail_uniform = false;
+                            break;
+                        }
                     }
-                }
 
-                if (tail_is_default) {
-                    try writeCSI(&self.output, self.allocator, "0m");
-                    self.current_fg = .none;
-                    self.current_bg = .none;
-                    self.current_bold = false;
-                    self.current_italic = false;
-                    self.current_faint = false;
-                    self.current_underline = .none;
-                    self.current_strikethrough = false;
-                    self.current_inverse = false;
-
-                    // EL: erase to end of line using current (reset) SGR.
-                    try writeCSI(&self.output, self.allocator, "K");
+                    if (tail_uniform) {
+                        // Make sure the SGR state matches the blank tail.
+                        try self.emitStyleChanges(&seq_buf, base);
+                        try writeCSI(&self.output, self.allocator, "K");
+                    }
                 }
             }
         }
