@@ -81,7 +81,7 @@ pub const Layout = struct {
         const pane = try self.allocator.create(Pane);
         errdefer self.allocator.destroy(pane);
 
-        pane.* = try Pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
+        try pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
         errdefer pane.deinit();
 
         pane.focused = true;
@@ -116,7 +116,7 @@ pub const Layout = struct {
         const new_x = if (dir == .horizontal) focused.x + focused.width - new_width else focused.x;
         const new_y = if (dir == .vertical) focused.y + focused.height - new_height else focused.y;
 
-        new_pane.* = try Pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
+        try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
         errdefer new_pane.deinit();
 
         try self.panes.put(new_id, new_pane);

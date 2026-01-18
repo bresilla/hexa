@@ -5,6 +5,8 @@ const core = @import("core");
 const Pane = @import("pane.zig").Pane;
 const Layout = @import("layout.zig").Layout;
 const SplitDir = @import("layout.zig").SplitDir;
+const render = @import("render.zig");
+const Renderer = render.Renderer;
 
 const c = @cImport({
     @cInclude("sys/ioctl.h");
@@ -18,11 +20,13 @@ const State = struct {
     active_floating: ?usize,
     running: bool,
     needs_render: bool,
+    force_full_render: bool,
     term_width: u16,
     term_height: u16,
     status_height: u16,
+    renderer: Renderer,
 
-    fn init(allocator: std.mem.Allocator, width: u16, height: u16) State {
+    fn init(allocator: std.mem.Allocator, width: u16, height: u16) !State {
         const cfg = core.Config.load(allocator);
         const status_h: u16 = if (cfg.status_enabled) 1 else 0;
         return .{
@@ -33,9 +37,11 @@ const State = struct {
             .active_floating = null,
             .running = true,
             .needs_render = true,
+            .force_full_render = true,
             .term_width = width,
             .term_height = height,
             .status_height = status_h,
+            .renderer = try Renderer.init(allocator, width, height),
         };
     }
 
@@ -48,17 +54,26 @@ const State = struct {
         self.floating_panes.deinit(self.allocator);
         self.layout.deinit();
         self.config.deinit();
+        self.renderer.deinit();
     }
 };
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
+    // Redirect stderr to /dev/null to suppress ghostty warnings
+    // that would otherwise corrupt the display
+    const devnull = std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only }) catch null;
+    if (devnull) |f| {
+        posix.dup2(f.handle, posix.STDERR_FILENO) catch {};
+        f.close();
+    }
+
     // Get terminal size
     const size = getTermSize();
 
     // Initialize state
-    var state = State.init(allocator, size.cols, size.rows);
+    var state = try State.init(allocator, size.cols, size.rows);
     defer state.deinit();
 
     // Create first pane
@@ -68,14 +83,30 @@ pub fn main() !void {
     const orig_termios = try enableRawMode(posix.STDIN_FILENO);
     defer disableRawMode(posix.STDIN_FILENO, orig_termios) catch {};
 
-    // Enter alternate screen, hide cursor
+    // Enter alternate screen and reset it
     const stdout = std.fs.File.stdout();
-    try stdout.writeAll("\x1b[?1049h\x1b[?25l");
-    defer stdout.writeAll("\x1b[?25h\x1b[?1049l") catch {};
+    // Sequence:
+    // ESC[?1049h    - Enter alternate screen buffer (FIRST - before any reset)
+    // ESC[2J        - Clear entire alternate screen
+    // ESC[H         - Cursor to home position (1,1)
+    // ESC[0m        - Reset all SGR attributes
+    // ESC(B         - Set G0 charset to ASCII (US-ASCII)
+    // ESC)0         - Set G1 charset to DEC Special Graphics
+    // SI (0x0F)     - Shift In - select G0 charset
+    // ESC[?25l      - Hide cursor
+    // ESC[?1000h    - Enable mouse click tracking
+    // ESC[?1006h    - Enable SGR mouse mode
+    // Also clear scrollback (CSI 3 J) so we don't see prior content.
+    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1006h");
+    // On exit: disable mouse, show cursor, reset attributes, leave alternate screen
+    defer stdout.writeAll("\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
 
     // Build poll fds
     var poll_fds: [17]posix.pollfd = undefined; // stdin + up to 16 panes
-    var buffer: [8192]u8 = undefined;
+    var buffer: [32768]u8 = undefined; // Larger buffer for efficiency
+
+    // Frame timing
+    var last_render: i64 = std.time.milliTimestamp();
 
     // Main loop
     while (state.running) {
@@ -94,7 +125,11 @@ pub fn main() !void {
                 // Resize floating panes based on their stored percentages
                 resizeFloatingPanes(&state);
 
+                // Resize renderer and force full redraw
+                state.renderer.resize(new_size.cols, new_size.rows) catch {};
+                state.renderer.invalidate();
                 state.needs_render = true;
+                state.force_full_render = true;
             }
         }
 
@@ -172,7 +207,10 @@ pub fn main() !void {
             }
         }
 
-        const timeout: i32 = if (state.needs_render) 0 else 100;
+        // Calculate poll timeout - wait for next frame or input
+        const now = std.time.milliTimestamp();
+        const since_render = now - last_render;
+        const timeout: i32 = if (!state.needs_render) 100 else if (since_render >= 16) 0 else @intCast(16 - since_render);
         _ = posix.poll(poll_fds[0..fd_count], timeout) catch continue;
 
         // Handle stdin
@@ -182,7 +220,7 @@ pub fn main() !void {
             handleInput(&state, buffer[0..n]);
         }
 
-        // Handle PTY output and check for dead panes
+        // Handle PTY output
         var idx: usize = 1;
         var dead_panes: std.ArrayList(u16) = .empty;
         defer dead_panes.deinit(allocator);
@@ -202,7 +240,7 @@ pub fn main() !void {
             }
         }
 
-        // Handle floating pane output and check for dead floating panes
+        // Handle floating pane output
         var dead_floating: std.ArrayList(usize) = .empty;
         defer dead_floating.deinit(allocator);
 
@@ -255,10 +293,15 @@ pub fn main() !void {
             }
         }
 
-        // Render
+        // Render with frame rate limiting (max 60fps)
         if (state.needs_render) {
-            render(&state, stdout) catch {};
-            state.needs_render = false;
+            const render_now = std.time.milliTimestamp();
+            if (render_now - last_render >= 16) { // ~60fps
+                renderTo(&state, stdout) catch {};
+                state.needs_render = false;
+                state.force_full_render = false;
+                last_render = render_now;
+            }
         }
     }
 }
@@ -269,6 +312,14 @@ fn handleInput(state: *State, input: []const u8) void {
         // Check for Alt+key (ESC followed by key)
         if (input[i] == 0x1b and i + 1 < input.len) {
             const next = input[i + 1];
+            // Check for CSI sequences (ESC [)
+            if (next == '[' and i + 2 < input.len) {
+                // Handle scroll keys
+                if (handleScrollKeys(state, input[i..])) |consumed| {
+                    i += consumed;
+                    continue;
+                }
+            }
             // Make sure it's not an actual escape sequence (like arrow keys)
             if (next != '[' and next != 'O') {
                 if (handleAltKey(state, next)) {
@@ -284,17 +335,134 @@ fn handleInput(state: *State, input: []const u8) void {
             return;
         }
 
-        // Forward remaining input to focused pane
+        // If pane is scrolled and user types, scroll to bottom first
         if (state.active_floating) |idx| {
             const fpane = state.floating_panes.items[idx];
             if (fpane.visible) {
+                if (fpane.isScrolled()) {
+                    fpane.scrollToBottom();
+                    state.needs_render = true;
+                }
                 fpane.write(input[i..]) catch {};
             }
         } else if (state.layout.getFocusedPane()) |pane| {
+            if (pane.isScrolled()) {
+                pane.scrollToBottom();
+                state.needs_render = true;
+            }
             pane.write(input[i..]) catch {};
         }
         return;
     }
+}
+
+/// Handle scroll-related escape sequences
+/// Returns number of bytes consumed, or null if not a scroll sequence
+fn handleScrollKeys(state: *State, input: []const u8) ?usize {
+    // Must start with ESC [
+    if (input.len < 3 or input[0] != 0x1b or input[1] != '[') return null;
+
+    // Get the focused pane
+    const pane = if (state.active_floating) |idx|
+        state.floating_panes.items[idx]
+    else
+        state.layout.getFocusedPane() orelse return null;
+
+    // SGR mouse wheel: ESC [ < 64 ; x ; y M (up) or ESC [ < 65 ; x ; y M (down)
+    if (input.len >= 4 and input[2] == '<') {
+        // Find the 'M' or 'm' terminator
+        var end: usize = 3;
+        while (end < input.len and input[end] != 'M' and input[end] != 'm') : (end += 1) {}
+        if (end >= input.len) return null;
+
+        // Parse button number (first number after '<')
+        var btn: u8 = 0;
+        var i: usize = 3;
+        while (i < end and input[i] >= '0' and input[i] <= '9') : (i += 1) {
+            btn = btn * 10 + (input[i] - '0');
+        }
+
+        // Button 64 = wheel up, 65 = wheel down
+        if (btn == 64) {
+            pane.scrollUp(3);
+            state.needs_render = true;
+            return end + 1;
+        } else if (btn == 65) {
+            pane.scrollDown(3);
+            state.needs_render = true;
+            return end + 1;
+        }
+        // Other mouse events - consume but don't act
+        return end + 1;
+    }
+
+    // Page Up: ESC [ 5 ~
+    if (input.len >= 4 and input[2] == '5' and input[3] == '~') {
+        pane.scrollUp(pane.height / 2);
+        state.needs_render = true;
+        return 4;
+    }
+
+    // Page Down: ESC [ 6 ~
+    if (input.len >= 4 and input[2] == '6' and input[3] == '~') {
+        pane.scrollDown(pane.height / 2);
+        state.needs_render = true;
+        return 4;
+    }
+
+    // Shift+Page Up: ESC [ 5 ; 2 ~
+    if (input.len >= 6 and input[2] == '5' and input[3] == ';' and input[4] == '2' and input[5] == '~') {
+        pane.scrollUp(pane.height);
+        state.needs_render = true;
+        return 6;
+    }
+
+    // Shift+Page Down: ESC [ 6 ; 2 ~
+    if (input.len >= 6 and input[2] == '6' and input[3] == ';' and input[4] == '2' and input[5] == '~') {
+        pane.scrollDown(pane.height);
+        state.needs_render = true;
+        return 6;
+    }
+
+    // Home (scroll to top): ESC [ H or ESC [ 1 ~
+    if (input.len >= 3 and input[2] == 'H') {
+        pane.scrollToTop();
+        state.needs_render = true;
+        return 3;
+    }
+    if (input.len >= 4 and input[2] == '1' and input[3] == '~') {
+        pane.scrollToTop();
+        state.needs_render = true;
+        return 4;
+    }
+
+    // End (scroll to bottom): ESC [ F or ESC [ 4 ~
+    if (input.len >= 3 and input[2] == 'F') {
+        pane.scrollToBottom();
+        state.needs_render = true;
+        return 3;
+    }
+    if (input.len >= 4 and input[2] == '4' and input[3] == '~') {
+        pane.scrollToBottom();
+        state.needs_render = true;
+        return 4;
+    }
+
+    // Shift+Up: ESC [ 1 ; 2 A - scroll up one line
+    if (input.len >= 6 and input[2] == '1' and input[3] == ';' and input[4] == '2' and input[5] == 'A') {
+        pane.scrollUp(1);
+        state.needs_render = true;
+        return 6;
+    }
+
+    // Shift+Down: ESC [ 1 ; 2 B - scroll down one line
+    if (input.len >= 6 and input[2] == '1' and input[3] == ';' and input[4] == '2' and input[5] == 'B') {
+        pane.scrollDown(1);
+        state.needs_render = true;
+        return 6;
+    }
+
+    return null;
 }
 
 fn handleAltKey(state: *State, key: u8) bool {
@@ -480,7 +648,7 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef) !void {
     const content_h = outer_h -| (pad_y * 2);
 
     const id: u16 = @intCast(100 + state.floating_panes.items.len);
-    pane.* = try Pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command);
+    try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command);
     pane.floating = true;
     pane.focused = true;
     pane.visible = true;
@@ -504,43 +672,61 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef) !void {
     state.active_floating = state.floating_panes.items.len - 1;
 }
 
-fn render(state: *State, stdout: std.fs.File) !void {
-    const allocator = state.allocator;
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
+fn renderTo(state: *State, stdout: std.fs.File) !void {
+    const renderer = &state.renderer;
 
-    // Begin synchronized output (reduces flicker) and hide cursor
-    // We don't clear screen - just overwrite content to reduce flicker
-    try output.appendSlice(allocator, "\x1b[?2026h\x1b[?25l");
+    // Begin a new frame
+    renderer.beginFrame();
 
-    // Render tiled panes
+    // Draw tiled panes into the cell buffer
     var pane_it = state.layout.paneIterator();
     while (pane_it.next()) |pane| {
-        try pane.*.render(allocator, &output);
+        const render_state = pane.*.getRenderState() catch continue;
+        renderer.drawRenderState(render_state, pane.*.x, pane.*.y, pane.*.width, pane.*.height);
+
+        const is_scrolled = pane.*.isScrolled();
+
+        // Draw scroll indicator if pane is scrolled
+        if (is_scrolled) {
+            drawScrollIndicator(renderer, pane.*.x, pane.*.y, pane.*.width);
+        }
     }
 
-    // Only draw split borders when there are multiple panes
+    // Draw split borders when there are multiple panes
     if (state.layout.paneCount() > 1) {
-        try renderSplitBorders(state, allocator, &output);
+        drawSplitBorders(state, renderer);
     }
 
-    // Render visible floating panes (on top)
+    // Draw visible floating panes (on top of tiled panes)
     for (state.floating_panes.items, 0..) |pane, i| {
         if (!pane.visible) continue;
-        try pane.render(allocator, &output);
 
+        // First draw the border (which clears the area)
         const is_active = state.active_floating == i;
-        // Use per-pane border settings
         const title = if (pane.show_title) pane.name else "";
-        try renderFloatingBorder(allocator, &output, pane.border_x, pane.border_y, pane.border_w, pane.border_h, is_active, title, pane.border_color);
+        drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, is_active, title, pane.border_color);
+
+        // Then draw the pane content
+        const render_state = pane.getRenderState() catch continue;
+        renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
+
+        const is_scrolled = pane.isScrolled();
+
+        // Draw scroll indicator if pane is scrolled
+        if (is_scrolled) {
+            drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
+        }
     }
 
-    // Render status bar if enabled
+    // Draw status bar if enabled
     if (state.config.status_enabled) {
-        try renderStatusBar(state, allocator, &output);
+        drawStatusBar(state, renderer);
     }
 
-    // Position cursor and get style from focused pane
+    // End frame with differential render
+    const output = try renderer.endFrame(state.force_full_render);
+
+    // Get cursor info
     var cursor_x: u16 = 1;
     var cursor_y: u16 = 1;
     var cursor_style: u8 = 0;
@@ -561,18 +747,43 @@ fn render(state: *State, stdout: std.fs.File) !void {
         cursor_visible = pane.isCursorVisible();
     }
 
-    // Set cursor style (DECSCUSR), position, visibility, and end sync
-    try output.writer(allocator).print("\x1b[{d} q\x1b[{d};{d}H", .{ cursor_style, cursor_y, cursor_x });
-    if (cursor_visible) {
-        try output.appendSlice(allocator, "\x1b[?25h");
-    }
-    try output.appendSlice(allocator, "\x1b[?2026l");
+    // Build cursor sequences
+    var cursor_buf: [64]u8 = undefined;
+    var cursor_len: usize = 0;
 
-    try stdout.writeAll(output.items);
+    const style_seq = std.fmt.bufPrint(cursor_buf[cursor_len..], "\x1b[{d} q", .{cursor_style}) catch "";
+    cursor_len += style_seq.len;
+
+    const pos_seq = std.fmt.bufPrint(cursor_buf[cursor_len..], "\x1b[{d};{d}H", .{ cursor_y, cursor_x }) catch "";
+    cursor_len += pos_seq.len;
+
+    if (cursor_visible) {
+        const show_seq = "\x1b[?25h";
+        @memcpy(cursor_buf[cursor_len..][0..show_seq.len], show_seq);
+        cursor_len += show_seq.len;
+    }
+
+    // Write everything as a single iovec list.
+    //
+    // IMPORTANT: terminal writes can be partial. If we don't fully flush the
+    // whole frame, the outer terminal can see truncated CSI/SGR sequences,
+    // which matches the observed "38;5;240m" / "[m" garbage artifacts.
+    var iovecs = [_]std.posix.iovec_const{
+        .{ .base = output.ptr, .len = output.len },
+        .{ .base = &cursor_buf, .len = cursor_len },
+    };
+    try stdout.writevAll(iovecs[0..]);
 }
 
-fn renderSplitBorders(state: *State, allocator: std.mem.Allocator, output: *std.ArrayList(u8)) !void {
-    try output.appendSlice(allocator, "\x1b[90m"); // gray
+fn drawSplitBorders(state: *State, renderer: *Renderer) void {
+    const border_cell = render.Cell{
+        .char = '│',
+        .fg = .{ .palette = 8 }, // gray
+    };
+    const h_border_cell = render.Cell{
+        .char = '─',
+        .fg = .{ .palette = 8 }, // gray
+    };
 
     // Find split lines by checking pane boundaries
     var pane_it = state.layout.paneIterator();
@@ -583,103 +794,137 @@ fn renderSplitBorders(state: *State, allocator: std.mem.Allocator, output: *std.
         // Draw vertical separator if pane doesn't reach right edge
         if (right_edge < state.term_width) {
             for (0..pane.*.height) |row| {
-                try output.writer(allocator).print("\x1b[{d};{d}H│", .{
-                    pane.*.y + @as(u16, @intCast(row)) + 1,
-                    right_edge + 1,
-                });
+                renderer.setCell(right_edge, pane.*.y + @as(u16, @intCast(row)), border_cell);
             }
         }
 
         // Draw horizontal separator if pane doesn't reach bottom
         if (bottom_edge < state.term_height - state.status_height) {
-            try output.writer(allocator).print("\x1b[{d};{d}H", .{ bottom_edge + 1, pane.*.x + 1 });
-            for (0..pane.*.width) |_| {
-                try output.appendSlice(allocator, "─");
+            for (0..pane.*.width) |col| {
+                renderer.setCell(pane.*.x + @as(u16, @intCast(col)), bottom_edge, h_border_cell);
             }
         }
     }
-
-    try output.appendSlice(allocator, "\x1b[0m");
 }
 
-fn renderFloatingBorder(allocator: std.mem.Allocator, output: *std.ArrayList(u8), x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8, border_color: u8) !void {
-    // Use configured color, brighter when active
-    if (active) {
-        // Bright version of the color (add 8 for bright colors, or use bold)
-        try output.writer(allocator).print("\x1b[1;38;5;{d}m", .{border_color});
-    } else {
-        try output.writer(allocator).print("\x1b[38;5;{d}m", .{border_color});
+fn drawScrollIndicator(renderer: *Renderer, pane_x: u16, pane_y: u16, pane_width: u16) void {
+    // Display a scroll indicator at top-right of pane
+    const indicator = " \xe2\x96\xb2\xe2\x96\xb2\xe2\x96\xb2 "; // " ▲▲▲ "
+    const indicator_chars = [_]u21{ ' ', 0x25b2, 0x25b2, 0x25b2, ' ' };
+
+    // Position at top-right corner (inside pane bounds)
+    const indicator_len: u16 = 5;
+    const x_pos = pane_x + pane_width -| indicator_len;
+
+    // Yellow background (palette 3), black text (palette 0)
+    for (indicator_chars, 0..) |char, i| {
+        renderer.setCell(x_pos + @as(u16, @intCast(i)), pane_y, .{
+            .char = char,
+            .fg = .{ .palette = 0 }, // black
+            .bg = .{ .palette = 3 }, // yellow
+        });
+    }
+    _ = indicator;
+}
+
+fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8, border_color: u8) void {
+    const fg: render.Color = .{ .palette = border_color };
+    const bold = active;
+
+    // Clear the interior with spaces first
+    for (1..h -| 1) |row| {
+        for (1..w -| 1) |col| {
+            renderer.setCell(x + @as(u16, @intCast(col)), y + @as(u16, @intCast(row)), .{
+                .char = ' ',
+            });
+        }
     }
 
-    // Top border with title
-    try output.writer(allocator).print("\x1b[{d};{d}H", .{ y + 1, x + 1 });
-    try output.appendSlice(allocator, "╭");
+    // Top-left corner
+    renderer.setCell(x, y, .{ .char = 0x256D, .fg = fg, .bold = bold }); // ╭
 
-    // Build title with name (if provided)
+    // Top border with optional title
     if (name.len > 0) {
         var title_buf: [32]u8 = undefined;
         const title = std.fmt.bufPrint(&title_buf, "[ {s} ]", .{name}) catch "[ float ]";
-        const title_start = (w -| title.len) / 2;
+        const title_start = @as(usize, (w -| 2) -| title.len) / 2;
 
         for (0..w -| 2) |col| {
-            if (col >= title_start and col < title_start + title.len) {
-                try output.append(allocator, title[col - title_start]);
-            } else {
-                try output.appendSlice(allocator, "─");
-            }
+            const char: u21 = if (col >= title_start and col < title_start + title.len)
+                title[col - title_start]
+            else
+                0x2500; // ─
+            renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = char, .fg = fg, .bold = bold });
         }
     } else {
-        // No title, just draw the line
-        for (0..w -| 2) |_| {
-            try output.appendSlice(allocator, "─");
+        for (0..w -| 2) |col| {
+            renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = 0x2500, .fg = fg, .bold = bold }); // ─
         }
     }
-    try output.appendSlice(allocator, "╮");
+
+    // Top-right corner
+    renderer.setCell(x + w - 1, y, .{ .char = 0x256E, .fg = fg, .bold = bold }); // ╮
 
     // Side borders
     for (1..h -| 1) |row| {
-        try output.writer(allocator).print("\x1b[{d};{d}H│", .{ y + @as(u16, @intCast(row)) + 1, x + 1 });
-        try output.writer(allocator).print("\x1b[{d};{d}H│", .{ y + @as(u16, @intCast(row)) + 1, x + w });
+        renderer.setCell(x, y + @as(u16, @intCast(row)), .{ .char = 0x2502, .fg = fg, .bold = bold }); // │
+        renderer.setCell(x + w - 1, y + @as(u16, @intCast(row)), .{ .char = 0x2502, .fg = fg, .bold = bold }); // │
     }
+
+    // Bottom-left corner
+    renderer.setCell(x, y + h - 1, .{ .char = 0x2570, .fg = fg, .bold = bold }); // ╰
 
     // Bottom border
-    try output.writer(allocator).print("\x1b[{d};{d}H", .{ y + h, x + 1 });
-    try output.appendSlice(allocator, "╰");
-    for (0..w -| 2) |_| {
-        try output.appendSlice(allocator, "─");
+    for (0..w -| 2) |col| {
+        renderer.setCell(x + @as(u16, @intCast(col)) + 1, y + h - 1, .{ .char = 0x2500, .fg = fg, .bold = bold }); // ─
     }
-    try output.appendSlice(allocator, "╯");
 
-    try output.appendSlice(allocator, "\x1b[0m");
+    // Bottom-right corner
+    renderer.setCell(x + w - 1, y + h - 1, .{ .char = 0x256F, .fg = fg, .bold = bold }); // ╯
 }
 
-fn renderStatusBar(state: *State, allocator: std.mem.Allocator, output: *std.ArrayList(u8)) !void {
-    const y = state.term_height;
+fn drawStatusBar(state: *State, renderer: *Renderer) void {
+    const y = state.term_height - 1; // 0-indexed
 
-    // Background
-    try output.writer(allocator).print("\x1b[{d};1H\x1b[44m\x1b[37m", .{y}); // blue bg, white fg
-
-    // Fill with spaces first
-    for (0..state.term_width) |_| {
-        try output.append(allocator, ' ');
+    // Fill with spaces (blue bg, white fg)
+    for (0..state.term_width) |xi| {
+        renderer.setCell(@intCast(xi), y, .{
+            .char = ' ',
+            .fg = .{ .palette = 15 }, // white
+            .bg = .{ .palette = 4 }, // blue
+        });
     }
-
-    // Go back to start of line
-    try output.writer(allocator).print("\x1b[{d};1H", .{y});
 
     // Left side: pane info
     const pane_count = state.layout.paneCount();
     const float_count = state.floating_panes.items.len;
-    try output.writer(allocator).print(" [{d}]", .{pane_count});
+
+    var left_buf: [32]u8 = undefined;
+    var left_text: []const u8 = undefined;
     if (float_count > 0) {
-        try output.writer(allocator).print(" +{d}f", .{float_count});
+        left_text = std.fmt.bufPrint(&left_buf, " [{d}] +{d}f", .{ pane_count, float_count }) catch " [?]";
+    } else {
+        left_text = std.fmt.bufPrint(&left_buf, " [{d}]", .{pane_count}) catch " [?]";
+    }
+
+    for (left_text, 0..) |char, i| {
+        renderer.setCell(@intCast(i), y, .{
+            .char = char,
+            .fg = .{ .palette = 15 }, // white
+            .bg = .{ .palette = 4 }, // blue
+        });
     }
 
     // Right side: help hints
     const help = " Alt+h/v:split Alt+n:next Alt+q:quit ";
-    try output.writer(allocator).print("\x1b[{d};{d}H{s}", .{ y, state.term_width - help.len + 1, help });
-
-    try output.appendSlice(allocator, "\x1b[0m");
+    const help_start = state.term_width -| @as(u16, @intCast(help.len));
+    for (help, 0..) |char, i| {
+        renderer.setCell(help_start + @as(u16, @intCast(i)), y, .{
+            .char = char,
+            .fg = .{ .palette = 15 }, // white
+            .bg = .{ .palette = 4 }, // blue
+        });
+    }
 }
 
 fn getTermSize() struct { cols: u16, rows: u16 } {

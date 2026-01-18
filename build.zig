@@ -38,6 +38,23 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(mux_exe);
 
+    // Build smux executable (single-pane, full redraw)
+    const smux_root = b.createModule(.{
+        .root_source_file = b.path("src/smux/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    smux_root.addImport("core", core_module);
+    if (ghostty_vt_mod) |vt| {
+        smux_root.addImport("ghostty-vt", vt);
+    }
+    const smux_exe = b.addExecutable(.{
+        .name = "smux",
+        .root_module = smux_root,
+    });
+    b.installArtifact(smux_exe);
+
     // Run step
     const run_mux = b.addRunArtifact(mux_exe);
     run_mux.step.dependOn(b.getInstallStep());
@@ -46,4 +63,9 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("run", "Run hexa-mux");
     run_step.dependOn(&run_mux.step);
+
+    const run_smux = b.addRunArtifact(smux_exe);
+    run_smux.step.dependOn(b.getInstallStep());
+    const smux_step = b.step("smux", "Run smux");
+    smux_step.dependOn(&run_smux.step);
 }

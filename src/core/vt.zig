@@ -4,33 +4,45 @@ const std = @import("std");
 pub const ghostty = @import("ghostty-vt");
 pub const Terminal = ghostty.Terminal;
 
+const ReadonlyStream = @TypeOf((@as(*Terminal, undefined)).vtStream());
+
 /// Thin wrapper around ghostty Terminal
 pub const VT = struct {
-    allocator: std.mem.Allocator,
-    terminal: Terminal,
-    width: u16,
-    height: u16,
+    allocator: std.mem.Allocator = undefined,
+    terminal: Terminal = undefined,
+    stream: ReadonlyStream = undefined,
+    render_state: ghostty.RenderState = .empty,
+    width: u16 = 0,
+    height: u16 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, width: u16, height: u16) !VT {
-        return .{
-            .allocator = allocator,
-            .terminal = try Terminal.init(allocator, .{
-                .cols = width,
-                .rows = height,
-            }),
-            .width = width,
-            .height = height,
-        };
+    /// Initialize the VT in-place.
+    ///
+    /// IMPORTANT: Ghostty terminal state must not be moved after initialization.
+    /// This function initializes fields directly on `self` so the terminal lives
+    /// at its final stable address.
+    pub fn init(self: *VT, allocator: std.mem.Allocator, width: u16, height: u16) !void {
+        self.* = .{ .allocator = allocator, .width = width, .height = height };
+
+        self.terminal = try Terminal.init(allocator, .{ .cols = width, .rows = height });
+        errdefer self.terminal.deinit(allocator);
+
+        self.stream = self.terminal.vtStream();
+        self.render_state = .empty;
     }
 
     pub fn deinit(self: *VT) void {
+        self.render_state.deinit(self.allocator);
+        self.stream.deinit();
         self.terminal.deinit(self.allocator);
+        self.* = undefined;
     }
 
-    /// Process input data through the terminal emulator
+    /// Process input data through the terminal emulator.
+    ///
+    /// We must reuse the same stream across calls so the parser can maintain
+    /// state for sequences that arrive split across PTY reads.
     pub fn feed(self: *VT, data: []const u8) !void {
-        var stream = self.terminal.vtStream();
-        try stream.nextSlice(data);
+        try self.stream.nextSlice(data);
     }
 
     /// Resize the virtual terminal
@@ -74,5 +86,15 @@ pub const VT = struct {
     pub fn getPwd(self: *VT) ?[]const u8 {
         if (self.terminal.pwd.items.len == 0) return null;
         return self.terminal.pwd.items;
+    }
+
+    /// Update and return a stable snapshot of the currently visible viewport.
+    ///
+    /// This uses ghostty's `RenderState` which duplicates any managed cell data
+    /// required for rendering. Reading cells via `PageList` directly can be
+    /// fragile when pins/pages are shifting due to scrollback or resize.
+    pub fn getRenderState(self: *VT) !*const ghostty.RenderState {
+        try self.render_state.update(self.allocator, &self.terminal);
+        return &self.render_state;
     }
 };
