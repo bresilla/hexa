@@ -88,13 +88,13 @@ pub const Server = struct {
             // Check server socket for new connections
             if (poll_fds.items[0].revents & posix.POLL.IN != 0) {
                 if (self.socket.tryAccept() catch null) |conn| {
-                    const client_id = try self.ses_state.addClient(conn.fd);
+                    // Don't add as client yet - wait until they create a pane
+                    // This prevents --list and other queries from being counted as muxes
                     try poll_fds.append(self.allocator, .{
                         .fd = conn.fd,
                         .events = posix.POLL.IN,
                         .revents = 0,
                     });
-                    _ = client_id;
                 }
             }
 
@@ -121,11 +121,12 @@ pub const Server = struct {
                         const line = conn.recvLine(&buf) catch null;
 
                         if (line) |msg| {
-                            if (client_id) |cid| {
-                                self.handleMessage(&conn, cid, msg) catch |err| {
-                                    self.sendError(&conn, @errorName(err)) catch {};
-                                };
-                            }
+                            // Handle message - pass optional client_id
+                            // Some messages (status, ping) don't need a registered client
+                            // Others (create_pane) will register the client
+                            self.handleMessage(&conn, client_id, pfd.fd, msg) catch |err| {
+                                self.sendError(&conn, @errorName(err)) catch {};
+                            };
                         } else {
                             // Connection closed
                             if (client_id) |cid| {
@@ -154,7 +155,9 @@ pub const Server = struct {
     }
 
     /// Handle a message from a client
-    fn handleMessage(self: *Server, conn: *ipc.Connection, client_id: usize, msg: []const u8) !void {
+    /// client_id is optional - queries like status/ping don't need a registered client
+    /// For operations that need a client (create_pane, etc.), we register on first use
+    fn handleMessage(self: *Server, conn: *ipc.Connection, client_id: ?usize, fd: posix.fd_t, msg: []const u8) !void {
         // Parse JSON message
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, msg, .{}) catch {
             try self.sendError(conn, "invalid_json");
@@ -170,26 +173,39 @@ pub const Server = struct {
 
         const type_str = msg_type.string;
 
-        if (std.mem.eql(u8, type_str, "create_pane")) {
-            try self.handleCreatePane(conn, client_id, root);
-        } else if (std.mem.eql(u8, type_str, "find_sticky")) {
-            try self.handleFindSticky(conn, client_id, root);
-        } else if (std.mem.eql(u8, type_str, "reconnect")) {
-            try self.handleReconnect(conn, client_id, root);
-        } else if (std.mem.eql(u8, type_str, "disconnect")) {
-            try self.handleDisconnect(conn, client_id, root);
-        } else if (std.mem.eql(u8, type_str, "orphan_pane")) {
-            try self.handleOrphanPane(conn, root);
-        } else if (std.mem.eql(u8, type_str, "list_orphaned")) {
-            try self.handleListOrphaned(conn);
-        } else if (std.mem.eql(u8, type_str, "adopt_pane")) {
-            try self.handleAdoptPane(conn, client_id, root);
-        } else if (std.mem.eql(u8, type_str, "kill_pane")) {
-            try self.handleKillPane(conn, root);
-        } else if (std.mem.eql(u8, type_str, "ping")) {
+        // Read-only queries - don't need a registered client
+        if (std.mem.eql(u8, type_str, "ping")) {
             try conn.sendLine("{\"type\":\"pong\"}");
+            return;
         } else if (std.mem.eql(u8, type_str, "status")) {
             try self.handleStatus(conn);
+            return;
+        } else if (std.mem.eql(u8, type_str, "list_orphaned")) {
+            try self.handleListOrphaned(conn);
+            return;
+        }
+
+        // Operations that need a client - register if not already registered
+        const cid = client_id orelse blk: {
+            // Register this connection as a new client
+            const new_id = try self.ses_state.addClient(fd);
+            break :blk new_id;
+        };
+
+        if (std.mem.eql(u8, type_str, "create_pane")) {
+            try self.handleCreatePane(conn, cid, root);
+        } else if (std.mem.eql(u8, type_str, "find_sticky")) {
+            try self.handleFindSticky(conn, cid, root);
+        } else if (std.mem.eql(u8, type_str, "reconnect")) {
+            try self.handleReconnect(conn, cid, root);
+        } else if (std.mem.eql(u8, type_str, "disconnect")) {
+            try self.handleDisconnect(conn, cid, root);
+        } else if (std.mem.eql(u8, type_str, "orphan_pane")) {
+            try self.handleOrphanPane(conn, root);
+        } else if (std.mem.eql(u8, type_str, "adopt_pane")) {
+            try self.handleAdoptPane(conn, cid, root);
+        } else if (std.mem.eql(u8, type_str, "kill_pane")) {
+            try self.handleKillPane(conn, root);
         } else if (std.mem.eql(u8, type_str, "broadcast_notify")) {
             try self.handleBroadcastNotify(conn, root);
         } else {

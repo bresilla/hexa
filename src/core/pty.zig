@@ -130,6 +130,9 @@ pub const Pty = struct {
 
     pub fn pollStatus(self: *Pty) ?u32 {
         if (self.child_reaped) return 0; // Already dead
+        // For ses-managed processes, we can't waitpid (not our child)
+        // Just check if we can read from the fd as a proxy for alive
+        if (self.external_process) return null; // Assume alive
         const result = posix.waitpid(self.child_pid, posix.W.NOHANG);
         if (result.pid == 0) return null; // Still running
         self.child_reaped = true;

@@ -127,6 +127,10 @@ const State = struct {
     /// Create a new tab with one pane
     fn createTab(self: *State) !void {
         var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, "tab");
+        // Set ses client if connected (for new tabs after startup)
+        if (self.ses_client.isConnected()) {
+            tab.layout.setSesClient(&self.ses_client);
+        }
         _ = try tab.layout.createFirstPane();
         try self.tabs.append(self.allocator, tab);
         self.active_tab = self.tabs.items.len - 1;
@@ -213,16 +217,16 @@ pub fn main() !void {
         }
     }
 
-    // Create first tab with one pane
-    try state.createTab();
-
-    // Connect to ses daemon (start it if needed)
+    // Connect to ses daemon FIRST (start it if needed)
     state.ses_client.connect() catch {};
 
     // Show notification if we just started the daemon
     if (state.ses_client.just_started_daemon) {
         state.notifications.showFor("ses daemon started", 2000);
     }
+
+    // Create first tab with one pane (will use ses if connected)
+    try state.createTab();
 
     // Enter raw mode
     const orig_termios = try enableRawMode(posix.STDIN_FILENO);
