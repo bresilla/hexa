@@ -35,6 +35,7 @@ pub const FloatDef = struct {
     name: []const u8,
     command: ?[]const u8,
     alone: bool = false, // hide all other floats when this one opens
+    unique: bool = false, // if true, each directory gets its own instance
     // Per-float overrides (null = use default)
     width_percent: ?u8 = null,
     height_percent: ?u8 = null,
@@ -173,6 +174,7 @@ pub const Config = struct {
                     .name = name,
                     .command = command,
                     .alone = jf.alone orelse false,
+                    .unique = jf.unique orelse false,
                     .width_percent = if (jf.width_percent) |v| @intCast(@min(100, @max(10, v))) else null,
                     .height_percent = if (jf.height_percent) |v| @intCast(@min(100, @max(10, v))) else null,
                     .pos_x = if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else null,
@@ -275,6 +277,7 @@ const JsonConfig = struct {
         name: []const u8,
         command: ?[]const u8 = null,
         alone: ?bool = null,
+        unique: ?bool = null,
         width_percent: ?i64 = null,
         height_percent: ?i64 = null,
         pos_x: ?i64 = null,

@@ -3,57 +3,102 @@ const Segment = @import("../segment.zig").Segment;
 const Context = @import("../segment.zig").Context;
 const Style = @import("../style.zig").Style;
 
-/// Git status segment - displays git status indicators
-/// Format: !3 +2 ?1 (modified, staged, untracked counts)
+// Starship-compatible icons
+const ICON_CONFLICTED = "=";
+const ICON_AHEAD = "⇡";
+const ICON_BEHIND = "⇣";
+const ICON_DIVERGED = "⇕";
+const ICON_UNTRACKED = "?";
+const ICON_STASHED = "$";
+const ICON_MODIFIED = "!";
+const ICON_STAGED = "+";
+const ICON_RENAMED = "»";
+const ICON_DELETED = "✘";
+
+/// Git status segment - displays git status indicators using starship icons
+/// Format: ⇡1 ⇣2 +3 !4 ?5 (ahead, behind, staged, modified, untracked)
 pub fn render(ctx: *Context) ?[]const Segment {
     const cwd = if (ctx.cwd.len > 0) ctx.cwd else std.posix.getenv("PWD") orelse return null;
 
-    // Find git directory
-    const git_dir = findGitDir(cwd) orelse return null;
+    // Check if we're in a git repo
+    if (!isGitRepo(cwd)) return null;
 
-    // Get status from index and worktree
+    // Run git status --porcelain=v2 --branch
     var status = GitStatus{};
-    readGitStatus(git_dir, cwd, &status);
+    runGitStatus(cwd, &status);
 
     if (status.isEmpty()) return null;
 
-    // Build status string
-    var text_buf: [64]u8 = undefined;
+    // Build status string with starship icons
+    var text_buf: [128]u8 = undefined;
     var text_len: usize = 0;
+
+    // Ahead/behind
+    if (status.ahead > 0 and status.behind > 0) {
+        // Diverged
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_DIVERGED ++ "{d}/{d}", .{ status.ahead, status.behind }) catch return null;
+        text_len += written.len;
+    } else if (status.ahead > 0) {
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_AHEAD ++ "{d}", .{status.ahead}) catch return null;
+        text_len += written.len;
+    } else if (status.behind > 0) {
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_BEHIND ++ "{d}", .{status.behind}) catch return null;
+        text_len += written.len;
+    }
+
+    // Conflicted
+    if (status.conflicts > 0) {
+        if (text_len > 0) text_buf[text_len] = ' ';
+        if (text_len > 0) text_len += 1;
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_CONFLICTED ++ "{d}", .{status.conflicts}) catch return null;
+        text_len += written.len;
+    }
+
+    // Stashed
+    if (status.stashed > 0) {
+        if (text_len > 0) text_buf[text_len] = ' ';
+        if (text_len > 0) text_len += 1;
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_STASHED ++ "{d}", .{status.stashed}) catch return null;
+        text_len += written.len;
+    }
 
     // Staged changes
     if (status.staged > 0) {
-        const written = std.fmt.bufPrint(text_buf[text_len..], "+{d}", .{status.staged}) catch return null;
+        if (text_len > 0) text_buf[text_len] = ' ';
+        if (text_len > 0) text_len += 1;
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_STAGED ++ "{d}", .{status.staged}) catch return null;
         text_len += written.len;
     }
 
     // Modified (unstaged)
     if (status.modified > 0) {
-        if (text_len > 0) {
-            text_buf[text_len] = ' ';
-            text_len += 1;
-        }
-        const written = std.fmt.bufPrint(text_buf[text_len..], "!{d}", .{status.modified}) catch return null;
+        if (text_len > 0) text_buf[text_len] = ' ';
+        if (text_len > 0) text_len += 1;
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_MODIFIED ++ "{d}", .{status.modified}) catch return null;
+        text_len += written.len;
+    }
+
+    // Deleted
+    if (status.deleted > 0) {
+        if (text_len > 0) text_buf[text_len] = ' ';
+        if (text_len > 0) text_len += 1;
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_DELETED ++ "{d}", .{status.deleted}) catch return null;
+        text_len += written.len;
+    }
+
+    // Renamed
+    if (status.renamed > 0) {
+        if (text_len > 0) text_buf[text_len] = ' ';
+        if (text_len > 0) text_len += 1;
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_RENAMED ++ "{d}", .{status.renamed}) catch return null;
         text_len += written.len;
     }
 
     // Untracked
     if (status.untracked > 0) {
-        if (text_len > 0) {
-            text_buf[text_len] = ' ';
-            text_len += 1;
-        }
-        const written = std.fmt.bufPrint(text_buf[text_len..], "?{d}", .{status.untracked}) catch return null;
-        text_len += written.len;
-    }
-
-    // Conflicts
-    if (status.conflicts > 0) {
-        if (text_len > 0) {
-            text_buf[text_len] = ' ';
-            text_len += 1;
-        }
-        const written = std.fmt.bufPrint(text_buf[text_len..], "✖{d}", .{status.conflicts}) catch return null;
+        if (text_len > 0) text_buf[text_len] = ' ';
+        if (text_len > 0) text_len += 1;
+        const written = std.fmt.bufPrint(text_buf[text_len..], ICON_UNTRACKED ++ "{d}", .{status.untracked}) catch return null;
         text_len += written.len;
     }
 
@@ -64,7 +109,7 @@ pub fn render(ctx: *Context) ?[]const Segment {
     // Color based on status: red if conflicts, yellow if dirty, green if only staged
     const style = if (status.conflicts > 0)
         Style.parse("bold fg:red")
-    else if (status.modified > 0 or status.untracked > 0)
+    else if (status.modified > 0 or status.untracked > 0 or status.deleted > 0)
         Style.parse("fg:yellow")
     else
         Style.parse("fg:green");
@@ -77,77 +122,159 @@ const GitStatus = struct {
     modified: u16 = 0,
     untracked: u16 = 0,
     conflicts: u16 = 0,
+    deleted: u16 = 0,
+    renamed: u16 = 0,
+    ahead: u16 = 0,
+    behind: u16 = 0,
+    stashed: u16 = 0,
 
     fn isEmpty(self: GitStatus) bool {
-        return self.staged == 0 and self.modified == 0 and self.untracked == 0 and self.conflicts == 0;
+        return self.staged == 0 and self.modified == 0 and self.untracked == 0 and
+            self.conflicts == 0 and self.deleted == 0 and self.renamed == 0 and
+            self.ahead == 0 and self.behind == 0 and self.stashed == 0;
     }
 };
 
-fn findGitDir(cwd: []const u8) ?[]const u8 {
+fn isGitRepo(cwd: []const u8) bool {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var current: []const u8 = cwd;
 
     while (true) {
-        const git_path = std.fmt.bufPrint(&path_buf, "{s}/.git", .{current}) catch return null;
-
-        // Check if it's a directory
-        if (std.fs.openDirAbsolute(git_path, .{})) |dir| {
-            var d = dir;
-            d.close();
-            // Return the parent directory (repo root)
-            return current;
+        const git_path = std.fmt.bufPrint(&path_buf, "{s}/.git", .{current}) catch return false;
+        if (std.fs.cwd().access(git_path, .{})) |_| {
+            return true;
         } else |_| {}
 
-        // Check if it's a file (worktree)
         if (std.fs.openFileAbsolute(git_path, .{})) |file| {
             file.close();
-            return current;
+            return true;
         } else |_| {}
 
-        // Move up
         if (std.mem.lastIndexOfScalar(u8, current, '/')) |idx| {
-            if (idx == 0) return null;
+            if (idx == 0) {
+                if (std.fs.cwd().access("/.git", .{})) |_| {
+                    return true;
+                } else |_| {}
+                return false;
+            }
             current = current[0..idx];
         } else {
-            return null;
+            return false;
         }
     }
 }
 
-fn readGitStatus(git_dir: []const u8, cwd: []const u8, status: *GitStatus) void {
-    _ = git_dir;
+fn runGitStatus(cwd: []const u8, status: *GitStatus) void {
+    const alloc = std.heap.page_allocator;
 
-    // Read status by checking index vs worktree
-    // This is a simplified approach - for full accuracy we'd need to
-    // parse the index file and compare with worktree
+    // Run git status --porcelain=v2 --branch
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "git", "-C", cwd, "status", "--porcelain=v2", "--branch" },
+    }) catch return;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
 
-    // For now, do a quick scan of common indicators
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // Check exit code
+    const exit_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!exit_ok) return;
 
-    // Check for MERGE_HEAD (conflict indicator)
-    const merge_path = std.fmt.bufPrint(&path_buf, "{s}/.git/MERGE_HEAD", .{cwd}) catch return;
-    if (std.fs.openFileAbsolute(merge_path, .{})) |file| {
-        file.close();
-        status.conflicts = 1; // At least one conflict
-    } else |_| {}
+    // Parse output
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
 
-    // Check for REBASE_HEAD
-    const rebase_path = std.fmt.bufPrint(&path_buf, "{s}/.git/REBASE_HEAD", .{cwd}) catch return;
-    if (std.fs.openFileAbsolute(rebase_path, .{})) |file| {
-        file.close();
-        status.conflicts = 1;
-    } else |_| {}
+        // Branch info: # branch.ab +<ahead> -<behind>
+        if (std.mem.startsWith(u8, line, "# branch.ab ")) {
+            parseAheadBehind(line[12..], status);
+        }
+        // Changed entry (porcelain v2 format)
+        else if (line[0] == '1') {
+            // Ordinary change: 1 XY ...
+            if (line.len > 2) {
+                parseChangeStatus(line[2..4], status);
+            }
+        } else if (line[0] == '2') {
+            // Rename/copy: 2 XY ...
+            status.renamed += 1;
+            if (line.len > 2) {
+                parseChangeStatus(line[2..4], status);
+            }
+        } else if (line[0] == 'u') {
+            // Unmerged (conflict)
+            status.conflicts += 1;
+        } else if (line[0] == '?') {
+            // Untracked
+            status.untracked += 1;
+        } else if (line[0] == '!') {
+            // Ignored - skip
+        }
+    }
 
-    // For a more complete status, we'd need to either:
-    // 1. Parse .git/index and compare with worktree files
-    // 2. Run `git status --porcelain` (but we want to avoid spawning processes)
+    // Check for stashes
+    checkStash(cwd, status);
+}
 
-    // Simple heuristic: check if index exists and has recent mtime
-    const index_path = std.fmt.bufPrint(&path_buf, "{s}/.git/index", .{cwd}) catch return;
-    const index_file = std.fs.openFileAbsolute(index_path, .{}) catch return;
-    defer index_file.close();
+fn parseAheadBehind(s: []const u8, status: *GitStatus) void {
+    // Format: +<ahead> -<behind>
+    var parts = std.mem.splitScalar(u8, s, ' ');
+    if (parts.next()) |ahead_str| {
+        if (ahead_str.len > 1 and ahead_str[0] == '+') {
+            status.ahead = std.fmt.parseInt(u16, ahead_str[1..], 10) catch 0;
+        }
+    }
+    if (parts.next()) |behind_str| {
+        if (behind_str.len > 1 and behind_str[0] == '-') {
+            status.behind = std.fmt.parseInt(u16, behind_str[1..], 10) catch 0;
+        }
+    }
+}
 
-    // If we got here, repo has an index, likely has tracked files
-    // Mark as potentially having changes (user can see actual status in git)
-    // This is intentionally conservative - shows repo is active
+fn parseChangeStatus(xy: []const u8, status: *GitStatus) void {
+    if (xy.len < 2) return;
+    const index_status = xy[0];
+    const worktree_status = xy[1];
+
+    // Index changes (staged)
+    switch (index_status) {
+        'A', 'M', 'T' => status.staged += 1,
+        'D' => status.deleted += 1,
+        'R' => status.renamed += 1,
+        else => {},
+    }
+
+    // Worktree changes (modified/deleted)
+    switch (worktree_status) {
+        'M', 'T' => status.modified += 1,
+        'D' => status.deleted += 1,
+        else => {},
+    }
+}
+
+fn checkStash(cwd: []const u8, status: *GitStatus) void {
+    const alloc = std.heap.page_allocator;
+
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "git", "-C", cwd, "stash", "list" },
+    }) catch return;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    const exit_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!exit_ok) return;
+
+    // Count lines
+    var count: u16 = 0;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0) count += 1;
+    }
+    status.stashed = count;
 }

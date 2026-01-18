@@ -18,7 +18,8 @@ pub fn render(ctx: *Context) ?[]const Segment {
     // Get branch name into static buffer
     const branch = getBranchName(cwd) orelse return null;
 
-    const text = ctx.allocFmt(" {s}", .{branch}) catch return null;
+    // Return just the branch name - config controls the icon (e.g., "  $output")
+    const text = ctx.allocText(branch) catch return null;
 
     return ctx.addSegment(text, Style.parse("bold fg:magenta")) catch return null;
 }

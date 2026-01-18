@@ -37,6 +37,9 @@ pub const Pane = struct {
     float_pos_y_pct: u8 = 50,
     float_pad_x: u8 = 1,
     float_pad_y: u8 = 0,
+    // For unique floats: the directory this float is bound to
+    unique_dir: ?[]const u8 = null,
+    is_unique: bool = false,
 
     // Tracks whether we saw a clear-screen sequence in the last PTY read.
     did_clear: bool = false,
@@ -63,6 +66,10 @@ pub const Pane = struct {
     pub fn deinit(self: *Pane) void {
         self.pty.close();
         self.vt.deinit();
+        // Free unique_dir if allocated
+        if (self.unique_dir) |dir| {
+            self.allocator.free(dir);
+        }
     }
 
     /// Read from PTY and feed to VT. Returns true if data was read.
@@ -187,6 +194,18 @@ pub const Pane = struct {
     /// Get current working directory (from OSC 7)
     pub fn getPwd(self: *Pane) ?[]const u8 {
         return self.vt.getPwd();
+    }
+
+    // Static buffer for readlink result
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    /// Get current working directory by reading /proc/<pid>/cwd
+    /// This is more reliable than OSC 7 as it works with any shell
+    pub fn getRealCwd(self: *Pane) ?[]const u8 {
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{self.pty.child_pid}) catch return null;
+        const link = std.posix.readlink(path, &cwd_buf) catch return null;
+        return link;
     }
 
     /// Scroll up by given number of lines

@@ -262,28 +262,106 @@ fn getConfigPath(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdout: std.fs.File, is_zsh: bool) !void {
+    const alloc = std.heap.page_allocator;
+
     // Known built-in segments that return null when they have nothing to show
     const conditional_segments = [_][]const u8{ "status", "sudo", "git_branch", "git_status", "jobs", "duration" };
 
-    for (modules) |mod| {
-        // Check 'when' condition if present
-        if (mod.when) |when_cmd| {
-            if (!checkCondition(when_cmd)) continue;
-        }
+    const ModuleResult = struct {
+        when_passed: bool = true,
+        output: ?[]const u8 = null,
+    };
 
-        // Get segment output text
+    var results: [32]ModuleResult = [_]ModuleResult{.{}} ** 32;
+    const mod_count = @min(modules.len, 32);
+
+    // Thread function for running a module's commands
+    const ThreadContext = struct {
+        mod: *const JsonModule,
+        result: *ModuleResult,
+        alloc: std.mem.Allocator,
+    };
+
+    const thread_fn = struct {
+        fn run(tctx: ThreadContext) void {
+            // Check 'when' condition
+            if (tctx.mod.when) |when_cmd| {
+                const when_result = std.process.Child.run(.{
+                    .allocator = tctx.alloc,
+                    .argv = &.{ "/bin/bash", "-c", when_cmd },
+                }) catch {
+                    tctx.result.when_passed = false;
+                    return;
+                };
+                tctx.alloc.free(when_result.stdout);
+                tctx.alloc.free(when_result.stderr);
+                tctx.result.when_passed = switch (when_result.term) {
+                    .Exited => |code| code == 0,
+                    else => false,
+                };
+                if (!tctx.result.when_passed) return;
+            }
+
+            // Run command
+            if (tctx.mod.command) |cmd| {
+                const cmd_result = std.process.Child.run(.{
+                    .allocator = tctx.alloc,
+                    .argv = &.{ "/bin/bash", "-c", cmd },
+                }) catch return;
+                tctx.alloc.free(cmd_result.stderr);
+
+                const exit_ok = switch (cmd_result.term) {
+                    .Exited => |code| code == 0,
+                    else => false,
+                };
+                if (!exit_ok) {
+                    tctx.alloc.free(cmd_result.stdout);
+                    return;
+                }
+
+                const trimmed = std.mem.trimRight(u8, cmd_result.stdout, "\n\r");
+                if (trimmed.len > 0) {
+                    tctx.result.output = trimmed;
+                } else {
+                    tctx.alloc.free(cmd_result.stdout);
+                }
+            }
+        }
+    }.run;
+
+    // Spawn threads for modules with commands or when conditions
+    var threads: [32]?std.Thread = [_]?std.Thread{null} ** 32;
+    for (modules[0..mod_count], 0..) |*mod, i| {
+        if (mod.when != null or mod.command != null) {
+            threads[i] = std.Thread.spawn(.{}, thread_fn, .{ThreadContext{
+                .mod = mod,
+                .result = &results[i],
+                .alloc = alloc,
+            }}) catch null;
+        }
+    }
+
+    // Wait for all threads
+    for (threads[0..mod_count]) |maybe_thread| {
+        if (maybe_thread) |thread| {
+            thread.join();
+        }
+    }
+
+    // Render modules
+    for (modules[0..mod_count], 0..) |mod, i| {
+        if (!results[i].when_passed) continue;
+
         var output_text: []const u8 = "";
         var should_render = true;
 
-        // If module has a command, run it
-        if (mod.command) |cmd| {
-            if (runCommand(ctx.allocator, cmd)) |result| {
-                output_text = result;
+        if (mod.command != null) {
+            if (results[i].output) |out| {
+                output_text = out;
             } else {
                 should_render = false;
             }
         } else {
-            // Check if it's a known conditional segment
             var is_conditional = false;
             for (conditional_segments) |cs| {
                 if (std.mem.eql(u8, mod.name, cs)) {
@@ -297,27 +375,20 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
                     output_text = segs[0].text;
                 }
             } else if (is_conditional) {
-                // Conditional segment returned null - skip
                 should_render = false;
             }
-            // Non-conditional segments (like "separator") render even without output
         }
 
         if (!should_render) continue;
 
-        // Render each output in the outputs array
         if (mod.outputs) |outputs| {
             for (outputs) |out| {
                 const style = Style.parse(out.style orelse "");
                 const format = out.format orelse "$output";
 
-                // Write style using buffer
                 try writeStyleDirect(stdout, style, is_zsh);
-
-                // Write format with $output substitution
                 try writeFormat(stdout, format, output_text);
 
-                // Reset style
                 if (!style.isEmpty()) {
                     if (is_zsh) try stdout.writeAll("%{");
                     try stdout.writeAll("\x1b[0m");
