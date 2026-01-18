@@ -231,6 +231,10 @@ pub fn main() !void {
                 if (poll_fds[idx].revents & posix.POLL.IN != 0) {
                     if (pane.*.poll(&buffer)) |had_data| {
                         if (had_data) state.needs_render = true;
+                        if (pane.*.did_clear) {
+                            state.force_full_render = true;
+                            state.renderer.invalidate();
+                        }
                     } else |_| {}
                 }
                 if (poll_fds[idx].revents & posix.POLL.HUP != 0) {
@@ -249,6 +253,10 @@ pub fn main() !void {
                 if (poll_fds[idx].revents & posix.POLL.IN != 0) {
                     if (pane.poll(&buffer)) |had_data| {
                         if (had_data) state.needs_render = true;
+                        if (pane.did_clear) {
+                            state.force_full_render = true;
+                            state.renderer.invalidate();
+                        }
                     } else |_| {}
                 }
                 if (poll_fds[idx].revents & posix.POLL.HUP != 0) {

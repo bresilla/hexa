@@ -308,6 +308,11 @@ pub const Renderer = struct {
         try writeCSI(&self.output, self.allocator, "?2026h"); // begin sync
         try writeCSI(&self.output, self.allocator, "?25l"); // hide cursor
         try writeCSI(&self.output, self.allocator, "0m"); // reset attributes
+        if (force_full) {
+            // Ensure the outer terminal fully clears any stale backgrounds.
+            try writeCSI(&self.output, self.allocator, "H");
+            try writeCSI(&self.output, self.allocator, "2J");
+        }
         self.current_fg = .none;
         self.current_bg = .none;
         self.current_bold = false;

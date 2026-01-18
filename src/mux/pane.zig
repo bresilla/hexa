@@ -38,12 +38,18 @@ pub const Pane = struct {
     float_pad_x: u8 = 1,
     float_pad_y: u8 = 0,
 
+    // Tracks whether we saw a clear-screen sequence in the last PTY read.
+    did_clear: bool = false,
+    // Keep last bytes so we can detect escape sequences across read boundaries.
+    esc_tail: [3]u8 = .{ 0, 0, 0 },
+    esc_tail_len: u8 = 0,
+
     pub fn init(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16) !void {
         return self.initWithCommand(allocator, id, x, y, width, height, null);
     }
 
     pub fn initWithCommand(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16, command: ?[]const u8) !void {
-        self.* = .{ .allocator = allocator, .id = id, .x = x, .y = y, .width = width, .height = height };
+        self.* = .{ .allocator = allocator, .id = id, .x = x, .y = y, .width = width, .height = height, .did_clear = false, .esc_tail = .{ 0, 0, 0 }, .esc_tail_len = 0 };
 
         const cmd = command orelse (posix.getenv("SHELL") orelse "/bin/sh");
         self.pty = try core.Pty.spawn(cmd);
@@ -61,13 +67,65 @@ pub const Pane = struct {
 
     /// Read from PTY and feed to VT. Returns true if data was read.
     pub fn poll(self: *Pane, buffer: []u8) !bool {
+        self.did_clear = false;
+
         const n = self.pty.read(buffer) catch |err| {
             if (err == error.WouldBlock) return false;
             return err;
         };
         if (n == 0) return false;
-        try self.vt.feed(buffer[0..n]);
+
+        const data = buffer[0..n];
+        self.did_clear = containsClearSeq(self.esc_tail[0..self.esc_tail_len], data);
+
+        // Update tail with the last up-to-3 bytes.
+        const take: usize = @min(@as(usize, 3), data.len);
+        if (take > 0) {
+            @memcpy(self.esc_tail[0..take], data[data.len - take .. data.len]);
+            self.esc_tail_len = @intCast(take);
+        }
+
+        try self.vt.feed(data);
         return true;
+    }
+
+    fn containsClearSeq(tail: []const u8, data: []const u8) bool {
+        // Common clear sequences emitted by shells / terminfo:
+        // - ED2: ESC[2J
+        // - ED3: ESC[3J (clear scrollback)
+        // - ED0: ESC[J or ESC[0J
+        // - Home+ED*: ESC[H ...
+        // - Form feed: ^L (0x0C)
+        return std.mem.indexOfScalar(u8, data, 0x0c) != null or
+            containsSeq(tail, data, "\x1b[2J") or
+            containsSeq(tail, data, "\x1b[3J") or
+            containsSeq(tail, data, "\x1b[J") or
+            containsSeq(tail, data, "\x1b[0J") or
+            containsSeq(tail, data, "\x1b[H\x1b[2J") or
+            containsSeq(tail, data, "\x1b[H\x1b[J") or
+            containsSeq(tail, data, "\x1b[H\x1b[0J") or
+            containsSeq(tail, data, "\x1b[1;1H\x1b[2J") or
+            containsSeq(tail, data, "\x1b[1;1H\x1b[J") or
+            containsSeq(tail, data, "\x1b[1;1H\x1b[0J");
+    }
+
+    fn containsSeq(tail: []const u8, data: []const u8, seq: []const u8) bool {
+        if (std.mem.indexOf(u8, data, seq) != null) return true;
+        if (tail.len == 0) return false;
+
+        // Check for a match split across tail+data.
+        const max_k = @min(tail.len, seq.len - 1);
+        var k: usize = 1;
+        while (k <= max_k) : (k += 1) {
+            if (std.mem.eql(u8, tail[tail.len - k .. tail.len], seq[0..k]) and
+                data.len >= seq.len - k and
+                std.mem.eql(u8, data[0 .. seq.len - k], seq[k..seq.len]))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// Write input to PTY
