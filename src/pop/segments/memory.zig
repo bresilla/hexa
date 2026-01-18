@@ -3,11 +3,17 @@ const Segment = @import("../segment.zig").Segment;
 const Context = @import("../segment.zig").Context;
 const Style = @import("../style.zig").Style;
 
+// Cache last value for error recovery
+var last_percent: u64 = 0;
+
 /// Memory segment - displays memory usage percentage
 /// Format: 67
 pub fn render(ctx: *Context) ?[]const Segment {
-    // Read /proc/meminfo
-    const file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch return null;
+    // Read /proc/meminfo - open fresh each time
+    const file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch {
+        const text = ctx.allocFmt("{d:>2}", .{last_percent}) catch return null;
+        return ctx.addSegment(text, Style{}) catch return null;
+    };
     defer file.close();
 
     var buf: [2048]u8 = undefined;
@@ -34,8 +40,10 @@ pub fn render(ctx: *Context) ?[]const Segment {
     // Calculate percentage used
     const mem_used = mem_total - mem_available;
     const mem_percent = (mem_used * 100) / mem_total;
+    last_percent = mem_percent;
 
-    const text = ctx.allocFmt("{d}", .{mem_percent}) catch return null;
+    // Fixed 2-digit width (space-padded for 0-9)
+    const text = ctx.allocFmt("{d:>2}", .{mem_percent}) catch return null;
     return ctx.addSegment(text, Style{}) catch return null;
 }
 

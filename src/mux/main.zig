@@ -182,6 +182,8 @@ pub fn main() !void {
 
     // Frame timing
     var last_render: i64 = std.time.milliTimestamp();
+    var last_status_update: i64 = last_render;
+    const status_update_interval: i64 = 250; // Update status bar every 250ms
 
     // Main loop
     while (state.running) {
@@ -292,11 +294,21 @@ pub fn main() !void {
             }
         }
 
-        // Calculate poll timeout - wait for next frame or input
+        // Calculate poll timeout - wait for next frame, status update, or input
         const now = std.time.milliTimestamp();
         const since_render = now - last_render;
-        const timeout: i32 = if (!state.needs_render) 100 else if (since_render >= 16) 0 else @intCast(16 - since_render);
+        const since_status = now - last_status_update;
+        const until_status: i64 = @max(0, status_update_interval - since_status);
+        const frame_timeout: i32 = if (!state.needs_render) 100 else if (since_render >= 16) 0 else @intCast(16 - since_render);
+        const timeout: i32 = @intCast(@min(frame_timeout, until_status));
         _ = posix.poll(poll_fds[0..fd_count], timeout) catch continue;
+
+        // Check if status bar needs periodic update
+        const now2 = std.time.milliTimestamp();
+        if (now2 - last_status_update >= status_update_interval) {
+            state.needs_render = true;
+            last_status_update = now2;
+        }
 
         // Handle stdin
         if (poll_fds[0].revents & posix.POLL.IN != 0) {

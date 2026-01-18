@@ -44,7 +44,8 @@ fn readBattery(ctx: *Context, bat_path: []const u8) ?[]const Segment {
         }
     }
 
-    const text = ctx.allocFmt("{d}%", .{capacity}) catch return null;
+    // Fixed 3-digit width for percentage (space-padded)
+    const text = ctx.allocFmt("{d:>3}%", .{capacity}) catch return null;
     return ctx.addSegment(text, style) catch return null;
 }
 

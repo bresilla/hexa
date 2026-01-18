@@ -124,6 +124,7 @@ fn printInit(shell: []const u8) !void {
             \\autoload -Uz add-zsh-hook
             \\add-zsh-hook precmd __pop_precmd
             \\add-zsh-hook preexec __pop_preexec
+            \\ZLE_RPROMPT_INDENT=0
             \\
         );
     } else if (std.mem.eql(u8, shell, "fish")) {

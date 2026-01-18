@@ -3,18 +3,27 @@ const Segment = @import("../segment.zig").Segment;
 const Context = @import("../segment.zig").Context;
 const Style = @import("../style.zig").Style;
 
-// Persistent state for CPU calculation
-var last_idle: u64 = 0;
-var last_total: u64 = 0;
+// Persistent state for CPU calculation (use struct to prevent optimization issues)
+const CpuState = struct {
+    idle: u64 = 0,
+    total: u64 = 0,
+    initialized: bool = false,
+    last_percent: u64 = 0,
+};
+var state: CpuState = .{};
 
 /// CPU segment - displays CPU usage percentage
 /// Format: 94
 pub fn render(ctx: *Context) ?[]const Segment {
     // Read /proc/stat
-    const file = std.fs.openFileAbsolute("/proc/stat", .{}) catch return null;
+    const file = std.fs.openFileAbsolute("/proc/stat", .{}) catch {
+        // Return last known value if can't read
+        const text = ctx.allocFmt("{d:>2}", .{state.last_percent}) catch return null;
+        return ctx.addSegment(text, Style{}) catch return null;
+    };
     defer file.close();
 
-    var buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
     const len = file.read(&buf) catch return null;
     const str = buf[0..len];
 
@@ -48,19 +57,23 @@ pub fn render(ctx: *Context) ?[]const Segment {
     const idle = values[3]; // idle is 4th field
 
     // Calculate percentage
-    var cpu_percent: u64 = 0;
-    if (last_total > 0 and total > last_total) {
-        const total_diff = total - last_total;
-        const idle_diff = idle - last_idle;
+    var cpu_percent: u64 = state.last_percent;
+    if (state.initialized and total > state.total) {
+        const total_diff = total - state.total;
+        const idle_diff = if (idle >= state.idle) idle - state.idle else 0;
         if (total_diff > 0) {
-            cpu_percent = ((total_diff - idle_diff) * 100) / total_diff;
+            const active = if (total_diff > idle_diff) total_diff - idle_diff else 0;
+            cpu_percent = (active * 100) / total_diff;
         }
     }
 
-    // Update cached values
-    last_idle = idle;
-    last_total = total;
+    // Update state
+    state.idle = idle;
+    state.total = total;
+    state.initialized = true;
+    state.last_percent = cpu_percent;
 
-    const text = ctx.allocFmt("{d}", .{cpu_percent}) catch return null;
+    // Fixed 2-digit width (space-padded for 0-9)
+    const text = ctx.allocFmt("{d:>2}", .{cpu_percent}) catch return null;
     return ctx.addSegment(text, Style{}) catch return null;
 }

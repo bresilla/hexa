@@ -57,17 +57,32 @@ pub const Context = struct {
 
     /// Render a segment by name and return its segments
     pub fn renderSegment(self: *Context, name: []const u8) ?[]const Segment {
-        // Check cache first
-        if (self.cached_segments.get(name)) |segs| {
-            return segs;
+        // Dynamic segments (cpu, mem, netspeed, time) should not be cached
+        // since they need fresh values each render
+        const dynamic_segments = [_][]const u8{ "cpu", "mem", "memory", "netspeed", "time", "battery", "uptime" };
+        var is_dynamic = false;
+        for (dynamic_segments) |dyn| {
+            if (std.mem.eql(u8, name, dyn)) {
+                is_dynamic = true;
+                break;
+            }
+        }
+
+        // Check cache first (only for non-dynamic segments)
+        if (!is_dynamic) {
+            if (self.cached_segments.get(name)) |segs| {
+                return segs;
+            }
         }
 
         // Look up in built-in segments
         const segments_mod = @import("segments/mod.zig");
         if (segments_mod.registry.get(name)) |render_fn| {
             if (render_fn(self)) |segs| {
-                // Cache and return
-                self.cached_segments.put(name, segs) catch {};
+                // Cache non-dynamic segments
+                if (!is_dynamic) {
+                    self.cached_segments.put(name, segs) catch {};
+                }
                 return segs;
             }
         }

@@ -107,9 +107,16 @@ fn readSysFile(prefix: []const u8, iface: []const u8, suffix: []const u8) ?u64 {
 fn formatBytes(ctx: *Context, bytes: u64) ?[]const u8 {
     if (bytes >= 1024 * 1024) {
         const mb = @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
-        return ctx.allocFmt("{d:.1}M", .{mb}) catch return null;
+        if (mb >= 100.0) {
+            return ctx.allocFmt("{d:>3.0}M", .{mb}) catch return null;
+        } else if (mb >= 10.0) {
+            return ctx.allocFmt("{d:>4.1}M", .{mb}) catch return null;
+        } else {
+            return ctx.allocFmt("{d:>4.2}M", .{mb}) catch return null;
+        }
     } else {
         const kb = bytes / 1024;
-        return ctx.allocFmt("{d}K", .{kb}) catch return null;
+        // Fixed 3-digit width for KB values
+        return ctx.allocFmt("{d:>3}K", .{kb}) catch return null;
     }
 }
