@@ -10,6 +10,7 @@ const c = @cImport({
 pub const Pty = struct {
     master_fd: posix.fd_t,
     child_pid: posix.pid_t,
+    child_reaped: bool = false,
 
     pub fn spawn(shell: []const u8) !Pty {
         return spawnWithEnv(shell);
@@ -101,15 +102,20 @@ pub const Pty = struct {
         return posix.write(self.master_fd, data);
     }
 
-    pub fn pollStatus(self: Pty) ?u32 {
+    pub fn pollStatus(self: *Pty) ?u32 {
+        if (self.child_reaped) return 0; // Already dead
         const result = posix.waitpid(self.child_pid, posix.W.NOHANG);
-        if (result.pid == 0) return null;
+        if (result.pid == 0) return null; // Still running
+        self.child_reaped = true;
         return result.status;
     }
 
-    pub fn close(self: Pty) void {
+    pub fn close(self: *Pty) void {
         _ = posix.close(self.master_fd);
-        _ = posix.waitpid(self.child_pid, 0);
+        if (!self.child_reaped) {
+            _ = posix.waitpid(self.child_pid, 0);
+            self.child_reaped = true;
+        }
     }
 
     // Set the terminal size (for window resize handling)

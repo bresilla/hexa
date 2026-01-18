@@ -1,5 +1,5 @@
 .{
-    .name = .blox,
+    .name = .hexa,
     .version = "0.1.0",
     .paths = .{
         "build.zig",
@@ -9,6 +9,11 @@
         "README.md",
         "PLAN.md",
     },
-    .dependencies = .{},
-    .fingerprint = 0x4d1d5cb6a52959c4,
+    .dependencies = .{
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/refs/heads/main.tar.gz",
+            .hash = "ghostty-1.3.0-dev-5UdBC5zRRQToJtNPVuZMWFMLWU56l7RoIyxB09WDxTKH",
+        },
+    },
+    .fingerprint = 0x4c99ab0b473f252d,
 }
