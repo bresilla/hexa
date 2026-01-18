@@ -37,9 +37,9 @@ pub const Pane = struct {
     float_pos_y_pct: u8 = 50,
     float_pad_x: u8 = 1,
     float_pad_y: u8 = 0,
-    // For unique floats: the directory this float is bound to
-    unique_dir: ?[]const u8 = null,
-    is_unique: bool = false,
+    // For pwd floats: the directory this float is bound to
+    pwd_dir: ?[]const u8 = null,
+    is_pwd: bool = false,
 
     // Tracks whether we saw a clear-screen sequence in the last PTY read.
     did_clear: bool = false,
@@ -66,8 +66,8 @@ pub const Pane = struct {
     pub fn deinit(self: *Pane) void {
         self.pty.close();
         self.vt.deinit();
-        // Free unique_dir if allocated
-        if (self.unique_dir) |dir| {
+        // Free pwd_dir if allocated
+        if (self.pwd_dir) |dir| {
             self.allocator.free(dir);
         }
     }

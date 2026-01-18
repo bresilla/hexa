@@ -35,7 +35,7 @@ pub const FloatDef = struct {
     name: []const u8,
     command: ?[]const u8,
     alone: bool = false, // hide all other floats when this one opens
-    unique: bool = false, // if true, each directory gets its own instance
+    pwd: bool = false, // if true, each directory gets its own instance
     // Per-float overrides (null = use default)
     width_percent: ?u8 = null,
     height_percent: ?u8 = null,
@@ -117,28 +117,6 @@ pub const Config = struct {
             }
         }
 
-        // Apply float defaults
-        if (json.float) |f| {
-            if (f.width_percent) |w| {
-                config.float_width_percent = @intCast(@min(100, @max(10, w)));
-            }
-            if (f.height_percent) |h| {
-                config.float_height_percent = @intCast(@min(100, @max(10, h)));
-            }
-            if (f.padding_x) |px| {
-                config.float_padding_x = @intCast(@min(10, @max(0, px)));
-            }
-            if (f.padding_y) |py| {
-                config.float_padding_y = @intCast(@min(10, @max(0, py)));
-            }
-            if (f.border_color) |c| {
-                config.float_border_color = @intCast(@min(15, @max(0, c)));
-            }
-            if (f.show_title) |t| {
-                config.float_show_title = t;
-            }
-        }
-
         // Apply status settings
         if (json.status) |s| {
             if (s.enabled) |e| {
@@ -174,9 +152,9 @@ pub const Config = struct {
                     .name = name,
                     .command = command,
                     .alone = jf.alone orelse false,
-                    .unique = jf.unique orelse false,
-                    .width_percent = if (jf.width_percent) |v| @intCast(@min(100, @max(10, v))) else null,
-                    .height_percent = if (jf.height_percent) |v| @intCast(@min(100, @max(10, v))) else null,
+                    .pwd = jf.pwd orelse false,
+                    .width_percent = if (jf.width) |v| @intCast(@min(100, @max(10, v))) else null,
+                    .height_percent = if (jf.height) |v| @intCast(@min(100, @max(10, v))) else null,
                     .pos_x = if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else null,
                     .pos_y = if (jf.pos_y) |v| @intCast(@min(100, @max(0, v))) else null,
                     .padding_x = if (jf.padding_x) |v| @intCast(@min(10, @max(0, v))) else null,
@@ -254,6 +232,22 @@ pub const Config = struct {
 };
 
 // JSON structure for parsing
+const JsonFloatPane = struct {
+    key: []const u8,
+    name: []const u8,
+    command: ?[]const u8 = null,
+    alone: ?bool = null,
+    pwd: ?bool = null,
+    width: ?i64 = null,
+    height: ?i64 = null,
+    pos_x: ?i64 = null,
+    pos_y: ?i64 = null,
+    padding_x: ?i64 = null,
+    padding_y: ?i64 = null,
+    border_color: ?i64 = null,
+    show_title: ?bool = null,
+};
+
 const JsonConfig = struct {
     keys: ?struct {
         quit: ?[]const u8 = null,
@@ -264,29 +258,7 @@ const JsonConfig = struct {
         prev_pane: ?[]const u8 = null,
         close_pane: ?[]const u8 = null,
     } = null,
-    float: ?struct {
-        width_percent: ?i64 = null,
-        height_percent: ?i64 = null,
-        padding_x: ?i64 = null,
-        padding_y: ?i64 = null,
-        border_color: ?i64 = null,
-        show_title: ?bool = null,
-    } = null,
-    floats: ?[]const struct {
-        key: []const u8,
-        name: []const u8,
-        command: ?[]const u8 = null,
-        alone: ?bool = null,
-        unique: ?bool = null,
-        width_percent: ?i64 = null,
-        height_percent: ?i64 = null,
-        pos_x: ?i64 = null,
-        pos_y: ?i64 = null,
-        padding_x: ?i64 = null,
-        padding_y: ?i64 = null,
-        border_color: ?i64 = null,
-        show_title: ?bool = null,
-    } = null,
+    floats: ?[]const JsonFloatPane = null,
     status: ?struct {
         enabled: ?bool = null,
         left: ?[]const JsonStatusModule = null,

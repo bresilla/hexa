@@ -649,20 +649,20 @@ fn handleAltKey(state: *State, key: u8) bool {
 }
 
 fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
-    // Get current directory from focused pane (for unique floats)
+    // Get current directory from focused pane (for pwd floats)
     // Use getRealCwd which reads /proc/<pid>/cwd for accurate directory
     var current_dir: ?[]const u8 = null;
     if (state.currentLayout().getFocusedPane()) |focused| {
         current_dir = focused.getRealCwd();
     }
 
-    // Find existing float by name (and directory if unique)
+    // Find existing float by name (and directory if pwd)
     for (state.floating_panes.items, 0..) |pane, i| {
         if (std.mem.eql(u8, pane.name, float_def.name)) {
-            // For unique floats, also check directory match
-            if (float_def.unique and pane.is_unique) {
+            // For pwd floats, also check directory match
+            if (float_def.pwd and pane.is_pwd) {
                 // Both dirs must exist and match, or both be null
-                const dirs_match = if (pane.unique_dir) |pane_dir| blk: {
+                const dirs_match = if (pane.pwd_dir) |pane_dir| blk: {
                     if (current_dir) |curr| {
                         break :blk std.mem.eql(u8, pane_dir, curr);
                     }
@@ -684,8 +684,8 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                         }
                     }
                 }
-                // For unique floats, hide other instances of same float (different dirs)
-                if (float_def.unique) {
+                // For pwd floats, hide other instances of same float (different dirs)
+                if (float_def.pwd) {
                     for (state.floating_panes.items, 0..) |other, j| {
                         if (j != i and std.mem.eql(u8, other.name, float_def.name)) {
                             other.visible = false;
@@ -710,8 +710,8 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
             }
         }
     }
-    // For unique floats, hide other instances of same float (different dirs)
-    if (float_def.unique) {
+    // For pwd floats, hide other instances of same float (different dirs)
+    if (float_def.pwd) {
         const new_idx = state.floating_panes.items.len - 1;
         for (state.floating_panes.items, 0..) |pane, i| {
             if (i != new_idx and std.mem.eql(u8, pane.name, float_def.name)) {
@@ -811,11 +811,11 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     pane.float_pad_x = @intCast(pad_x_cfg);
     pane.float_pad_y = @intCast(pad_y_cfg);
 
-    // For unique floats, store the directory and duplicate it
-    if (float_def.unique) {
-        pane.is_unique = true;
+    // For pwd floats, store the directory and duplicate it
+    if (float_def.pwd) {
+        pane.is_pwd = true;
         if (current_dir) |dir| {
-            pane.unique_dir = state.allocator.dupe(u8, dir) catch null;
+            pane.pwd_dir = state.allocator.dupe(u8, dir) catch null;
         }
     }
 
@@ -849,23 +849,36 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     }
 
     // Draw visible floating panes (on top of tiled panes)
+    // Draw inactive floats first, then active one last so it's on top
     for (state.floating_panes.items, 0..) |pane, i| {
         if (!pane.visible) continue;
+        if (state.active_floating == i) continue; // Skip active, draw it last
 
-        // First draw the border (which clears the area)
-        const is_active = state.active_floating == i;
         const title = if (pane.show_title) pane.name else "";
-        drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, is_active, title, pane.border_color);
+        drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, title, pane.border_color);
 
-        // Then draw the pane content
         const render_state = pane.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
 
-        const is_scrolled = pane.isScrolled();
-
-        // Draw scroll indicator if pane is scrolled
-        if (is_scrolled) {
+        if (pane.isScrolled()) {
             drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
+        }
+    }
+
+    // Draw active float last so it's on top
+    if (state.active_floating) |idx| {
+        const pane = state.floating_panes.items[idx];
+        if (pane.visible) {
+            const title = if (pane.show_title) pane.name else "";
+            drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, title, pane.border_color);
+
+            if (pane.getRenderState()) |render_state| {
+                renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
+            } else |_| {}
+
+            if (pane.isScrolled()) {
+                drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
+            }
         }
     }
 
