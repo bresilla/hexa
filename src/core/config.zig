@@ -172,11 +172,11 @@ pub const Config = struct {
     fn getConfigPath(allocator: std.mem.Allocator) ![]const u8 {
         const config_home = posix.getenv("XDG_CONFIG_HOME");
         if (config_home) |ch| {
-            return std.fmt.allocPrint(allocator, "{s}/hexa/config.json", .{ch});
+            return std.fmt.allocPrint(allocator, "{s}/hexa/mux.json", .{ch});
         }
 
         const home = posix.getenv("HOME") orelse return error.NoHome;
-        return std.fmt.allocPrint(allocator, "{s}/.config/hexa/config.json", .{home});
+        return std.fmt.allocPrint(allocator, "{s}/.config/hexa/mux.json", .{home});
     }
 };
 

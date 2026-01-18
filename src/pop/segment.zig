@@ -1,0 +1,157 @@
+const std = @import("std");
+const Style = @import("style.zig").Style;
+
+/// A rendered segment with text and style
+pub const Segment = struct {
+    text: []const u8,
+    style: Style = .{},
+};
+
+/// Segment render function signature
+pub const SegmentFn = *const fn (ctx: *Context) ?[]const Segment;
+
+/// Context passed to all segments during rendering
+pub const Context = struct {
+    allocator: std.mem.Allocator,
+
+    // Environment
+    cwd: []const u8 = "",
+    home: ?[]const u8 = null,
+    terminal_width: u16 = 80,
+
+    // Shell state (for prompt mode)
+    exit_status: ?i32 = null,
+    cmd_duration_ms: ?u64 = null,
+    jobs: u16 = 0,
+
+    // Mux state (for status bar mode)
+    session_name: []const u8 = "",
+    pane_names: []const []const u8 = &.{},
+    active_pane: usize = 0,
+
+    // Segment output storage
+    segment_buffer: std.ArrayList(Segment) = .empty,
+    text_buffer: std.ArrayList(u8) = .empty,
+
+    // Cached segment outputs
+    cached_segments: std.StringHashMap([]const Segment),
+
+    pub fn init(allocator: std.mem.Allocator) Context {
+        return .{
+            .allocator = allocator,
+            .cached_segments = std.StringHashMap([]const Segment).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Context) void {
+        self.segment_buffer.deinit(self.allocator);
+        self.text_buffer.deinit(self.allocator);
+        self.cached_segments.deinit();
+    }
+
+    /// Get environment variable
+    pub fn getEnv(self: *Context, key: []const u8) ?[]const u8 {
+        _ = self;
+        return std.posix.getenv(key);
+    }
+
+    /// Render a segment by name and return its segments
+    pub fn renderSegment(self: *Context, name: []const u8) ?[]const Segment {
+        // Check cache first
+        if (self.cached_segments.get(name)) |segs| {
+            return segs;
+        }
+
+        // Look up in built-in segments
+        const segments_mod = @import("segments/mod.zig");
+        if (segments_mod.registry.get(name)) |render_fn| {
+            if (render_fn(self)) |segs| {
+                // Cache and return
+                self.cached_segments.put(name, segs) catch {};
+                return segs;
+            }
+        }
+
+        // Check for custom.* segments
+        if (std.mem.startsWith(u8, name, "custom.")) {
+            // TODO: Handle custom segments from config
+            return null;
+        }
+
+        // Check for mux-specific segments
+        if (std.mem.eql(u8, name, "panes")) {
+            return self.renderPanes();
+        }
+        if (std.mem.eql(u8, name, "session")) {
+            return self.renderSession();
+        }
+
+        return null;
+    }
+
+    /// Render pane names for mux status bar
+    fn renderPanes(self: *Context) ?[]const Segment {
+        if (self.pane_names.len == 0) return null;
+
+        self.segment_buffer.clearRetainingCapacity();
+
+        for (self.pane_names, 0..) |pane_name, i| {
+            const is_active = i == self.active_pane;
+
+            // Add separator between panes
+            if (i > 0) {
+                self.segment_buffer.append(self.allocator, .{
+                    .text = " | ",
+                    .style = Style.parse("fg:7"),
+                }) catch return null;
+            }
+
+            // Add pane name with active/inactive styling
+            const style = if (is_active)
+                Style.parse("bg:1 fg:0")
+            else
+                Style.parse("bg:237 fg:250");
+
+            self.segment_buffer.append(self.allocator, .{
+                .text = pane_name,
+                .style = style,
+            }) catch return null;
+        }
+
+        return self.segment_buffer.items;
+    }
+
+    /// Render session name for mux status bar
+    fn renderSession(self: *Context) ?[]const Segment {
+        if (self.session_name.len == 0) return null;
+
+        self.segment_buffer.clearRetainingCapacity();
+        self.segment_buffer.append(self.allocator, .{
+            .text = self.session_name,
+            .style = Style{},
+        }) catch return null;
+
+        return self.segment_buffer.items;
+    }
+
+    /// Allocate text that persists for the render lifetime
+    pub fn allocText(self: *Context, text: []const u8) ![]const u8 {
+        const start = self.text_buffer.items.len;
+        try self.text_buffer.appendSlice(self.allocator, text);
+        return self.text_buffer.items[start..];
+    }
+
+    /// Format and allocate text
+    pub fn allocFmt(self: *Context, comptime fmt: []const u8, args: anytype) ![]const u8 {
+        const start = self.text_buffer.items.len;
+        try self.text_buffer.writer(self.allocator).print(fmt, args);
+        return self.text_buffer.items[start..];
+    }
+
+    /// Add a segment to the output buffer and return it
+    pub fn addSegment(self: *Context, text: []const u8, style: Style) ![]const Segment {
+        self.segment_buffer.clearRetainingCapacity();
+        try self.segment_buffer.append(self.allocator, .{ .text = text, .style = style });
+        return self.segment_buffer.items;
+    }
+};

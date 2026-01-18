@@ -343,4 +343,27 @@ pub const Layout = struct {
     pub fn paneCount(self: *Layout) usize {
         return self.panes.count();
     }
+
+    /// Get index of focused pane in iteration order
+    pub fn getFocusedIndex(self: *Layout) usize {
+        var ids: [16]u16 = undefined;
+        var count: usize = 0;
+
+        var it = self.panes.keyIterator();
+        while (it.next()) |id| {
+            if (count < 16) {
+                ids[count] = id.*;
+                count += 1;
+            }
+        }
+
+        // Sort to get consistent order
+        std.mem.sort(u16, ids[0..count], {}, std.sort.asc(u16));
+
+        for (ids[0..count], 0..) |id, i| {
+            if (id == self.focused_pane_id) return i;
+        }
+
+        return 0;
+    }
 };

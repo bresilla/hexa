@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
+const pop = @import("pop");
 
 const Pane = @import("pane.zig").Pane;
 const Layout = @import("layout.zig").Layout;
@@ -893,46 +894,198 @@ fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, activ
 
 fn drawStatusBar(state: *State, renderer: *Renderer) void {
     const y = state.term_height - 1; // 0-indexed
+    const width = state.term_width;
 
-    // Fill with spaces (blue bg, white fg)
-    for (0..state.term_width) |xi| {
+    // Fill with spaces (default bg)
+    for (0..width) |xi| {
         renderer.setCell(@intCast(xi), y, .{
             .char = ' ',
-            .fg = .{ .palette = 15 }, // white
-            .bg = .{ .palette = 4 }, // blue
+            .fg = .{ .palette = 7 }, // gray
         });
     }
 
-    // Left side: pane info
-    const pane_count = state.layout.paneCount();
-    const float_count = state.floating_panes.items.len;
+    // Create pop context
+    var ctx = pop.Context.init(state.allocator);
+    defer ctx.deinit();
 
-    var left_buf: [32]u8 = undefined;
-    var left_text: []const u8 = undefined;
-    if (float_count > 0) {
-        left_text = std.fmt.bufPrint(&left_buf, " [{d}] +{d}f", .{ pane_count, float_count }) catch " [?]";
-    } else {
-        left_text = std.fmt.bufPrint(&left_buf, " [{d}]", .{pane_count}) catch " [?]";
+    ctx.terminal_width = width;
+
+    // Collect pane names for center section
+    var pane_names: [16][]const u8 = undefined;
+    var pane_count: usize = 0;
+    var pane_it = state.layout.paneIterator();
+    while (pane_it.next()) |pane| {
+        if (pane_count < 16) {
+            // Get pane name (use PWD basename or "pane")
+            const pwd = pane.*.getPwd();
+            if (pwd) |p| {
+                // Get basename
+                const basename = std.fs.path.basename(p);
+                pane_names[pane_count] = basename;
+            } else {
+                pane_names[pane_count] = "pane";
+            }
+            pane_count += 1;
+        }
+    }
+    ctx.pane_names = pane_names[0..pane_count];
+    ctx.active_pane = state.layout.getFocusedIndex();
+    ctx.session_name = "hexa";
+
+    // === LEFT SECTION ===
+    // Format: time | netspeed | uptime
+    var left_x: u16 = 0;
+
+    // Time segment
+    if (ctx.renderSegment("time")) |segs| {
+        for (segs) |seg| {
+            left_x = drawSegment(renderer, left_x, y, seg, pop.Style.parse("bold bg:237 fg:250"));
+        }
     }
 
-    for (left_text, 0..) |char, i| {
-        renderer.setCell(@intCast(i), y, .{
+    // Arrow separator
+    left_x = drawStyledText(renderer, left_x, y, "", pop.Style.parse("fg:237 bg:1"));
+
+    // Netspeed segment
+    if (ctx.renderSegment("netspeed")) |segs| {
+        left_x = drawStyledText(renderer, left_x, y, " ", pop.Style.parse("bg:1 fg:0"));
+        for (segs) |seg| {
+            left_x = drawSegment(renderer, left_x, y, seg, pop.Style.parse("bg:1 fg:0"));
+        }
+        left_x = drawStyledText(renderer, left_x, y, " ", pop.Style.parse("bg:1 fg:0"));
+    }
+
+    // Arrow separator
+    left_x = drawStyledText(renderer, left_x, y, "", pop.Style.parse("fg:1"));
+
+    // Uptime segment
+    if (ctx.renderSegment("uptime")) |segs| {
+        left_x = drawStyledText(renderer, left_x, y, " ", pop.Style{});
+        for (segs) |seg| {
+            left_x = drawSegment(renderer, left_x, y, seg, pop.Style.parse("fg:7"));
+        }
+    }
+
+    // === RIGHT SECTION ===
+    // Format: session | cpu | mem | battery
+    var right_parts: [128]u8 = undefined;
+    var right_len: usize = 0;
+
+    // Build right section string
+    // Session
+    right_len += (std.fmt.bufPrint(right_parts[right_len..], "| {s} ", .{ctx.session_name}) catch "").len;
+
+    // CPU
+    if (ctx.renderSegment("cpu")) |segs| {
+        for (segs) |seg| {
+            right_len += (std.fmt.bufPrint(right_parts[right_len..], " {s} ", .{seg.text}) catch "").len;
+        }
+    }
+
+    // Memory
+    if (ctx.renderSegment("mem")) |segs| {
+        for (segs) |seg| {
+            right_len += (std.fmt.bufPrint(right_parts[right_len..], " {s}% ", .{seg.text}) catch "").len;
+        }
+    }
+
+    // Battery (if available)
+    if (ctx.renderSegment("battery")) |segs| {
+        for (segs) |seg| {
+            right_len += (std.fmt.bufPrint(right_parts[right_len..], " {s} ", .{seg.text}) catch "").len;
+        }
+    }
+
+    // Draw right section from the right edge
+    const right_start = width -| @as(u16, @intCast(right_len));
+    var rx: u16 = right_start;
+    for (right_parts[0..right_len]) |char| {
+        renderer.setCell(rx, y, .{
             .char = char,
-            .fg = .{ .palette = 15 }, // white
-            .bg = .{ .palette = 4 }, // blue
+            .fg = .{ .palette = 250 },
+            .bg = .{ .palette = 237 },
         });
+        rx += 1;
     }
 
-    // Right side: help hints
-    const help = " Alt+h/v:split Alt+n:next Alt+q:quit ";
-    const help_start = state.term_width -| @as(u16, @intCast(help.len));
-    for (help, 0..) |char, i| {
-        renderer.setCell(help_start + @as(u16, @intCast(i)), y, .{
-            .char = char,
-            .fg = .{ .palette = 15 }, // white
-            .bg = .{ .palette = 4 }, // blue
-        });
+    // === CENTER SECTION ===
+    // Draw pane names
+    const center_start = left_x + 2;
+    const center_end = right_start -| 2;
+    var cx: u16 = center_start;
+
+    for (ctx.pane_names, 0..) |pane_name, i| {
+        if (cx >= center_end) break;
+
+        // Separator
+        if (i > 0) {
+            cx = drawStyledText(renderer, cx, y, " | ", pop.Style.parse("fg:7"));
+        }
+
+        // Pane name with active/inactive style
+        const is_active = i == ctx.active_pane;
+        const style = if (is_active)
+            pop.Style.parse("bg:1 fg:0")
+        else
+            pop.Style.parse("bg:237 fg:250");
+
+        // Draw with powerline arrows
+        if (is_active) {
+            cx = drawStyledText(renderer, cx, y, "", pop.Style.parse("fg:1"));
+        } else {
+            cx = drawStyledText(renderer, cx, y, "", pop.Style.parse("fg:237"));
+        }
+
+        cx = drawStyledText(renderer, cx, y, " ", style);
+        cx = drawStyledText(renderer, cx, y, pane_name, style);
+        cx = drawStyledText(renderer, cx, y, " ", style);
+
+        if (is_active) {
+            cx = drawStyledText(renderer, cx, y, "", pop.Style.parse("fg:1"));
+        } else {
+            cx = drawStyledText(renderer, cx, y, "", pop.Style.parse("fg:237"));
+        }
     }
+}
+
+fn drawSegment(renderer: *Renderer, x: u16, y: u16, seg: pop.Segment, default_style: pop.Style) u16 {
+    const style = if (seg.style.isEmpty()) default_style else seg.style;
+    return drawStyledText(renderer, x, y, seg.text, style);
+}
+
+fn drawStyledText(renderer: *Renderer, start_x: u16, y: u16, text: []const u8, style: pop.Style) u16 {
+    var x = start_x;
+    var i: usize = 0;
+
+    while (i < text.len) {
+        // Decode UTF-8 codepoint
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const codepoint = std.unicode.utf8Decode(text[i..][0..len]) catch ' ';
+
+        var cell = render.Cell{
+            .char = codepoint,
+            .bold = style.bold,
+            .italic = style.italic,
+        };
+
+        // Convert pop.Color to render.Color
+        switch (style.fg) {
+            .none => {},
+            .palette => |p| cell.fg = .{ .palette = p },
+            .rgb => |rgb| cell.fg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } },
+        }
+        switch (style.bg) {
+            .none => {},
+            .palette => |p| cell.bg = .{ .palette = p },
+            .rgb => |rgb| cell.bg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } },
+        }
+
+        renderer.setCell(x, y, cell);
+        x += 1;
+        i += len;
+    }
+
+    return x;
 }
 
 fn getTermSize() struct { cols: u16, rows: u16 } {
