@@ -112,6 +112,19 @@ pub const PanesConfig = struct {
     status: StatusConfig = .{},
 };
 
+/// Notification configuration
+pub const NotificationConfig = struct {
+    fg: u8 = 0, // foreground color (palette index)
+    bg: u8 = 3, // background color (palette index)
+    bold: bool = true,
+    padding_x: u8 = 1,
+    padding_y: u8 = 0,
+    margin_x: u8 = 2,
+    margin_y: u8 = 1,
+    duration_ms: u32 = 3000,
+    position: []const u8 = "bottom_center",
+};
+
 pub const Config = struct {
     // Global keybindings (Alt + key)
     key_quit: u8 = 'q',
@@ -131,6 +144,9 @@ pub const Config = struct {
 
     // Panes (includes status)
     panes: PanesConfig = .{},
+
+    // Notifications
+    notifications: NotificationConfig = .{},
 
     // Internal
     _allocator: ?std.mem.Allocator = null,
@@ -365,6 +381,19 @@ pub const Config = struct {
             }
         }
 
+        // Parse notifications config
+        if (json.notifications) |n| {
+            if (n.fg) |v| config.notifications.fg = @intCast(@min(255, @max(0, v)));
+            if (n.bg) |v| config.notifications.bg = @intCast(@min(255, @max(0, v)));
+            if (n.bold) |v| config.notifications.bold = v;
+            if (n.padding_x) |v| config.notifications.padding_x = @intCast(@min(10, @max(0, v)));
+            if (n.padding_y) |v| config.notifications.padding_y = @intCast(@min(10, @max(0, v)));
+            if (n.margin_x) |v| config.notifications.margin_x = @intCast(@min(10, @max(0, v)));
+            if (n.margin_y) |v| config.notifications.margin_y = @intCast(@min(10, @max(0, v)));
+            if (n.duration_ms) |v| config.notifications.duration_ms = @intCast(@min(60000, @max(100, v)));
+            if (n.position) |v| config.notifications.position = allocator.dupe(u8, v) catch "bottom_center";
+        }
+
         return config;
     }
 
@@ -502,6 +531,18 @@ const JsonPanesConfig = struct {
     } = null,
 };
 
+const JsonNotificationConfig = struct {
+    fg: ?i64 = null,
+    bg: ?i64 = null,
+    bold: ?bool = null,
+    padding_x: ?i64 = null,
+    padding_y: ?i64 = null,
+    margin_x: ?i64 = null,
+    margin_y: ?i64 = null,
+    duration_ms: ?i64 = null,
+    position: ?[]const u8 = null,
+};
+
 const JsonConfig = struct {
     keys: ?struct {
         quit: ?[]const u8 = null,
@@ -509,6 +550,7 @@ const JsonConfig = struct {
     floats: ?[]const JsonFloatPane = null,
     splits: ?JsonSplitsConfig = null,
     panes: ?JsonPanesConfig = null,
+    notifications: ?JsonNotificationConfig = null,
 };
 
 const JsonOutput = struct {

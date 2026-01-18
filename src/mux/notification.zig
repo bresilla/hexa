@@ -17,7 +17,7 @@ pub const Position = enum {
 /// Style configuration for notifications
 pub const Style = struct {
     fg: Color = .{ .palette = 0 }, // black text
-    bg: Color = .{ .palette = 3 }, // yellow background
+    bg: Color = .{ .palette = 1 }, // red background (default, overridden by config)
     bold: bool = true,
     padding_x: u16 = 1, // horizontal padding inside box
     padding_y: u16 = 0, // vertical padding inside box
@@ -25,6 +25,19 @@ pub const Style = struct {
     margin_y: u16 = 1, // margin from screen edge
     border: bool = true,
     border_char: u8 = ' ', // border character (space = solid bg)
+
+    /// Create style from config
+    pub fn fromConfig(cfg: anytype) Style {
+        return .{
+            .fg = .{ .palette = cfg.fg },
+            .bg = .{ .palette = cfg.bg },
+            .bold = cfg.bold,
+            .padding_x = cfg.padding_x,
+            .padding_y = cfg.padding_y,
+            .margin_x = cfg.margin_x,
+            .margin_y = cfg.margin_y,
+        };
+    }
 };
 
 /// A single notification
@@ -57,6 +70,27 @@ pub const NotificationManager = struct {
             .default_position = .bottom_center,
             .default_style = .{},
             .default_duration_ms = 3000,
+        };
+    }
+
+    /// Initialize with config
+    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: anytype) NotificationManager {
+        // Parse position from string
+        const pos: Position = if (std.mem.eql(u8, cfg.position, "top_left")) .top_left
+            else if (std.mem.eql(u8, cfg.position, "top_center")) .top_center
+            else if (std.mem.eql(u8, cfg.position, "top_right")) .top_right
+            else if (std.mem.eql(u8, cfg.position, "center")) .center
+            else if (std.mem.eql(u8, cfg.position, "bottom_left")) .bottom_left
+            else if (std.mem.eql(u8, cfg.position, "bottom_right")) .bottom_right
+            else .bottom_center;
+
+        return .{
+            .allocator = allocator,
+            .current = null,
+            .queue = .empty,
+            .default_position = pos,
+            .default_style = Style.fromConfig(cfg),
+            .default_duration_ms = @intCast(cfg.duration_ms),
         };
     }
 

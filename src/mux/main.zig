@@ -88,7 +88,7 @@ const State = struct {
             .layout_height = layout_h,
             .renderer = try Renderer.init(allocator, width, height),
             .ses_client = SesClient.init(allocator),
-            .notifications = NotificationManager.init(allocator),
+            .notifications = NotificationManager.initWithConfig(allocator, cfg.notifications),
             .uuid = uuid,
             .ipc_server = ipc_server,
             .socket_path = socket_path,
@@ -596,7 +596,13 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
             const msg = msg_val.string;
             // Duplicate message since we'll free parsed
             const msg_copy = state.allocator.dupe(u8, msg) catch return;
-            state.notifications.showWithOptions(msg_copy, 3000, .bottom_center, .{}, true);
+            state.notifications.showWithOptions(
+                msg_copy,
+                state.notifications.default_duration_ms,
+                state.notifications.default_position,
+                state.notifications.default_style,
+                true,
+            );
             state.needs_render = true;
         }
     }
@@ -649,7 +655,13 @@ fn handleIpcConnection(state: *State, buffer: []u8) void {
         if (root.get("message")) |msg_val| {
             const msg = msg_val.string;
             const msg_copy = state.allocator.dupe(u8, msg) catch return;
-            state.notifications.showWithOptions(msg_copy, 3000, .bottom_center, .{}, true);
+            state.notifications.showWithOptions(
+                msg_copy,
+                state.notifications.default_duration_ms,
+                state.notifications.default_position,
+                state.notifications.default_style,
+                true,
+            );
             state.needs_render = true;
         }
     }
