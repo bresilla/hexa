@@ -29,7 +29,7 @@ const State = struct {
 
     fn init(allocator: std.mem.Allocator, width: u16, height: u16) !State {
         const cfg = core.Config.load(allocator);
-        const status_h: u16 = if (cfg.status_enabled) 1 else 0;
+        const status_h: u16 = if (cfg.status.enabled) 1 else 0;
         return .{
             .allocator = allocator,
             .config = cfg,
@@ -117,7 +117,7 @@ pub fn main() !void {
             if (new_size.cols != state.term_width or new_size.rows != state.term_height) {
                 state.term_width = new_size.cols;
                 state.term_height = new_size.rows;
-                const status_h: u16 = if (state.config.status_enabled) 1 else 0;
+                const status_h: u16 = if (state.config.status.enabled) 1 else 0;
                 state.status_height = status_h;
 
                 // Resize layout (tiled panes)
@@ -728,7 +728,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     }
 
     // Draw status bar if enabled
-    if (state.config.status_enabled) {
+    if (state.config.status.enabled) {
         drawStatusBar(state, renderer);
     }
 
@@ -893,21 +893,18 @@ fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, activ
 }
 
 fn drawStatusBar(state: *State, renderer: *Renderer) void {
-    const y = state.term_height - 1; // 0-indexed
+    const y = state.term_height - 1;
     const width = state.term_width;
+    const cfg = &state.config.status;
 
-    // Fill with spaces (default bg)
+    // Clear status bar
     for (0..width) |xi| {
-        renderer.setCell(@intCast(xi), y, .{
-            .char = ' ',
-            .fg = .{ .palette = 7 }, // gray
-        });
+        renderer.setCell(@intCast(xi), y, .{ .char = ' ' });
     }
 
     // Create pop context
     var ctx = pop.Context.init(state.allocator);
     defer ctx.deinit();
-
     ctx.terminal_width = width;
 
     // Collect pane names for center section
@@ -916,15 +913,8 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
     var pane_it = state.layout.paneIterator();
     while (pane_it.next()) |pane| {
         if (pane_count < 16) {
-            // Get pane name (use PWD basename or "pane")
             const pwd = pane.*.getPwd();
-            if (pwd) |p| {
-                // Get basename
-                const basename = std.fs.path.basename(p);
-                pane_names[pane_count] = basename;
-            } else {
-                pane_names[pane_count] = "pane";
-            }
+            pane_names[pane_count] = if (pwd) |p| std.fs.path.basename(p) else "pane";
             pane_count += 1;
         }
     }
@@ -932,120 +922,160 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
     ctx.active_pane = state.layout.getFocusedIndex();
     ctx.session_name = "hexa";
 
-    // === LEFT SECTION ===
-    // Format: time | netspeed | uptime
+    // === DRAW LEFT SECTION ===
     var left_x: u16 = 0;
-
-    // Time segment
-    if (ctx.renderSegment("time")) |segs| {
-        for (segs) |seg| {
-            left_x = drawSegment(renderer, left_x, y, seg, pop.Style.parse("bold bg:237 fg:250"));
-        }
+    for (cfg.left) |mod| {
+        left_x = drawModule(renderer, &ctx, mod, left_x, y);
     }
 
-    // Arrow separator
-    left_x = drawStyledText(renderer, left_x, y, "", pop.Style.parse("fg:237 bg:1"));
-
-    // Netspeed segment
-    if (ctx.renderSegment("netspeed")) |segs| {
-        left_x = drawStyledText(renderer, left_x, y, " ", pop.Style.parse("bg:1 fg:0"));
-        for (segs) |seg| {
-            left_x = drawSegment(renderer, left_x, y, seg, pop.Style.parse("bg:1 fg:0"));
-        }
-        left_x = drawStyledText(renderer, left_x, y, " ", pop.Style.parse("bg:1 fg:0"));
+    // === CALCULATE RIGHT WIDTH ===
+    var right_width: u16 = 0;
+    for (cfg.right) |mod| {
+        right_width += calcModuleWidth(&ctx, mod);
     }
+    const right_start = width -| right_width;
 
-    // Arrow separator
-    left_x = drawStyledText(renderer, left_x, y, "", pop.Style.parse("fg:1"));
-
-    // Uptime segment
-    if (ctx.renderSegment("uptime")) |segs| {
-        left_x = drawStyledText(renderer, left_x, y, " ", pop.Style{});
-        for (segs) |seg| {
-            left_x = drawSegment(renderer, left_x, y, seg, pop.Style.parse("fg:7"));
-        }
-    }
-
-    // === RIGHT SECTION ===
-    // Format: session | cpu | mem | battery
-    var right_parts: [128]u8 = undefined;
-    var right_len: usize = 0;
-
-    // Build right section string
-    // Session
-    right_len += (std.fmt.bufPrint(right_parts[right_len..], "| {s} ", .{ctx.session_name}) catch "").len;
-
-    // CPU
-    if (ctx.renderSegment("cpu")) |segs| {
-        for (segs) |seg| {
-            right_len += (std.fmt.bufPrint(right_parts[right_len..], " {s} ", .{seg.text}) catch "").len;
-        }
-    }
-
-    // Memory
-    if (ctx.renderSegment("mem")) |segs| {
-        for (segs) |seg| {
-            right_len += (std.fmt.bufPrint(right_parts[right_len..], " {s}% ", .{seg.text}) catch "").len;
-        }
-    }
-
-    // Battery (if available)
-    if (ctx.renderSegment("battery")) |segs| {
-        for (segs) |seg| {
-            right_len += (std.fmt.bufPrint(right_parts[right_len..], " {s} ", .{seg.text}) catch "").len;
-        }
-    }
-
-    // Draw right section from the right edge
-    const right_start = width -| @as(u16, @intCast(right_len));
+    // === DRAW RIGHT SECTION ===
     var rx: u16 = right_start;
-    for (right_parts[0..right_len]) |char| {
-        renderer.setCell(rx, y, .{
-            .char = char,
-            .fg = .{ .palette = 250 },
-            .bg = .{ .palette = 237 },
-        });
-        rx += 1;
+    for (cfg.right) |mod| {
+        rx = drawModule(renderer, &ctx, mod, rx, y);
     }
 
-    // === CENTER SECTION ===
-    // Draw pane names
-    const center_start = left_x + 2;
-    const center_end = right_start -| 2;
-    var cx: u16 = center_start;
-
-    for (ctx.pane_names, 0..) |pane_name, i| {
-        if (cx >= center_end) break;
-
-        // Separator
-        if (i > 0) {
-            cx = drawStyledText(renderer, cx, y, " | ", pop.Style.parse("fg:7"));
-        }
-
-        // Pane name with active/inactive style
-        const is_active = i == ctx.active_pane;
-        const style = if (is_active)
-            pop.Style.parse("bg:1 fg:0")
-        else
-            pop.Style.parse("bg:237 fg:250");
-
-        // Draw with powerline arrows
-        if (is_active) {
-            cx = drawStyledText(renderer, cx, y, "", pop.Style.parse("fg:1"));
-        } else {
-            cx = drawStyledText(renderer, cx, y, "", pop.Style.parse("fg:237"));
-        }
-
-        cx = drawStyledText(renderer, cx, y, " ", style);
-        cx = drawStyledText(renderer, cx, y, pane_name, style);
-        cx = drawStyledText(renderer, cx, y, " ", style);
-
-        if (is_active) {
-            cx = drawStyledText(renderer, cx, y, "", pop.Style.parse("fg:1"));
-        } else {
-            cx = drawStyledText(renderer, cx, y, "", pop.Style.parse("fg:237"));
+    // === CALCULATE CENTER WIDTH ===
+    var center_width: u16 = 0;
+    for (cfg.center) |mod| {
+        if (std.mem.eql(u8, mod.name, "panes")) {
+            for (ctx.pane_names, 0..) |pane_name, i| {
+                if (i > 0) center_width += @as(u16, @intCast(mod.separator.len));
+                center_width += 2 + @as(u16, @intCast(pane_name.len)) + 2; // arrows + space + name + space
+            }
         }
     }
+
+    // === DRAW CENTER SECTION (truly centered) ===
+    const center_start = (width -| center_width) / 2;
+    if (center_start > left_x + 2 and center_start + center_width < right_start -| 2) {
+        var cx: u16 = center_start;
+        for (cfg.center) |mod| {
+            if (std.mem.eql(u8, mod.name, "panes")) {
+                const active_style = pop.Style.parse(mod.active_style);
+                const inactive_style = pop.Style.parse(mod.inactive_style);
+                const sep_style = pop.Style.parse(mod.separator_style);
+
+                for (ctx.pane_names, 0..) |pane_name, i| {
+                    if (i > 0) {
+                        cx = drawStyledText(renderer, cx, y, mod.separator, sep_style);
+                    }
+                    const is_active = i == ctx.active_pane;
+                    const style = if (is_active) active_style else inactive_style;
+                    const arrow_fg = if (is_active) active_style.bg else inactive_style.bg;
+                    const arrow_style = pop.Style{ .fg = arrow_fg };
+
+                    cx = drawStyledText(renderer, cx, y, "", arrow_style);
+                    cx = drawStyledText(renderer, cx, y, " ", style);
+                    cx = drawStyledText(renderer, cx, y, pane_name, style);
+                    cx = drawStyledText(renderer, cx, y, " ", style);
+                    cx = drawStyledText(renderer, cx, y, "", arrow_style);
+                }
+            }
+        }
+    }
+}
+
+fn drawModule(renderer: *Renderer, ctx: *pop.Context, mod: core.config.StatusModule, start_x: u16, y: u16) u16 {
+    var x = start_x;
+
+    // Get the output text for this module
+    var output_text: []const u8 = "";
+
+    // Special handling for "session"
+    if (std.mem.eql(u8, mod.name, "session")) {
+        output_text = ctx.session_name;
+    } else {
+        // Render segment to get output text
+        if (ctx.renderSegment(mod.name)) |segs| {
+            if (segs.len > 0) {
+                output_text = segs[0].text;
+            }
+        }
+    }
+
+    // Draw each output in the array
+    for (mod.outputs) |out| {
+        const style = pop.Style.parse(out.style);
+        x = drawFormatted(renderer, x, y, out.format, output_text, style);
+    }
+
+    return x;
+}
+
+fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const u8, output: []const u8, style: pop.Style) u16 {
+    var x = start_x;
+    var i: usize = 0;
+
+    while (i < format.len) {
+        // Look for $output
+        if (i + 7 <= format.len and std.mem.eql(u8, format[i..][0..7], "$output")) {
+            x = drawStyledText(renderer, x, y, output, style);
+            i += 7;
+        } else {
+            // Draw single char (handle UTF-8)
+            const len = std.unicode.utf8ByteSequenceLength(format[i]) catch 1;
+            const end = @min(i + len, format.len);
+            x = drawStyledText(renderer, x, y, format[i..end], style);
+            i = end;
+        }
+    }
+    return x;
+}
+
+fn calcModuleWidth(ctx: *pop.Context, mod: core.config.StatusModule) u16 {
+    var width: u16 = 0;
+
+    // Get the output text for this module
+    var output_text: []const u8 = "";
+
+    // Special handling for "session"
+    if (std.mem.eql(u8, mod.name, "session")) {
+        output_text = ctx.session_name;
+    } else {
+        // Render segment to get output text
+        if (ctx.renderSegment(mod.name)) |segs| {
+            if (segs.len > 0) {
+                output_text = segs[0].text;
+            }
+        }
+    }
+
+    // Sum width of all outputs
+    for (mod.outputs) |out| {
+        width += calcFormattedWidth(out.format, output_text);
+    }
+
+    return width;
+}
+
+fn calcFormattedWidth(format: []const u8, output: []const u8) u16 {
+    var width: u16 = 0;
+    var i: usize = 0;
+
+    while (i < format.len) {
+        if (i + 7 <= format.len and std.mem.eql(u8, format[i..][0..7], "$output")) {
+            // Count output chars
+            var j: usize = 0;
+            while (j < output.len) {
+                const len = std.unicode.utf8ByteSequenceLength(output[j]) catch 1;
+                j += len;
+                width += 1;
+            }
+            i += 7;
+        } else {
+            const len = std.unicode.utf8ByteSequenceLength(format[i]) catch 1;
+            i += len;
+            width += 1;
+        }
+    }
+    return width;
 }
 
 fn drawSegment(renderer: *Renderer, x: u16, y: u16, seg: pop.Segment, default_style: pop.Style) u16 {

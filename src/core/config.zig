@@ -1,6 +1,35 @@
 const std = @import("std");
 const posix = std.posix;
 
+/// Output definition for status modules (style + format pair)
+pub const OutputDef = struct {
+    style: []const u8 = "",
+    format: []const u8 = "$output",
+};
+
+/// Status bar module definition
+pub const StatusModule = struct {
+    name: []const u8,
+    // Array of outputs (each with style + format)
+    outputs: []const OutputDef = &[_]OutputDef{},
+    // Optional for custom modules
+    command: ?[]const u8 = null,
+    when: ?[]const u8 = null,
+    // For panes module
+    active_style: []const u8 = "bg:1 fg:0",
+    inactive_style: []const u8 = "bg:237 fg:250",
+    separator: []const u8 = " | ",
+    separator_style: []const u8 = "fg:7",
+};
+
+/// Status bar config
+pub const StatusConfig = struct {
+    enabled: bool = true,
+    left: []const StatusModule = &[_]StatusModule{},
+    center: []const StatusModule = &[_]StatusModule{},
+    right: []const StatusModule = &[_]StatusModule{},
+};
+
 pub const FloatDef = struct {
     key: u8,
     name: []const u8,
@@ -39,7 +68,7 @@ pub const Config = struct {
     floats: []FloatDef = &[_]FloatDef{},
 
     // Status bar
-    status_enabled: bool = true,
+    status: StatusConfig = .{},
 
     // Internal
     _allocator: ?std.mem.Allocator = null,
@@ -112,7 +141,19 @@ pub const Config = struct {
         // Apply status settings
         if (json.status) |s| {
             if (s.enabled) |e| {
-                config.status_enabled = e;
+                config.status.enabled = e;
+            }
+            // Parse left modules
+            if (s.left) |left_mods| {
+                config.status.left = parseStatusModules(allocator, left_mods);
+            }
+            // Parse center modules
+            if (s.center) |center_mods| {
+                config.status.center = parseStatusModules(allocator, center_mods);
+            }
+            // Parse right modules
+            if (s.right) |right_mods| {
+                config.status.right = parseStatusModules(allocator, right_mods);
             }
         }
 
@@ -169,6 +210,36 @@ pub const Config = struct {
         return null;
     }
 
+    fn parseStatusModules(allocator: std.mem.Allocator, json_mods: []const JsonStatusModule) []const StatusModule {
+        var list: std.ArrayList(StatusModule) = .empty;
+        for (json_mods) |jm| {
+            // Parse outputs array
+            var outputs: []const OutputDef = &[_]OutputDef{};
+            if (jm.outputs) |json_outputs| {
+                var output_list: std.ArrayList(OutputDef) = .empty;
+                for (json_outputs) |jo| {
+                    output_list.append(allocator, .{
+                        .style = if (jo.style) |s| allocator.dupe(u8, s) catch "" else "",
+                        .format = if (jo.format) |f| allocator.dupe(u8, f) catch "$output" else "$output",
+                    }) catch continue;
+                }
+                outputs = output_list.toOwnedSlice(allocator) catch &[_]OutputDef{};
+            }
+
+            list.append(allocator, .{
+                .name = allocator.dupe(u8, jm.name) catch continue,
+                .outputs = outputs,
+                .command = if (jm.command) |c| allocator.dupe(u8, c) catch null else null,
+                .when = if (jm.when) |w| allocator.dupe(u8, w) catch null else null,
+                .active_style = if (jm.active_style) |s| allocator.dupe(u8, s) catch "bg:1 fg:0" else "bg:1 fg:0",
+                .inactive_style = if (jm.inactive_style) |s| allocator.dupe(u8, s) catch "bg:237 fg:250" else "bg:237 fg:250",
+                .separator = if (jm.separator) |s| allocator.dupe(u8, s) catch " | " else " | ",
+                .separator_style = if (jm.separator_style) |s| allocator.dupe(u8, s) catch "fg:7" else "fg:7",
+            }) catch continue;
+        }
+        return list.toOwnedSlice(allocator) catch &[_]StatusModule{};
+    }
+
     fn getConfigPath(allocator: std.mem.Allocator) ![]const u8 {
         const config_home = posix.getenv("XDG_CONFIG_HOME");
         if (config_home) |ch| {
@@ -215,5 +286,24 @@ const JsonConfig = struct {
     } = null,
     status: ?struct {
         enabled: ?bool = null,
+        left: ?[]const JsonStatusModule = null,
+        center: ?[]const JsonStatusModule = null,
+        right: ?[]const JsonStatusModule = null,
     } = null,
+};
+
+const JsonOutput = struct {
+    style: ?[]const u8 = null,
+    format: ?[]const u8 = null,
+};
+
+const JsonStatusModule = struct {
+    name: []const u8,
+    outputs: ?[]const JsonOutput = null,
+    command: ?[]const u8 = null,
+    when: ?[]const u8 = null,
+    active_style: ?[]const u8 = null,
+    inactive_style: ?[]const u8 = null,
+    separator: ?[]const u8 = null,
+    separator_style: ?[]const u8 = null,
 };
