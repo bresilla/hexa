@@ -41,7 +41,6 @@ pub const FloatStylePosition = enum {
 
 pub const FloatStyle = struct {
     // Border appearance
-    color: u8 = 1,
     top_left: u21 = 0x256D, // ╭
     top_right: u21 = 0x256E, // ╮
     bottom_left: u21 = 0x2570, // ╰
@@ -65,32 +64,73 @@ pub const FloatDef = struct {
     pos_y: ?u8 = null, // position as percent (0=top, 50=center, 100=bottom)
     padding_x: ?u8 = null,
     padding_y: ?u8 = null,
+    // Border color (per-float override)
+    color: ?BorderColor = null,
     // Border style and optional module
     style: ?FloatStyle = null,
 };
 
-pub const Config = struct {
-    // Keybindings (Alt + key)
-    key_quit: u8 = 'q',
+/// Border color config (active/passive)
+pub const BorderColor = struct {
+    active: u8 = 1,
+    passive: u8 = 237,
+};
+
+/// Split border style with junction characters
+pub const SplitStyle = struct {
+    vertical: u21 = 0x2502, // │
+    horizontal: u21 = 0x2500, // ─
+    cross: u21 = 0x253C, // ┼
+    top_t: u21 = 0x252C, // ┬
+    bottom_t: u21 = 0x2534, // ┴
+    left_t: u21 = 0x251C, // ├
+    right_t: u21 = 0x2524, // ┤
+};
+
+/// Splits configuration
+pub const SplitsConfig = struct {
+    // Keys
     key_split_h: u8 = 'h',
     key_split_v: u8 = 'v',
-    key_new_pane: u8 = 't',
-    key_next_pane: u8 = 'n',
-    key_prev_pane: u8 = 'p',
-    key_close_pane: u8 = 'x',
+    // Border color
+    color: BorderColor = .{},
+    // Simple separator (when no style)
+    separator_v: u21 = 0x2502, // │
+    separator_h: u21 = 0x2500, // ─
+    // Full border style (if set, uses junctions)
+    style: ?SplitStyle = null,
+};
+
+/// Panes configuration (includes status bar)
+pub const PanesConfig = struct {
+    // Keys
+    key_new: u8 = 't',
+    key_next: u8 = 'n',
+    key_prev: u8 = 'p',
+    key_close: u8 = 'x',
+    // Status bar
+    status: StatusConfig = .{},
+};
+
+pub const Config = struct {
+    // Global keybindings (Alt + key)
+    key_quit: u8 = 'q',
 
     // Floating pane defaults
     float_width_percent: u8 = 60,
     float_height_percent: u8 = 60,
     float_padding_x: u8 = 1, // left/right padding inside border
     float_padding_y: u8 = 0, // top/bottom padding inside border
-    float_border_color: u8 = 1, // palette color for border (0-15)
+    float_color: BorderColor = .{}, // border colors (active/passive)
 
     // Named floats
     floats: []FloatDef = &[_]FloatDef{},
 
-    // Status bar
-    status: StatusConfig = .{},
+    // Splits
+    splits: SplitsConfig = .{},
+
+    // Panes (includes status)
+    panes: PanesConfig = .{},
 
     // Internal
     _allocator: ?std.mem.Allocator = null,
@@ -113,66 +153,103 @@ pub const Config = struct {
 
         const json = parsed.value;
 
-        // Apply keybindings
+        // Apply global keybindings
         if (json.keys) |keys| {
             if (keys.quit) |k| {
                 if (k.len > 0) config.key_quit = k[0];
             }
-            if (keys.split_h) |k| {
-                if (k.len > 0) config.key_split_h = k[0];
+        }
+
+        // Parse panes config
+        if (json.panes) |p| {
+            // Keys
+            if (p.keys) |keys| {
+                if (keys.new) |k| if (k.len > 0) {
+                    config.panes.key_new = k[0];
+                };
+                if (keys.next) |k| if (k.len > 0) {
+                    config.panes.key_next = k[0];
+                };
+                if (keys.prev) |k| if (k.len > 0) {
+                    config.panes.key_prev = k[0];
+                };
+                if (keys.close) |k| if (k.len > 0) {
+                    config.panes.key_close = k[0];
+                };
             }
-            if (keys.split_v) |k| {
-                if (k.len > 0) config.key_split_v = k[0];
-            }
-            if (keys.new_pane) |k| {
-                if (k.len > 0) config.key_new_pane = k[0];
-            }
-            if (keys.next_pane) |k| {
-                if (k.len > 0) config.key_next_pane = k[0];
-            }
-            if (keys.prev_pane) |k| {
-                if (k.len > 0) config.key_prev_pane = k[0];
-            }
-            if (keys.close_pane) |k| {
-                if (k.len > 0) config.key_close_pane = k[0];
+            // Status bar
+            if (p.status) |s| {
+                if (s.enabled) |e| {
+                    config.panes.status.enabled = e;
+                }
+                if (s.left) |left_mods| {
+                    config.panes.status.left = parseStatusModules(allocator, left_mods);
+                }
+                if (s.center) |center_mods| {
+                    config.panes.status.center = parseStatusModules(allocator, center_mods);
+                }
+                if (s.right) |right_mods| {
+                    config.panes.status.right = parseStatusModules(allocator, right_mods);
+                }
             }
         }
 
-        // Apply status settings
-        if (json.status) |s| {
-            if (s.enabled) |e| {
-                config.status.enabled = e;
-            }
-            // Parse left modules
-            if (s.left) |left_mods| {
-                config.status.left = parseStatusModules(allocator, left_mods);
-            }
-            // Parse center modules
-            if (s.center) |center_mods| {
-                config.status.center = parseStatusModules(allocator, center_mods);
-            }
-            // Parse right modules
-            if (s.right) |right_mods| {
-                config.status.right = parseStatusModules(allocator, right_mods);
-            }
-        }
-
-        // Parse floats array
+        // Parse floats array (first keyless entry = defaults)
         if (json.floats) |json_floats| {
             var float_list: std.ArrayList(FloatDef) = .empty;
-            for (json_floats) |jf| {
+
+            // Check for defaults (first entry without key)
+            var def_width: ?u8 = null;
+            var def_height: ?u8 = null;
+            var def_pos_x: ?u8 = null;
+            var def_pos_y: ?u8 = null;
+            var def_pad_x: ?u8 = null;
+            var def_pad_y: ?u8 = null;
+            var def_color: ?BorderColor = null;
+
+            for (json_floats, 0..) |jf, idx| {
+                // First entry without key = defaults
+                if (idx == 0 and jf.key.len == 0) {
+                    if (jf.width) |v| def_width = @intCast(@min(100, @max(10, v)));
+                    if (jf.height) |v| def_height = @intCast(@min(100, @max(10, v)));
+                    if (jf.pos_x) |v| def_pos_x = @intCast(@min(100, @max(0, v)));
+                    if (jf.pos_y) |v| def_pos_y = @intCast(@min(100, @max(0, v)));
+                    if (jf.padding_x) |v| def_pad_x = @intCast(@min(10, @max(0, v)));
+                    if (jf.padding_y) |v| def_pad_y = @intCast(@min(10, @max(0, v)));
+                    if (jf.color) |jc| {
+                        var c = BorderColor{};
+                        if (jc.active) |a| c.active = @intCast(@min(255, @max(0, a)));
+                        if (jc.passive) |p| c.passive = @intCast(@min(255, @max(0, p)));
+                        def_color = c;
+                    }
+                    // Apply defaults to config
+                    if (def_width) |w| config.float_width_percent = w;
+                    if (def_height) |h| config.float_height_percent = h;
+                    if (def_pad_x) |p| config.float_padding_x = p;
+                    if (def_pad_y) |p| config.float_padding_y = p;
+                    if (def_color) |c| config.float_color = c;
+                    continue;
+                }
+
                 const key: u8 = if (jf.key.len > 0) jf.key[0] else continue;
                 const command: ?[]const u8 = if (jf.command) |cmd|
                     allocator.dupe(u8, cmd) catch null
                 else
                     null;
 
+                // Parse color if present
+                const color: ?BorderColor = if (jf.color) |jc| blk: {
+                    var c = BorderColor{};
+                    if (jc.active) |a| c.active = @intCast(@min(255, @max(0, a)));
+                    if (jc.passive) |p| c.passive = @intCast(@min(255, @max(0, p)));
+                    break :blk c;
+                } else null;
+
                 // Parse style if present
                 const style: ?FloatStyle = if (jf.style) |js| blk: {
                     var result = FloatStyle{};
 
                     // Border appearance
-                    if (js.color) |col| result.color = @intCast(@min(255, @max(0, col)));
                     if (js.top_left) |s| if (s.len > 0) {
                         result.top_left = std.unicode.utf8Decode(s) catch 0x256D;
                     };
@@ -224,16 +301,68 @@ pub const Config = struct {
                     .command = command,
                     .alone = jf.alone orelse false,
                     .pwd = jf.pwd orelse false,
-                    .width_percent = if (jf.width) |v| @intCast(@min(100, @max(10, v))) else null,
-                    .height_percent = if (jf.height) |v| @intCast(@min(100, @max(10, v))) else null,
-                    .pos_x = if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else null,
-                    .pos_y = if (jf.pos_y) |v| @intCast(@min(100, @max(0, v))) else null,
-                    .padding_x = if (jf.padding_x) |v| @intCast(@min(10, @max(0, v))) else null,
-                    .padding_y = if (jf.padding_y) |v| @intCast(@min(10, @max(0, v))) else null,
+                    .width_percent = if (jf.width) |v| @intCast(@min(100, @max(10, v))) else def_width,
+                    .height_percent = if (jf.height) |v| @intCast(@min(100, @max(10, v))) else def_height,
+                    .pos_x = if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else def_pos_x,
+                    .pos_y = if (jf.pos_y) |v| @intCast(@min(100, @max(0, v))) else def_pos_y,
+                    .padding_x = if (jf.padding_x) |v| @intCast(@min(10, @max(0, v))) else def_pad_x,
+                    .padding_y = if (jf.padding_y) |v| @intCast(@min(10, @max(0, v))) else def_pad_y,
+                    .color = color orelse def_color,
                     .style = style,
                 }) catch continue;
             }
             config.floats = float_list.toOwnedSlice(allocator) catch &[_]FloatDef{};
+        }
+
+        // Parse splits config
+        if (json.splits) |sp| {
+            // Keys
+            if (sp.keys) |keys| {
+                if (keys.split_h) |k| if (k.len > 0) {
+                    config.splits.key_split_h = k[0];
+                };
+                if (keys.split_v) |k| if (k.len > 0) {
+                    config.splits.key_split_v = k[0];
+                };
+            }
+            // Color
+            if (sp.color) |jc| {
+                if (jc.active) |a| config.splits.color.active = @intCast(@min(255, @max(0, a)));
+                if (jc.passive) |p| config.splits.color.passive = @intCast(@min(255, @max(0, p)));
+            }
+            // Simple separators
+            if (sp.separator_v) |s| if (s.len > 0) {
+                config.splits.separator_v = std.unicode.utf8Decode(s) catch 0x2502;
+            };
+            if (sp.separator_h) |s| if (s.len > 0) {
+                config.splits.separator_h = std.unicode.utf8Decode(s) catch 0x2500;
+            };
+            // Full style
+            if (sp.style) |js| {
+                var style = SplitStyle{};
+                if (js.vertical) |s| if (s.len > 0) {
+                    style.vertical = std.unicode.utf8Decode(s) catch 0x2502;
+                };
+                if (js.horizontal) |s| if (s.len > 0) {
+                    style.horizontal = std.unicode.utf8Decode(s) catch 0x2500;
+                };
+                if (js.cross) |s| if (s.len > 0) {
+                    style.cross = std.unicode.utf8Decode(s) catch 0x253C;
+                };
+                if (js.top_t) |s| if (s.len > 0) {
+                    style.top_t = std.unicode.utf8Decode(s) catch 0x252C;
+                };
+                if (js.bottom_t) |s| if (s.len > 0) {
+                    style.bottom_t = std.unicode.utf8Decode(s) catch 0x2534;
+                };
+                if (js.left_t) |s| if (s.len > 0) {
+                    style.left_t = std.unicode.utf8Decode(s) catch 0x251C;
+                };
+                if (js.right_t) |s| if (s.len > 0) {
+                    style.right_t = std.unicode.utf8Decode(s) catch 0x2524;
+                };
+                config.splits.style = style;
+            }
         }
 
         return config;
@@ -301,9 +430,13 @@ pub const Config = struct {
 };
 
 // JSON structure for parsing
+const JsonBorderColor = struct {
+    active: ?i64 = null,
+    passive: ?i64 = null,
+};
+
 const JsonFloatStyle = struct {
     // Border appearance
-    color: ?i64 = null,
     top_left: ?[]const u8 = null,
     top_right: ?[]const u8 = null,
     bottom_left: ?[]const u8 = null,
@@ -319,7 +452,7 @@ const JsonFloatStyle = struct {
 };
 
 const JsonFloatPane = struct {
-    key: []const u8,
+    key: []const u8 = "",
     command: ?[]const u8 = null,
     alone: ?bool = null,
     pwd: ?bool = null,
@@ -329,26 +462,53 @@ const JsonFloatPane = struct {
     pos_y: ?i64 = null,
     padding_x: ?i64 = null,
     padding_y: ?i64 = null,
+    color: ?JsonBorderColor = null,
     style: ?JsonFloatStyle = null,
 };
 
-const JsonConfig = struct {
+const JsonSplitStyle = struct {
+    vertical: ?[]const u8 = null,
+    horizontal: ?[]const u8 = null,
+    cross: ?[]const u8 = null,
+    top_t: ?[]const u8 = null,
+    bottom_t: ?[]const u8 = null,
+    left_t: ?[]const u8 = null,
+    right_t: ?[]const u8 = null,
+};
+
+const JsonSplitsConfig = struct {
     keys: ?struct {
-        quit: ?[]const u8 = null,
         split_h: ?[]const u8 = null,
         split_v: ?[]const u8 = null,
-        new_pane: ?[]const u8 = null,
-        next_pane: ?[]const u8 = null,
-        prev_pane: ?[]const u8 = null,
-        close_pane: ?[]const u8 = null,
     } = null,
-    floats: ?[]const JsonFloatPane = null,
+    color: ?JsonBorderColor = null,
+    separator_v: ?[]const u8 = null,
+    separator_h: ?[]const u8 = null,
+    style: ?JsonSplitStyle = null,
+};
+
+const JsonPanesConfig = struct {
+    keys: ?struct {
+        new: ?[]const u8 = null,
+        next: ?[]const u8 = null,
+        prev: ?[]const u8 = null,
+        close: ?[]const u8 = null,
+    } = null,
     status: ?struct {
         enabled: ?bool = null,
         left: ?[]const JsonStatusModule = null,
         center: ?[]const JsonStatusModule = null,
         right: ?[]const JsonStatusModule = null,
     } = null,
+};
+
+const JsonConfig = struct {
+    keys: ?struct {
+        quit: ?[]const u8 = null,
+    } = null,
+    floats: ?[]const JsonFloatPane = null,
+    splits: ?JsonSplitsConfig = null,
+    panes: ?JsonPanesConfig = null,
 };
 
 const JsonOutput = struct {

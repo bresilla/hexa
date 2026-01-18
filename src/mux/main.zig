@@ -49,7 +49,7 @@ const State = struct {
 
     fn init(allocator: std.mem.Allocator, width: u16, height: u16) !State {
         const cfg = core.Config.load(allocator);
-        const status_h: u16 = if (cfg.status.enabled) 1 else 0;
+        const status_h: u16 = if (cfg.panes.status.enabled) 1 else 0;
         const layout_h = height - status_h;
         return .{
             .allocator = allocator,
@@ -191,7 +191,7 @@ pub fn main() !void {
             if (new_size.cols != state.term_width or new_size.rows != state.term_height) {
                 state.term_width = new_size.cols;
                 state.term_height = new_size.rows;
-                const status_h: u16 = if (state.config.status.enabled) 1 else 0;
+                const status_h: u16 = if (state.config.panes.status.enabled) 1 else 0;
                 state.status_height = status_h;
                 state.layout_width = new_size.cols;
                 state.layout_height = new_size.rows - status_h;
@@ -572,20 +572,24 @@ fn handleAltKey(state: *State, key: u8) bool {
         return true;
     }
 
-    if (key == cfg.key_split_h) {
+    // Split keys
+    const split_h_key = cfg.splits.key_split_h;
+    const split_v_key = cfg.splits.key_split_v;
+
+    if (key == split_h_key) {
         _ = state.currentLayout().splitFocused(.horizontal) catch null;
         state.needs_render = true;
         return true;
     }
 
-    if (key == cfg.key_split_v) {
+    if (key == split_v_key) {
         _ = state.currentLayout().splitFocused(.vertical) catch null;
         state.needs_render = true;
         return true;
     }
 
     // Alt+t = new tab
-    if (key == cfg.key_new_pane) {
+    if (key == cfg.panes.key_new) {
         state.active_floating = null;
         state.createTab() catch {};
         state.needs_render = true;
@@ -593,7 +597,7 @@ fn handleAltKey(state: *State, key: u8) bool {
     }
 
     // Alt+n = next tab
-    if (key == cfg.key_next_pane) {
+    if (key == cfg.panes.key_next) {
         state.active_floating = null;
         state.nextTab();
         state.needs_render = true;
@@ -601,7 +605,7 @@ fn handleAltKey(state: *State, key: u8) bool {
     }
 
     // Alt+p = previous tab
-    if (key == cfg.key_prev_pane) {
+    if (key == cfg.panes.key_prev) {
         state.active_floating = null;
         state.prevTab();
         state.needs_render = true;
@@ -609,7 +613,7 @@ fn handleAltKey(state: *State, key: u8) bool {
     }
 
     // Alt+x or Alt+w = close current tab (or quit if last tab)
-    if (key == cfg.key_close_pane or key == 'w') {
+    if (key == cfg.panes.key_close or key == 'w') {
         if (state.active_floating) |idx| {
             const pane = state.floating_panes.orderedRemove(idx);
             pane.deinit();
@@ -767,7 +771,7 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     const pos_y_pct: u16 = float_def.pos_y orelse 50; // default center
     const pad_x_cfg: u16 = float_def.padding_x orelse cfg.float_padding_x;
     const pad_y_cfg: u16 = float_def.padding_y orelse cfg.float_padding_y;
-    const border_color: u8 = if (float_def.style) |s| s.color else cfg.float_border_color;
+    const border_color = float_def.color orelse cfg.float_color;
 
     // Calculate outer frame size
     const avail_h = state.term_height - state.status_height;
@@ -817,10 +821,9 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
         }
     }
 
-    // Store style reference (includes border and optional module)
+    // Store style reference (includes border characters and optional module)
     if (float_def.style) |*style| {
         pane.float_style = style;
-        pane.border_color = style.color;
     }
 
     try state.floating_panes.append(state.allocator, pane);
@@ -885,7 +888,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     }
 
     // Draw status bar if enabled
-    if (state.config.status.enabled) {
+    if (state.config.panes.status.enabled) {
         drawStatusBar(state, renderer);
     }
 
@@ -942,33 +945,122 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 }
 
 fn drawSplitBorders(state: *State, renderer: *Renderer) void {
-    const border_cell = render.Cell{
-        .char = '│',
-        .fg = .{ .palette = 8 }, // gray
-    };
-    const h_border_cell = render.Cell{
-        .char = '─',
-        .fg = .{ .palette = 8 }, // gray
-    };
+    const splits = &state.config.splits;
+    const content_height = state.term_height - state.status_height;
 
-    // Find split lines by checking pane boundaries
+    // Get characters and color from config
+    const v_char: u21 = if (splits.style) |s| s.vertical else splits.separator_v;
+    const h_char: u21 = if (splits.style) |s| s.horizontal else splits.separator_h;
+    const color: u8 = splits.color.passive; // splits use passive color
+
+    // Junction characters (only used if style is set)
+    const cross_char: u21 = if (splits.style) |s| s.cross else v_char;
+    const top_t: u21 = if (splits.style) |s| s.top_t else v_char;
+    const bottom_t: u21 = if (splits.style) |s| s.bottom_t else v_char;
+    const left_t: u21 = if (splits.style) |s| s.left_t else h_char;
+    const right_t: u21 = if (splits.style) |s| s.right_t else h_char;
+
+    // Collect vertical and horizontal line positions
+    var v_lines: [64]u16 = undefined;
+    var v_line_count: usize = 0;
+    var h_lines: [64]u16 = undefined;
+    var h_line_count: usize = 0;
+
     var pane_it = state.currentLayout().paneIterator();
     while (pane_it.next()) |pane| {
         const right_edge = pane.*.x + pane.*.width;
         const bottom_edge = pane.*.y + pane.*.height;
 
-        // Draw vertical separator if pane doesn't reach right edge
-        if (right_edge < state.term_width) {
-            for (0..pane.*.height) |row| {
-                renderer.setCell(right_edge, pane.*.y + @as(u16, @intCast(row)), border_cell);
+        // Record vertical line position
+        if (right_edge < state.term_width and v_line_count < v_lines.len) {
+            // Check if already recorded
+            var found = false;
+            for (v_lines[0..v_line_count]) |x| {
+                if (x == right_edge) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                v_lines[v_line_count] = right_edge;
+                v_line_count += 1;
             }
         }
 
-        // Draw horizontal separator if pane doesn't reach bottom
-        if (bottom_edge < state.term_height - state.status_height) {
-            for (0..pane.*.width) |col| {
-                renderer.setCell(pane.*.x + @as(u16, @intCast(col)), bottom_edge, h_border_cell);
+        // Record horizontal line position
+        if (bottom_edge < content_height and h_line_count < h_lines.len) {
+            var found = false;
+            for (h_lines[0..h_line_count]) |y| {
+                if (y == bottom_edge) {
+                    found = true;
+                    break;
+                }
             }
+            if (!found) {
+                h_lines[h_line_count] = bottom_edge;
+                h_line_count += 1;
+            }
+        }
+    }
+
+    // Draw vertical lines
+    for (v_lines[0..v_line_count]) |x| {
+        for (0..content_height) |row| {
+            const y: u16 = @intCast(row);
+            var char = v_char;
+
+            // Check for junctions with horizontal lines
+            if (splits.style != null) {
+                for (h_lines[0..h_line_count]) |hy| {
+                    if (y == hy) {
+                        // Check if this is a cross, top_t, or bottom_t
+                        const at_top = (y == 0);
+                        const at_bottom = (y == content_height - 1);
+                        if (at_top) {
+                            char = top_t;
+                        } else if (at_bottom) {
+                            char = bottom_t;
+                        } else {
+                            char = cross_char;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            renderer.setCell(x, y, .{ .char = char, .fg = .{ .palette = color } });
+        }
+    }
+
+    // Draw horizontal lines
+    for (h_lines[0..h_line_count]) |y| {
+        for (0..state.term_width) |col| {
+            const x: u16 = @intCast(col);
+
+            // Skip if already drawn by vertical line (junction)
+            var is_junction = false;
+            for (v_lines[0..v_line_count]) |vx| {
+                if (x == vx) {
+                    is_junction = true;
+                    break;
+                }
+            }
+            if (is_junction) continue;
+
+            var char = h_char;
+
+            // Check for edge junctions
+            if (splits.style != null) {
+                const at_left = (x == 0);
+                const at_right = (x == state.term_width - 1);
+                if (at_left) {
+                    char = left_t;
+                } else if (at_right) {
+                    char = right_t;
+                }
+            }
+
+            renderer.setCell(x, y, .{ .char = char, .fg = .{ .palette = color } });
         }
     }
 }
@@ -993,8 +1085,9 @@ fn drawScrollIndicator(renderer: *Renderer, pane_x: u16, pane_y: u16, pane_width
     _ = indicator;
 }
 
-fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8, border_color: u8, style: ?*const core.FloatStyle) void {
-    const fg: render.Color = .{ .palette = border_color };
+fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8, border_color: core.BorderColor, style: ?*const core.FloatStyle) void {
+    const color = if (active) border_color.active else border_color.passive;
+    const fg: render.Color = .{ .palette = color };
     const bold = active;
 
     // Get border characters from style or use defaults
@@ -1216,7 +1309,7 @@ fn runStatusModule(module: *const core.StatusModule, buf: []u8) ![]const u8 {
 fn drawStatusBar(state: *State, renderer: *Renderer) void {
     const y = state.term_height - 1;
     const width = state.term_width;
-    const cfg = &state.config.status;
+    const cfg = &state.config.panes.status;
 
     // Clear status bar
     for (0..width) |xi| {

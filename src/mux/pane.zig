@@ -28,7 +28,7 @@ pub const Pane = struct {
     border_w: u16 = 0,
     border_h: u16 = 0,
     // Per-float style settings
-    border_color: u8 = 1,
+    border_color: core.BorderColor = .{},
     // Float layout percentages (for resize recalculation)
     float_width_pct: u8 = 60,
     float_height_pct: u8 = 60,
