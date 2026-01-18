@@ -9,6 +9,10 @@ pub const Pane = struct {
     id: u16 = 0,
     vt: core.VT = .{},
     pty: core.Pty = undefined,
+    // UUID for tracking in ses (32 hex chars)
+    uuid: [32]u8 = undefined,
+    // Whether this pane is managed by ses
+    ses_managed: bool = false,
     // Position and size in the terminal
     x: u16,
     y: u16,
@@ -57,6 +61,32 @@ pub const Pane = struct {
 
         const cmd = command orelse (posix.getenv("SHELL") orelse "/bin/sh");
         self.pty = try core.Pty.spawn(cmd);
+        errdefer self.pty.close();
+        try self.pty.setSize(width, height);
+
+        try self.vt.init(allocator, width, height);
+        errdefer self.vt.deinit();
+    }
+
+    /// Initialize a pane with an fd received from ses daemon
+    /// This is used when ses manages the PTY
+    pub fn initWithFd(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16, fd: posix.fd_t, child_pid: posix.pid_t, uuid: [32]u8) !void {
+        self.* = .{
+            .allocator = allocator,
+            .id = id,
+            .x = x,
+            .y = y,
+            .width = width,
+            .height = height,
+            .did_clear = false,
+            .esc_tail = .{ 0, 0, 0 },
+            .esc_tail_len = 0,
+            .uuid = uuid,
+            .ses_managed = true,
+        };
+
+        // Create Pty from existing fd
+        self.pty = core.Pty.fromFd(fd, child_pid);
         errdefer self.pty.close();
         try self.pty.setSize(width, height);
 

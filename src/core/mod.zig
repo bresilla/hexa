@@ -3,9 +3,15 @@
 pub const pty = @import("pty.zig");
 pub const vt = @import("vt.zig");
 pub const config = @import("config.zig");
+pub const ipc = @import("ipc.zig");
 
 pub const Pty = pty.Pty;
 pub const VT = vt.VT;
+
+// IPC exports
+pub const IpcServer = ipc.Server;
+pub const IpcClient = ipc.Client;
+pub const IpcConnection = ipc.Connection;
 pub const Config = config.Config;
 pub const FloatDef = config.FloatDef;
 pub const FloatStyle = config.FloatStyle;

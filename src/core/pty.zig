@@ -7,13 +7,29 @@ const c = @cImport({
     @cInclude("sys/ioctl.h");
 });
 
+// External declaration for environ (modified by setenv)
+extern var environ: [*:null]?[*:0]u8;
+
 pub const Pty = struct {
     master_fd: posix.fd_t,
     child_pid: posix.pid_t,
     child_reaped: bool = false,
+    // If true, we don't own the process (ses does) - don't try to kill on close
+    external_process: bool = false,
 
     pub fn spawn(shell: []const u8) !Pty {
         return spawnWithEnv(shell);
+    }
+
+    /// Create a Pty from an existing file descriptor
+    /// Used when ses daemon owns the PTY and passes us the fd
+    pub fn fromFd(fd: posix.fd_t, pid: posix.pid_t) Pty {
+        return Pty{
+            .master_fd = fd,
+            .child_pid = pid,
+            .child_reaped = false,
+            .external_process = true, // ses owns the process
+        };
     }
 
     pub fn spawnWithEnv(shell: []const u8) !Pty {
@@ -83,9 +99,9 @@ pub const Pty = struct {
         const allocator = std.heap.c_allocator;
         var env_list: std.ArrayList(?[*:0]const u8) = .empty;
 
-        // Copy parent environment, filtering out BOX and TERM
-        const environ = std.os.environ;
-        for (environ) |env_ptr| {
+        // Copy parent environment from C environ (includes setenv changes)
+        var i: usize = 0;
+        while (environ[i]) |env_ptr| : (i += 1) {
             const env_str = std.mem.span(env_ptr);
             // Skip BOX and TERM - we'll add our own
             if (std.mem.startsWith(u8, env_str, "BOX=")) continue;
@@ -123,6 +139,11 @@ pub const Pty = struct {
     pub fn close(self: *Pty) void {
         // Close master fd first - this sends EOF to the child
         _ = posix.close(self.master_fd);
+
+        // If ses owns the process, don't try to wait or kill it
+        if (self.external_process) {
+            return;
+        }
 
         if (!self.child_reaped) {
             // Try non-blocking wait first

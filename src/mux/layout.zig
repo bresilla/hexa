@@ -1,5 +1,7 @@
 const std = @import("std");
+const posix = std.posix;
 const Pane = @import("pane.zig").Pane;
+const SesClient = @import("ses_client.zig").SesClient;
 
 /// Direction of a split
 pub const SplitDir = enum {
@@ -32,6 +34,8 @@ pub const Layout = struct {
     y: u16,
     width: u16,
     height: u16,
+    // Optional ses client for pane creation
+    ses_client: ?*SesClient,
 
     pub fn init(allocator: std.mem.Allocator, width: u16, height: u16) Layout {
         return .{
@@ -44,7 +48,13 @@ pub const Layout = struct {
             .y = 0,
             .width = width,
             .height = height,
+            .ses_client = null,
         };
+    }
+
+    /// Set the ses client for pane creation
+    pub fn setSesClient(self: *Layout, client: *SesClient) void {
+        self.ses_client = client;
     }
 
     pub fn deinit(self: *Layout) void {
@@ -81,8 +91,35 @@ pub const Layout = struct {
         const pane = try self.allocator.create(Pane);
         errdefer self.allocator.destroy(pane);
 
+        // Try to create pane via ses if available
+        if (self.ses_client) |ses| {
+            if (ses.isConnected()) {
+                const result = ses.createPane(null, null, null) catch {
+                    // Fall back to local spawn
+                    try pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
+                    pane.focused = true;
+                    self.focused_pane_id = id;
+                    try self.panes.put(id, pane);
+                    const node = try self.allocator.create(LayoutNode);
+                    node.* = .{ .pane = id };
+                    self.root = node;
+                    return pane;
+                };
+
+                // Use fd from ses
+                try pane.initWithFd(self.allocator, id, self.x, self.y, self.width, self.height, result.fd, result.pid, result.uuid);
+                pane.focused = true;
+                self.focused_pane_id = id;
+                try self.panes.put(id, pane);
+                const node = try self.allocator.create(LayoutNode);
+                node.* = .{ .pane = id };
+                self.root = node;
+                return pane;
+            }
+        }
+
+        // Fall back to local PTY spawn
         try pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
-        errdefer pane.deinit();
 
         pane.focused = true;
         self.focused_pane_id = id;
@@ -116,7 +153,21 @@ pub const Layout = struct {
         const new_x = if (dir == .horizontal) focused.x + focused.width - new_width else focused.x;
         const new_y = if (dir == .vertical) focused.y + focused.height - new_height else focused.y;
 
-        try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
+        // Try to create pane via ses if available
+        if (self.ses_client) |ses| {
+            if (ses.isConnected()) {
+                if (ses.createPane(null, null, null)) |result| {
+                    try new_pane.initWithFd(self.allocator, new_id, new_x, new_y, new_width, new_height, result.fd, result.pid, result.uuid);
+                } else |_| {
+                    // Fall back to local spawn
+                    try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
+                }
+            } else {
+                try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
+            }
+        } else {
+            try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
+        }
         errdefer new_pane.deinit();
 
         try self.panes.put(new_id, new_pane);

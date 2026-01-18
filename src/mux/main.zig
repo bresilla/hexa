@@ -8,9 +8,13 @@ const Layout = @import("layout.zig").Layout;
 const SplitDir = @import("layout.zig").SplitDir;
 const render = @import("render.zig");
 const Renderer = render.Renderer;
+const SesClient = @import("ses_client.zig").SesClient;
+const notification = @import("notification.zig");
+const NotificationManager = notification.NotificationManager;
 
 const c = @cImport({
     @cInclude("sys/ioctl.h");
+    @cInclude("stdlib.h");
 });
 
 /// A tab contains a layout with panes
@@ -46,11 +50,27 @@ const State = struct {
     layout_width: u16,
     layout_height: u16,
     renderer: Renderer,
+    ses_client: SesClient,
+    notifications: NotificationManager,
+    uuid: [32]u8,
+    ipc_server: ?core.ipc.Server,
+    socket_path: ?[]const u8,
 
     fn init(allocator: std.mem.Allocator, width: u16, height: u16) !State {
         const cfg = core.Config.load(allocator);
         const status_h: u16 = if (cfg.panes.status.enabled) 1 else 0;
         const layout_h = height - status_h;
+
+        // Generate UUID for this mux instance
+        const uuid = core.ipc.generateUuid();
+
+        // Create IPC server socket
+        const socket_path = core.ipc.getMuxSocketPath(allocator, &uuid) catch null;
+        var ipc_server: ?core.ipc.Server = null;
+        if (socket_path) |path| {
+            ipc_server = core.ipc.Server.init(allocator, path) catch null;
+        }
+
         return .{
             .allocator = allocator,
             .config = cfg,
@@ -67,6 +87,11 @@ const State = struct {
             .layout_width = width,
             .layout_height = layout_h,
             .renderer = try Renderer.init(allocator, width, height),
+            .ses_client = SesClient.init(allocator),
+            .notifications = NotificationManager.init(allocator),
+            .uuid = uuid,
+            .ipc_server = ipc_server,
+            .socket_path = socket_path,
         };
     }
 
@@ -84,6 +109,14 @@ const State = struct {
         self.tabs.deinit(self.allocator);
         self.config.deinit();
         self.renderer.deinit();
+        self.ses_client.deinit();
+        self.notifications.deinit();
+        if (self.ipc_server) |*srv| {
+            srv.deinit();
+        }
+        if (self.socket_path) |path| {
+            self.allocator.free(path);
+        }
     }
 
     /// Get the current tab's layout
@@ -136,6 +169,26 @@ const State = struct {
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
+    // Parse command line arguments
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var notify_message: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if ((std.mem.eql(u8, arg, "--notify") or std.mem.eql(u8, arg, "-n")) and i + 1 < args.len) {
+            i += 1;
+            notify_message = args[i];
+        }
+    }
+
+    // Handle --notify: send to parent mux and exit
+    if (notify_message) |msg| {
+        sendNotifyToParentMux(allocator, msg);
+        return;
+    }
+
     // Redirect stderr to /dev/null to suppress ghostty warnings
     // that would otherwise corrupt the display
     const devnull = std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only }) catch null;
@@ -151,8 +204,25 @@ pub fn main() !void {
     var state = try State.init(allocator, size.cols, size.rows);
     defer state.deinit();
 
+    // Set HEXA_MUX_SOCKET environment for child processes
+    if (state.socket_path) |path| {
+        const path_z = allocator.dupeZ(u8, path) catch null;
+        if (path_z) |p| {
+            _ = c.setenv("HEXA_MUX_SOCKET", p.ptr, 1);
+            allocator.free(p);
+        }
+    }
+
     // Create first tab with one pane
     try state.createTab();
+
+    // Connect to ses daemon (start it if needed)
+    state.ses_client.connect() catch {};
+
+    // Show notification if we just started the daemon
+    if (state.ses_client.just_started_daemon) {
+        state.notifications.showFor("ses daemon started", 2000);
+    }
 
     // Enter raw mode
     const orig_termios = try enableRawMode(posix.STDIN_FILENO);
@@ -294,6 +364,26 @@ pub fn main() !void {
             }
         }
 
+        // Add ses connection fd if connected
+        var ses_fd_idx: ?usize = null;
+        if (state.ses_client.conn) |conn| {
+            if (fd_count < poll_fds.len) {
+                ses_fd_idx = fd_count;
+                poll_fds[fd_count] = .{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 };
+                fd_count += 1;
+            }
+        }
+
+        // Add IPC server fd for incoming connections
+        var ipc_fd_idx: ?usize = null;
+        if (state.ipc_server) |srv| {
+            if (fd_count < poll_fds.len) {
+                ipc_fd_idx = fd_count;
+                poll_fds[fd_count] = .{ .fd = srv.fd, .events = posix.POLL.IN, .revents = 0 };
+                fd_count += 1;
+            }
+        }
+
         // Calculate poll timeout - wait for next frame, status update, or input
         const now = std.time.milliTimestamp();
         const since_render = now - last_render;
@@ -315,6 +405,20 @@ pub fn main() !void {
             const n = posix.read(posix.STDIN_FILENO, &buffer) catch break;
             if (n == 0) break;
             handleInput(&state, buffer[0..n]);
+        }
+
+        // Handle ses messages
+        if (ses_fd_idx) |sidx| {
+            if (poll_fds[sidx].revents & posix.POLL.IN != 0) {
+                handleSesMessage(&state, &buffer);
+            }
+        }
+
+        // Handle IPC connections (for --notify)
+        if (ipc_fd_idx) |iidx| {
+            if (poll_fds[iidx].revents & posix.POLL.IN != 0) {
+                handleIpcConnection(&state, &buffer);
+            }
         }
 
         // Handle PTY output
@@ -364,10 +468,10 @@ pub fn main() !void {
         }
 
         // Remove dead floating panes (in reverse order to preserve indices)
-        var i: usize = dead_floating.items.len;
-        while (i > 0) {
-            i -= 1;
-            const fi = dead_floating.items[i];
+        var df_idx: usize = dead_floating.items.len;
+        while (df_idx > 0) {
+            df_idx -= 1;
+            const fi = dead_floating.items[df_idx];
             // Check if this was the active float before removing
             const was_active = if (state.active_floating) |af| af == fi else false;
 
@@ -402,6 +506,11 @@ pub fn main() !void {
                 // Last pane in last tab - exit
                 state.running = false;
             }
+        }
+
+        // Update notifications
+        if (state.notifications.update()) {
+            state.needs_render = true;
         }
 
         // Render with frame rate limiting (max 60fps)
@@ -464,6 +573,85 @@ fn handleInput(state: *State, input: []const u8) void {
             pane.write(input[i..]) catch {};
         }
         return;
+    }
+}
+
+fn handleSesMessage(state: *State, buffer: []u8) void {
+    const conn = &(state.ses_client.conn orelse return);
+
+    // Try to read a line from ses
+    const line = conn.recvLine(buffer) catch return;
+    if (line == null) return;
+
+    // Parse JSON message
+    const parsed = std.json.parseFromSlice(std.json.Value, state.allocator, line.?, .{}) catch return;
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const msg_type = (root.get("type") orelse return).string;
+
+    if (std.mem.eql(u8, msg_type, "notify")) {
+        // Handle notification from ses
+        if (root.get("message")) |msg_val| {
+            const msg = msg_val.string;
+            // Duplicate message since we'll free parsed
+            const msg_copy = state.allocator.dupe(u8, msg) catch return;
+            state.notifications.showWithOptions(msg_copy, 3000, .bottom_center, .{}, true);
+            state.needs_render = true;
+        }
+    }
+}
+
+fn sendNotifyToParentMux(_: std.mem.Allocator, message: []const u8) void {
+    // Get parent mux socket from environment
+    const socket_path = std.posix.getenv("HEXA_MUX_SOCKET") orelse {
+        _ = posix.write(posix.STDERR_FILENO, "Not inside a hexa-mux session (HEXA_MUX_SOCKET not set)\n") catch {};
+        return;
+    };
+
+    // Connect to parent mux
+    var client = core.ipc.Client.connect(socket_path) catch {
+        _ = posix.write(posix.STDERR_FILENO, "Failed to connect to mux\n") catch {};
+        return;
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+
+    // Send notify message
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"notify\",\"message\":\"{s}\"}}", .{message}) catch return;
+    conn.sendLine(msg) catch {};
+}
+
+fn handleIpcConnection(state: *State, buffer: []u8) void {
+    const server = &(state.ipc_server orelse return);
+
+    // Try to accept a connection (non-blocking)
+    const conn_opt = server.tryAccept() catch return;
+    if (conn_opt == null) return;
+
+    var conn = conn_opt.?;
+    defer conn.close();
+
+    // Read message
+    const line = conn.recvLine(buffer) catch return;
+    if (line == null) return;
+
+    // Parse JSON message
+    const parsed = std.json.parseFromSlice(std.json.Value, state.allocator, line.?, .{}) catch return;
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const msg_type = (root.get("type") orelse return).string;
+
+    if (std.mem.eql(u8, msg_type, "notify")) {
+        if (root.get("message")) |msg_val| {
+            const msg = msg_val.string;
+            const msg_copy = state.allocator.dupe(u8, msg) catch return;
+            state.notifications.showWithOptions(msg_copy, 3000, .bottom_center, .{}, true);
+            state.needs_render = true;
+        }
     }
 }
 
@@ -903,6 +1091,9 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     if (state.config.panes.status.enabled) {
         drawStatusBar(state, renderer);
     }
+
+    // Draw notifications overlay
+    state.notifications.render(renderer, state.term_width, state.term_height);
 
     // End frame with differential render
     const output = try renderer.endFrame(state.force_full_render);

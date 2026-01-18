@@ -74,4 +74,27 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("run", "Run hexa-mux");
     run_step.dependOn(&run_mux.step);
+
+    // Build hexa-ses executable (session server)
+    const ses_root = b.createModule(.{
+        .root_source_file = b.path("src/ses/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ses_root.addImport("core", core_module);
+    const ses_exe = b.addExecutable(.{
+        .name = "hexa-ses",
+        .root_module = ses_root,
+    });
+    b.installArtifact(ses_exe);
+
+    // Run ses step
+    const run_ses = b.addRunArtifact(ses_exe);
+    run_ses.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_ses.addArgs(args);
+    }
+    const run_ses_step = b.step("ses", "Run hexa-ses");
+    run_ses_step.dependOn(&run_ses.step);
 }
