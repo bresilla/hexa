@@ -8,3 +8,7 @@ pub const Pty = pty.Pty;
 pub const VT = vt.VT;
 pub const Config = config.Config;
 pub const FloatDef = config.FloatDef;
+pub const FloatStyle = config.FloatStyle;
+pub const FloatStylePosition = config.FloatStylePosition;
+pub const StatusModule = config.StatusModule;
+pub const OutputDef = config.OutputDef;

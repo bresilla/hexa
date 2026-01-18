@@ -656,9 +656,9 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
         current_dir = focused.getRealCwd();
     }
 
-    // Find existing float by name (and directory if pwd)
+    // Find existing float by key (and directory if pwd)
     for (state.floating_panes.items, 0..) |pane, i| {
-        if (std.mem.eql(u8, pane.name, float_def.name)) {
+        if (pane.float_key == float_def.key) {
             // For pwd floats, also check directory match
             if (float_def.pwd and pane.is_pwd) {
                 // Both dirs must exist and match, or both be null
@@ -679,7 +679,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                 // If alone mode, hide all other floats
                 if (float_def.alone) {
                     for (state.floating_panes.items) |other| {
-                        if (!std.mem.eql(u8, other.name, float_def.name)) {
+                        if (other.float_key != float_def.key) {
                             other.visible = false;
                         }
                     }
@@ -687,7 +687,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                 // For pwd floats, hide other instances of same float (different dirs)
                 if (float_def.pwd) {
                     for (state.floating_panes.items, 0..) |other, j| {
-                        if (j != i and std.mem.eql(u8, other.name, float_def.name)) {
+                        if (j != i and other.float_key == float_def.key) {
                             other.visible = false;
                         }
                     }
@@ -699,13 +699,13 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
         }
     }
 
-    // Not found - create new float with this name and command
+    // Not found - create new float
     createNamedFloat(state, float_def, current_dir) catch {};
 
     // If alone mode, hide all other floats after creation
     if (float_def.alone) {
         for (state.floating_panes.items) |pane| {
-            if (!std.mem.eql(u8, pane.name, float_def.name)) {
+            if (pane.float_key != float_def.key) {
                 pane.visible = false;
             }
         }
@@ -714,7 +714,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
     if (float_def.pwd) {
         const new_idx = state.floating_panes.items.len - 1;
         for (state.floating_panes.items, 0..) |pane, i| {
-            if (i != new_idx and std.mem.eql(u8, pane.name, float_def.name)) {
+            if (i != new_idx and pane.float_key == float_def.key) {
                 pane.visible = false;
             }
         }
@@ -767,8 +767,7 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     const pos_y_pct: u16 = float_def.pos_y orelse 50; // default center
     const pad_x_cfg: u16 = float_def.padding_x orelse cfg.float_padding_x;
     const pad_y_cfg: u16 = float_def.padding_y orelse cfg.float_padding_y;
-    const border_color: u8 = float_def.border_color orelse cfg.float_border_color;
-    const show_title: bool = float_def.show_title orelse cfg.float_show_title;
+    const border_color: u8 = if (float_def.style) |s| s.color else cfg.float_border_color;
 
     // Calculate outer frame size
     const avail_h = state.term_height - state.status_height;
@@ -795,14 +794,13 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     pane.floating = true;
     pane.focused = true;
     pane.visible = true;
-    pane.name = float_def.name;
+    pane.float_key = float_def.key;
     // Store outer dimensions and style for border rendering
     pane.border_x = outer_x;
     pane.border_y = outer_y;
     pane.border_w = outer_w;
     pane.border_h = outer_h;
     pane.border_color = border_color;
-    pane.show_title = show_title;
     // Store percentages for resize recalculation
     pane.float_width_pct = @intCast(width_pct);
     pane.float_height_pct = @intCast(height_pct);
@@ -817,6 +815,12 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
         if (current_dir) |dir| {
             pane.pwd_dir = state.allocator.dupe(u8, dir) catch null;
         }
+    }
+
+    // Store style reference (includes border and optional module)
+    if (float_def.style) |*style| {
+        pane.float_style = style;
+        pane.border_color = style.color;
     }
 
     try state.floating_panes.append(state.allocator, pane);
@@ -854,8 +858,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         if (!pane.visible) continue;
         if (state.active_floating == i) continue; // Skip active, draw it last
 
-        const title = if (pane.show_title) pane.name else "";
-        drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, title, pane.border_color);
+        drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, "", pane.border_color, pane.float_style);
 
         const render_state = pane.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
@@ -869,8 +872,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     if (state.active_floating) |idx| {
         const pane = state.floating_panes.items[idx];
         if (pane.visible) {
-            const title = if (pane.show_title) pane.name else "";
-            drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, title, pane.border_color);
+            drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, "", pane.border_color, pane.float_style);
 
             if (pane.getRenderState()) |render_state| {
                 renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
@@ -991,9 +993,17 @@ fn drawScrollIndicator(renderer: *Renderer, pane_x: u16, pane_y: u16, pane_width
     _ = indicator;
 }
 
-fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8, border_color: u8) void {
+fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8, border_color: u8, style: ?*const core.FloatStyle) void {
     const fg: render.Color = .{ .palette = border_color };
     const bold = active;
+
+    // Get border characters from style or use defaults
+    const top_left: u21 = if (style) |s| s.top_left else 0x256D;
+    const top_right: u21 = if (style) |s| s.top_right else 0x256E;
+    const bottom_left: u21 = if (style) |s| s.bottom_left else 0x2570;
+    const bottom_right: u21 = if (style) |s| s.bottom_right else 0x256F;
+    const horizontal: u21 = if (style) |s| s.horizontal else 0x2500;
+    const vertical: u21 = if (style) |s| s.vertical else 0x2502;
 
     // Clear the interior with spaces first
     for (1..h -| 1) |row| {
@@ -1005,9 +1015,9 @@ fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, activ
     }
 
     // Top-left corner
-    renderer.setCell(x, y, .{ .char = 0x256D, .fg = fg, .bold = bold }); // ╭
+    renderer.setCell(x, y, .{ .char = top_left, .fg = fg, .bold = bold });
 
-    // Top border with optional title
+    // Top border with optional title (centered)
     if (name.len > 0) {
         var title_buf: [32]u8 = undefined;
         const title = std.fmt.bufPrint(&title_buf, "[ {s} ]", .{name}) catch "[ float ]";
@@ -1017,34 +1027,190 @@ fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, activ
             const char: u21 = if (col >= title_start and col < title_start + title.len)
                 title[col - title_start]
             else
-                0x2500; // ─
+                horizontal;
             renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = char, .fg = fg, .bold = bold });
         }
     } else {
         for (0..w -| 2) |col| {
-            renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = 0x2500, .fg = fg, .bold = bold }); // ─
+            renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = horizontal, .fg = fg, .bold = bold });
         }
     }
 
     // Top-right corner
-    renderer.setCell(x + w - 1, y, .{ .char = 0x256E, .fg = fg, .bold = bold }); // ╮
+    renderer.setCell(x + w - 1, y, .{ .char = top_right, .fg = fg, .bold = bold });
 
     // Side borders
     for (1..h -| 1) |row| {
-        renderer.setCell(x, y + @as(u16, @intCast(row)), .{ .char = 0x2502, .fg = fg, .bold = bold }); // │
-        renderer.setCell(x + w - 1, y + @as(u16, @intCast(row)), .{ .char = 0x2502, .fg = fg, .bold = bold }); // │
+        renderer.setCell(x, y + @as(u16, @intCast(row)), .{ .char = vertical, .fg = fg, .bold = bold });
+        renderer.setCell(x + w - 1, y + @as(u16, @intCast(row)), .{ .char = vertical, .fg = fg, .bold = bold });
     }
 
     // Bottom-left corner
-    renderer.setCell(x, y + h - 1, .{ .char = 0x2570, .fg = fg, .bold = bold }); // ╰
+    renderer.setCell(x, y + h - 1, .{ .char = bottom_left, .fg = fg, .bold = bold });
 
     // Bottom border
     for (0..w -| 2) |col| {
-        renderer.setCell(x + @as(u16, @intCast(col)) + 1, y + h - 1, .{ .char = 0x2500, .fg = fg, .bold = bold }); // ─
+        renderer.setCell(x + @as(u16, @intCast(col)) + 1, y + h - 1, .{ .char = horizontal, .fg = fg, .bold = bold });
     }
 
     // Bottom-right corner
-    renderer.setCell(x + w - 1, y + h - 1, .{ .char = 0x256F, .fg = fg, .bold = bold }); // ╯
+    renderer.setCell(x + w - 1, y + h - 1, .{ .char = bottom_right, .fg = fg, .bold = bold });
+
+    // Render module in border if present
+    if (style) |s| {
+        if (s.module) |*module| {
+            if (s.position) |pos| {
+                // Run the module to get output
+                var output_buf: [256]u8 = undefined;
+                const output = runStatusModule(module, &output_buf) catch "";
+                if (output.len == 0) return;
+
+                // Render styled output
+                const segments = renderModuleOutput(module, output);
+
+                // Calculate position based on style position
+                const total_len = segments.total_len;
+                var draw_x: u16 = undefined;
+                var draw_y: u16 = undefined;
+
+                switch (pos) {
+                    .topleft => {
+                        draw_x = x + 2;
+                        draw_y = y;
+                    },
+                    .topcenter => {
+                        draw_x = x + @as(u16, @intCast((w -| total_len) / 2));
+                        draw_y = y;
+                    },
+                    .topright => {
+                        draw_x = x + w -| 2 -| @as(u16, @intCast(total_len));
+                        draw_y = y;
+                    },
+                    .bottomleft => {
+                        draw_x = x + 2;
+                        draw_y = y + h - 1;
+                    },
+                    .bottomcenter => {
+                        draw_x = x + @as(u16, @intCast((w -| total_len) / 2));
+                        draw_y = y + h - 1;
+                    },
+                    .bottomright => {
+                        draw_x = x + w -| 2 -| @as(u16, @intCast(total_len));
+                        draw_y = y + h - 1;
+                    },
+                }
+
+                // Draw each segment with its style
+                var cur_x = draw_x;
+                for (segments.items[0..segments.count]) |seg| {
+                    for (seg.text) |ch| {
+                        renderer.setCell(cur_x, draw_y, .{
+                            .char = ch,
+                            .fg = seg.fg,
+                            .bg = seg.bg,
+                            .bold = seg.bold,
+                            .italic = seg.italic,
+                        });
+                        cur_x += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+const RenderedSegment = struct {
+    text: []const u8,
+    fg: render.Color,
+    bg: render.Color,
+    bold: bool,
+    italic: bool,
+};
+
+const RenderedSegments = struct {
+    items: [16]RenderedSegment,
+    buffers: [16][64]u8, // Each segment gets its own buffer
+    count: usize,
+    total_len: usize,
+};
+
+fn renderModuleOutput(module: *const core.StatusModule, output: []const u8) RenderedSegments {
+    var result = RenderedSegments{
+        .items = undefined,
+        .buffers = undefined,
+        .count = 0,
+        .total_len = 0,
+    };
+
+    for (module.outputs) |out| {
+        if (result.count >= 16) break;
+
+        // Replace $output in format with actual output
+        var text_len: usize = 0;
+        var i: usize = 0;
+        while (i < out.format.len and text_len < 64) {
+            if (i + 6 < out.format.len and std.mem.eql(u8, out.format[i .. i + 7], "$output")) {
+                const copy_len = @min(output.len, 64 - text_len);
+                @memcpy(result.buffers[result.count][text_len .. text_len + copy_len], output[0..copy_len]);
+                text_len += copy_len;
+                i += 7;
+            } else {
+                result.buffers[result.count][text_len] = out.format[i];
+                text_len += 1;
+                i += 1;
+            }
+        }
+
+        // Parse style
+        const style = pop.Style.parse(out.style);
+
+        result.items[result.count] = .{
+            .text = result.buffers[result.count][0..text_len],
+            .fg = if (style.fg != .none) styleColorToRender(style.fg) else .none,
+            .bg = if (style.bg != .none) styleColorToRender(style.bg) else .none,
+            .bold = style.bold,
+            .italic = style.italic,
+        };
+        result.total_len += text_len;
+        result.count += 1;
+    }
+
+    return result;
+}
+
+fn styleColorToRender(col: pop.Color) render.Color {
+    return switch (col) {
+        .none => .none,
+        .palette => |p| .{ .palette = p },
+        .rgb => |rgb| .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } },
+    };
+}
+
+fn runStatusModule(module: *const core.StatusModule, buf: []u8) ![]const u8 {
+    // For custom commands, run them
+    if (module.command) |cmd| {
+        const result = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &.{ "/bin/sh", "-c", cmd },
+        }) catch return "";
+        defer std.heap.page_allocator.free(result.stdout);
+        defer std.heap.page_allocator.free(result.stderr);
+
+        // Copy to buffer, strip trailing newline
+        var len = result.stdout.len;
+        while (len > 0 and (result.stdout[len - 1] == '\n' or result.stdout[len - 1] == '\r')) {
+            len -= 1;
+        }
+        const copy_len = @min(len, buf.len);
+        @memcpy(buf[0..copy_len], result.stdout[0..copy_len]);
+        return buf[0..copy_len];
+    }
+
+    // For built-in modules, delegate to status module system
+    // For now just return module name as placeholder
+    const copy_len = @min(module.name.len, buf.len);
+    @memcpy(buf[0..copy_len], module.name[0..copy_len]);
+    return buf[0..copy_len];
 }
 
 fn drawStatusBar(state: *State, renderer: *Renderer) void {

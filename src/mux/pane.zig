@@ -20,8 +20,8 @@ pub const Pane = struct {
     floating: bool = false,
     // Is this pane visible? (for floating panes that can be toggled)
     visible: bool = true,
-    // Name/ID for the pane
-    name: []const u8 = "float",
+    // Key binding for this float (for matching)
+    float_key: u8 = 0,
     // Outer border dimensions (for floating panes with padding)
     border_x: u16 = 0,
     border_y: u16 = 0,
@@ -29,7 +29,6 @@ pub const Pane = struct {
     border_h: u16 = 0,
     // Per-float style settings
     border_color: u8 = 1,
-    show_title: bool = true,
     // Float layout percentages (for resize recalculation)
     float_width_pct: u8 = 60,
     float_height_pct: u8 = 60,
@@ -40,6 +39,8 @@ pub const Pane = struct {
     // For pwd floats: the directory this float is bound to
     pwd_dir: ?[]const u8 = null,
     is_pwd: bool = false,
+    // Border style and optional module
+    float_style: ?*const core.FloatStyle = null,
 
     // Tracks whether we saw a clear-screen sequence in the last PTY read.
     did_clear: bool = false,
