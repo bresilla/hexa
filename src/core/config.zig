@@ -5,6 +5,16 @@ pub const FloatDef = struct {
     key: u8,
     name: []const u8,
     command: ?[]const u8,
+    alone: bool = false, // hide all other floats when this one opens
+    // Per-float overrides (null = use default)
+    width_percent: ?u8 = null,
+    height_percent: ?u8 = null,
+    pos_x: ?u8 = null, // position as percent (0=left, 50=center, 100=right)
+    pos_y: ?u8 = null, // position as percent (0=top, 50=center, 100=bottom)
+    padding_x: ?u8 = null,
+    padding_y: ?u8 = null,
+    border_color: ?u8 = null,
+    show_title: ?bool = null,
 };
 
 pub const Config = struct {
@@ -20,6 +30,10 @@ pub const Config = struct {
     // Floating pane defaults
     float_width_percent: u8 = 60,
     float_height_percent: u8 = 60,
+    float_padding_x: u8 = 1, // left/right padding inside border
+    float_padding_y: u8 = 0, // top/bottom padding inside border
+    float_border_color: u8 = 1, // palette color for border (0-15)
+    float_show_title: bool = true, // show pane name in title bar
 
     // Named floats
     floats: []FloatDef = &[_]FloatDef{},
@@ -81,6 +95,18 @@ pub const Config = struct {
             if (f.height_percent) |h| {
                 config.float_height_percent = @intCast(@min(100, @max(10, h)));
             }
+            if (f.padding_x) |px| {
+                config.float_padding_x = @intCast(@min(10, @max(0, px)));
+            }
+            if (f.padding_y) |py| {
+                config.float_padding_y = @intCast(@min(10, @max(0, py)));
+            }
+            if (f.border_color) |c| {
+                config.float_border_color = @intCast(@min(15, @max(0, c)));
+            }
+            if (f.show_title) |t| {
+                config.float_show_title = t;
+            }
         }
 
         // Apply status settings
@@ -105,6 +131,15 @@ pub const Config = struct {
                     .key = key,
                     .name = name,
                     .command = command,
+                    .alone = jf.alone orelse false,
+                    .width_percent = if (jf.width_percent) |v| @intCast(@min(100, @max(10, v))) else null,
+                    .height_percent = if (jf.height_percent) |v| @intCast(@min(100, @max(10, v))) else null,
+                    .pos_x = if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else null,
+                    .pos_y = if (jf.pos_y) |v| @intCast(@min(100, @max(0, v))) else null,
+                    .padding_x = if (jf.padding_x) |v| @intCast(@min(10, @max(0, v))) else null,
+                    .padding_y = if (jf.padding_y) |v| @intCast(@min(10, @max(0, v))) else null,
+                    .border_color = if (jf.border_color) |v| @intCast(@min(255, @max(0, v))) else null,
+                    .show_title = jf.show_title,
                 }) catch continue;
             }
             config.floats = float_list.toOwnedSlice(allocator) catch &[_]FloatDef{};
@@ -159,11 +194,24 @@ const JsonConfig = struct {
     float: ?struct {
         width_percent: ?i64 = null,
         height_percent: ?i64 = null,
+        padding_x: ?i64 = null,
+        padding_y: ?i64 = null,
+        border_color: ?i64 = null,
+        show_title: ?bool = null,
     } = null,
     floats: ?[]const struct {
         key: []const u8,
         name: []const u8,
         command: ?[]const u8 = null,
+        alone: ?bool = null,
+        width_percent: ?i64 = null,
+        height_percent: ?i64 = null,
+        pos_x: ?i64 = null,
+        pos_y: ?i64 = null,
+        padding_x: ?i64 = null,
+        padding_y: ?i64 = null,
+        border_color: ?i64 = null,
+        show_title: ?bool = null,
     } = null,
     status: ?struct {
         enabled: ?bool = null,

@@ -47,8 +47,32 @@ pub const VT = struct {
         return .{ .x = cursor.x, .y = cursor.y };
     }
 
+    /// Get cursor style (returns DECSCUSR value: 0=default, 1=block blink, 2=block, 3=underline blink, 4=underline, 5=bar blink, 6=bar)
+    pub fn getCursorStyle(self: *VT) u8 {
+        const screen = self.terminal.screens.active;
+        const cursor_style = screen.cursor.cursor_style;
+        const blink = self.terminal.modes.get(.cursor_blinking);
+        // Map ghostty cursor style to DECSCUSR values
+        return switch (cursor_style) {
+            .block, .block_hollow => if (blink) 1 else 2,
+            .underline => if (blink) 3 else 4,
+            .bar => if (blink) 5 else 6,
+        };
+    }
+
+    /// Check if cursor is visible
+    pub fn isCursorVisible(self: *VT) bool {
+        return self.terminal.modes.get(.cursor_visible);
+    }
+
     /// Check if in alternate screen mode
     pub fn inAltScreen(self: *VT) bool {
         return self.terminal.screens.active_key == .alternate;
+    }
+
+    /// Get current working directory (from OSC 7)
+    pub fn getPwd(self: *VT) ?[]const u8 {
+        if (self.terminal.pwd.items.len == 0) return null;
+        return self.terminal.pwd.items;
     }
 };

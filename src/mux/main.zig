@@ -79,25 +79,54 @@ pub fn main() !void {
 
     // Main loop
     while (state.running) {
+        // Check for terminal resize
+        {
+            const new_size = getTermSize();
+            if (new_size.cols != state.term_width or new_size.rows != state.term_height) {
+                state.term_width = new_size.cols;
+                state.term_height = new_size.rows;
+                const status_h: u16 = if (state.config.status_enabled) 1 else 0;
+                state.status_height = status_h;
+
+                // Resize layout (tiled panes)
+                state.layout.resize(new_size.cols, new_size.rows - status_h);
+
+                // Resize floating panes based on their stored percentages
+                resizeFloatingPanes(&state);
+
+                state.needs_render = true;
+            }
+        }
+
         // Proactively check for dead floating panes before polling
         {
             var fi: usize = 0;
             while (fi < state.floating_panes.items.len) {
                 if (!state.floating_panes.items[fi].isAlive()) {
+                    // Check if this was the active float
+                    const was_active = if (state.active_floating) |af| af == fi else false;
+
                     const pane = state.floating_panes.orderedRemove(fi);
                     pane.deinit();
                     state.allocator.destroy(pane);
                     state.needs_render = true;
+
+                    // Clear focus if this was the active float
+                    if (was_active) {
+                        state.active_floating = null;
+                    }
                     // Don't increment fi, next item shifted into this position
                 } else {
                     fi += 1;
                 }
             }
-            if (state.floating_panes.items.len == 0) {
-                state.active_floating = null;
-            } else if (state.active_floating) |af| {
+            // Ensure active_floating is valid
+            if (state.active_floating) |af| {
                 if (af >= state.floating_panes.items.len) {
-                    state.active_floating = state.floating_panes.items.len - 1;
+                    state.active_floating = if (state.floating_panes.items.len > 0)
+                        state.floating_panes.items.len - 1
+                    else
+                        null;
                 }
             }
         }
@@ -196,17 +225,23 @@ pub fn main() !void {
         while (i > 0) {
             i -= 1;
             const fi = dead_floating.items[i];
+            // Check if this was the active float before removing
+            const was_active = if (state.active_floating) |af| af == fi else false;
+
             const pane = state.floating_panes.orderedRemove(fi);
             pane.deinit();
             state.allocator.destroy(pane);
             state.needs_render = true;
+
+            // Clear focus if this was the active float
+            if (was_active) {
+                state.active_floating = null;
+            }
         }
-        // Clear active floating if list is now empty
-        if (state.floating_panes.items.len == 0) {
-            state.active_floating = null;
-        } else if (state.active_floating) |af| {
+        // Ensure active_floating is still valid
+        if (state.active_floating) |af| {
             if (af >= state.floating_panes.items.len) {
-                state.active_floating = state.floating_panes.items.len - 1;
+                state.active_floating = null;
             }
         }
 
@@ -348,6 +383,14 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
             pane.visible = !pane.visible;
             if (pane.visible) {
                 state.active_floating = i;
+                // If alone mode, hide all other floats
+                if (float_def.alone) {
+                    for (state.floating_panes.items) |other| {
+                        if (!std.mem.eql(u8, other.name, float_def.name)) {
+                            other.visible = false;
+                        }
+                    }
+                }
             } else {
                 state.active_floating = null;
             }
@@ -356,6 +399,48 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
     }
     // Not found - create new float with this name and command
     createNamedFloat(state, float_def) catch {};
+
+    // If alone mode, hide all other floats after creation
+    if (float_def.alone) {
+        for (state.floating_panes.items) |pane| {
+            if (!std.mem.eql(u8, pane.name, float_def.name)) {
+                pane.visible = false;
+            }
+        }
+    }
+}
+
+fn resizeFloatingPanes(state: *State) void {
+    const avail_h = state.term_height - state.status_height;
+
+    for (state.floating_panes.items) |pane| {
+        // Recalculate outer frame size based on stored percentages
+        const outer_w: u16 = state.term_width * pane.float_width_pct / 100;
+        const outer_h: u16 = avail_h * pane.float_height_pct / 100;
+
+        // Recalculate position
+        const max_x = state.term_width -| outer_w;
+        const max_y = avail_h -| outer_h;
+        const outer_x: u16 = max_x * pane.float_pos_x_pct / 100;
+        const outer_y: u16 = max_y * pane.float_pos_y_pct / 100;
+
+        // Calculate content area
+        const pad_x: u16 = 1 + pane.float_pad_x;
+        const pad_y: u16 = 1 + pane.float_pad_y;
+        const content_x = outer_x + pad_x;
+        const content_y = outer_y + pad_y;
+        const content_w = outer_w -| (pad_x * 2);
+        const content_h = outer_h -| (pad_y * 2);
+
+        // Update pane position and size
+        pane.resize(content_x, content_y, content_w, content_h) catch {};
+
+        // Update border dimensions
+        pane.border_x = outer_x;
+        pane.border_y = outer_y;
+        pane.border_w = outer_w;
+        pane.border_h = outer_h;
+    }
 }
 
 fn createNamedFloat(state: *State, float_def: *const core.FloatDef) !void {
@@ -364,18 +449,56 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef) !void {
 
     const cfg = &state.config;
 
-    // Center floating pane using config percentages
-    const w = state.term_width * cfg.float_width_percent / 100;
-    const h = (state.term_height - state.status_height) * cfg.float_height_percent / 100;
-    const x = (state.term_width - w) / 2;
-    const y = (state.term_height - state.status_height - h) / 2;
+    // Use per-float settings or fall back to defaults
+    const width_pct: u16 = float_def.width_percent orelse cfg.float_width_percent;
+    const height_pct: u16 = float_def.height_percent orelse cfg.float_height_percent;
+    const pos_x_pct: u16 = float_def.pos_x orelse 50; // default center
+    const pos_y_pct: u16 = float_def.pos_y orelse 50; // default center
+    const pad_x_cfg: u16 = float_def.padding_x orelse cfg.float_padding_x;
+    const pad_y_cfg: u16 = float_def.padding_y orelse cfg.float_padding_y;
+    const border_color: u8 = float_def.border_color orelse cfg.float_border_color;
+    const show_title: bool = float_def.show_title orelse cfg.float_show_title;
+
+    // Calculate outer frame size
+    const avail_h = state.term_height - state.status_height;
+    const outer_w = state.term_width * width_pct / 100;
+    const outer_h = avail_h * height_pct / 100;
+
+    // Calculate position based on pos_x/pos_y percentages
+    // 0% = left/top edge, 50% = centered, 100% = right/bottom edge
+    const max_x = state.term_width -| outer_w;
+    const max_y = avail_h -| outer_h;
+    const outer_x = max_x * pos_x_pct / 100;
+    const outer_y = max_y * pos_y_pct / 100;
+
+    // Content area: 1 cell border + configurable padding
+    const pad_x: u16 = 1 + pad_x_cfg;
+    const pad_y: u16 = 1 + pad_y_cfg;
+    const content_x = outer_x + pad_x;
+    const content_y = outer_y + pad_y;
+    const content_w = outer_w -| (pad_x * 2);
+    const content_h = outer_h -| (pad_y * 2);
 
     const id: u16 = @intCast(100 + state.floating_panes.items.len);
-    pane.* = try Pane.initWithCommand(state.allocator, id, x, y, w, h, float_def.command);
+    pane.* = try Pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command);
     pane.floating = true;
     pane.focused = true;
     pane.visible = true;
     pane.name = float_def.name;
+    // Store outer dimensions and style for border rendering
+    pane.border_x = outer_x;
+    pane.border_y = outer_y;
+    pane.border_w = outer_w;
+    pane.border_h = outer_h;
+    pane.border_color = border_color;
+    pane.show_title = show_title;
+    // Store percentages for resize recalculation
+    pane.float_width_pct = @intCast(width_pct);
+    pane.float_height_pct = @intCast(height_pct);
+    pane.float_pos_x_pct = @intCast(pos_x_pct);
+    pane.float_pos_y_pct = @intCast(pos_y_pct);
+    pane.float_pad_x = @intCast(pad_x_cfg);
+    pane.float_pad_y = @intCast(pad_y_cfg);
 
     try state.floating_panes.append(state.allocator, pane);
     state.active_floating = state.floating_panes.items.len - 1;
@@ -386,8 +509,9 @@ fn render(state: *State, stdout: std.fs.File) !void {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    // Clear screen
-    try output.appendSlice(allocator, "\x1b[2J");
+    // Begin synchronized output (reduces flicker) and hide cursor
+    // We don't clear screen - just overwrite content to reduce flicker
+    try output.appendSlice(allocator, "\x1b[?2026h\x1b[?25l");
 
     // Render tiled panes
     var pane_it = state.layout.paneIterator();
@@ -406,7 +530,9 @@ fn render(state: *State, stdout: std.fs.File) !void {
         try pane.render(allocator, &output);
 
         const is_active = state.active_floating == i;
-        try renderFloatingBorder(allocator, &output, pane.x, pane.y, pane.width, pane.height, is_active, pane.name);
+        // Use per-pane border settings
+        const title = if (pane.show_title) pane.name else "";
+        try renderFloatingBorder(allocator, &output, pane.border_x, pane.border_y, pane.border_w, pane.border_h, is_active, title, pane.border_color);
     }
 
     // Render status bar if enabled
@@ -414,21 +540,33 @@ fn render(state: *State, stdout: std.fs.File) !void {
         try renderStatusBar(state, allocator, &output);
     }
 
-    // Position cursor
+    // Position cursor and get style from focused pane
     var cursor_x: u16 = 1;
     var cursor_y: u16 = 1;
+    var cursor_style: u8 = 0;
+    var cursor_visible: bool = true;
 
     if (state.active_floating) |idx| {
-        const pos = state.floating_panes.items[idx].getCursorPos();
+        const pane = state.floating_panes.items[idx];
+        const pos = pane.getCursorPos();
         cursor_x = pos.x + 1;
         cursor_y = pos.y + 1;
+        cursor_style = pane.getCursorStyle();
+        cursor_visible = pane.isCursorVisible();
     } else if (state.layout.getFocusedPane()) |pane| {
         const pos = pane.getCursorPos();
         cursor_x = pos.x + 1;
         cursor_y = pos.y + 1;
+        cursor_style = pane.getCursorStyle();
+        cursor_visible = pane.isCursorVisible();
     }
 
-    try output.writer(allocator).print("\x1b[{d};{d}H\x1b[?25h", .{ cursor_y, cursor_x });
+    // Set cursor style (DECSCUSR), position, visibility, and end sync
+    try output.writer(allocator).print("\x1b[{d} q\x1b[{d};{d}H", .{ cursor_style, cursor_y, cursor_x });
+    if (cursor_visible) {
+        try output.appendSlice(allocator, "\x1b[?25h");
+    }
+    try output.appendSlice(allocator, "\x1b[?2026l");
 
     try stdout.writeAll(output.items);
 }
@@ -464,23 +602,35 @@ fn renderSplitBorders(state: *State, allocator: std.mem.Allocator, output: *std.
     try output.appendSlice(allocator, "\x1b[0m");
 }
 
-fn renderFloatingBorder(allocator: std.mem.Allocator, output: *std.ArrayList(u8), x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8) !void {
-    const color = if (active) "\x1b[36m" else "\x1b[90m"; // cyan if active, gray otherwise
-    try output.appendSlice(allocator, color);
+fn renderFloatingBorder(allocator: std.mem.Allocator, output: *std.ArrayList(u8), x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8, border_color: u8) !void {
+    // Use configured color, brighter when active
+    if (active) {
+        // Bright version of the color (add 8 for bright colors, or use bold)
+        try output.writer(allocator).print("\x1b[1;38;5;{d}m", .{border_color});
+    } else {
+        try output.writer(allocator).print("\x1b[38;5;{d}m", .{border_color});
+    }
 
     // Top border with title
     try output.writer(allocator).print("\x1b[{d};{d}H", .{ y + 1, x + 1 });
     try output.appendSlice(allocator, "╭");
 
-    // Build title with name
-    var title_buf: [32]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "[ {s} ]", .{name}) catch "[ float ]";
-    const title_start = (w -| title.len) / 2;
+    // Build title with name (if provided)
+    if (name.len > 0) {
+        var title_buf: [32]u8 = undefined;
+        const title = std.fmt.bufPrint(&title_buf, "[ {s} ]", .{name}) catch "[ float ]";
+        const title_start = (w -| title.len) / 2;
 
-    for (0..w -| 2) |col| {
-        if (col >= title_start and col < title_start + title.len) {
-            try output.append(allocator, title[col - title_start]);
-        } else {
+        for (0..w -| 2) |col| {
+            if (col >= title_start and col < title_start + title.len) {
+                try output.append(allocator, title[col - title_start]);
+            } else {
+                try output.appendSlice(allocator, "─");
+            }
+        }
+    } else {
+        // No title, just draw the line
+        for (0..w -| 2) |_| {
             try output.appendSlice(allocator, "─");
         }
     }

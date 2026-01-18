@@ -51,13 +51,23 @@ pub const Pty = struct {
             _ = posix.close(@intCast(slave_fd));
             _ = posix.close(@intCast(master_fd));
 
-            const shell_z = std.heap.c_allocator.dupeZ(u8, shell) catch posix.exit(1);
-            var argv = [_:null]?[*:0]const u8{ shell_z, null };
-
             // Build environment: inherit parent env + BOX=1 + TERM override
             const envp = buildEnv() catch posix.exit(1);
 
-            posix.execvpeZ(shell_z, &argv, envp) catch posix.exit(1);
+            // Check if command has spaces (needs shell wrapper)
+            const has_spaces = std.mem.indexOfScalar(u8, shell, ' ') != null;
+
+            if (has_spaces) {
+                // Use /bin/sh -c "command" for commands with arguments
+                const cmd_z = std.heap.c_allocator.dupeZ(u8, shell) catch posix.exit(1);
+                var argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z, null };
+                posix.execvpeZ("/bin/sh", &argv, envp) catch posix.exit(1);
+            } else {
+                // Simple command without arguments
+                const shell_z = std.heap.c_allocator.dupeZ(u8, shell) catch posix.exit(1);
+                var argv = [_:null]?[*:0]const u8{ shell_z, null };
+                posix.execvpeZ(shell_z, &argv, envp) catch posix.exit(1);
+            }
             unreachable;
         }
 
@@ -111,8 +121,30 @@ pub const Pty = struct {
     }
 
     pub fn close(self: *Pty) void {
+        // Close master fd first - this sends EOF to the child
         _ = posix.close(self.master_fd);
+
         if (!self.child_reaped) {
+            // Try non-blocking wait first
+            const result = posix.waitpid(self.child_pid, posix.W.NOHANG);
+            if (result.pid != 0) {
+                self.child_reaped = true;
+                return;
+            }
+
+            // Still running - send SIGHUP then SIGTERM
+            _ = std.c.kill(self.child_pid, std.c.SIG.HUP);
+
+            // Brief wait then check again
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            const result2 = posix.waitpid(self.child_pid, posix.W.NOHANG);
+            if (result2.pid != 0) {
+                self.child_reaped = true;
+                return;
+            }
+
+            // Force kill if still alive
+            _ = std.c.kill(self.child_pid, std.c.SIG.KILL);
             _ = posix.waitpid(self.child_pid, 0);
             self.child_reaped = true;
         }
