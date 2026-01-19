@@ -559,6 +559,20 @@ pub const SesState = struct {
     pub fn killPane(self: *SesState, uuid: [32]u8) !void {
         var pane = self.panes.fetchRemove(uuid) orelse return error.PaneNotFound;
 
+        // Remove from client's pane_uuids list if attached
+        if (pane.value.attached_to) |client_id| {
+            if (self.getClient(client_id)) |client| {
+                var i: usize = 0;
+                while (i < client.pane_uuids.items.len) {
+                    if (std.mem.eql(u8, &client.pane_uuids.items[i], &uuid)) {
+                        _ = client.pane_uuids.orderedRemove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+
         // Close fd (sends SIGHUP to process)
         posix.close(pane.value.master_fd);
 

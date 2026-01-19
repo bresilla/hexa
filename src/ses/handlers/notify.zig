@@ -221,9 +221,11 @@ pub fn handleStatus(
         }
 
         // List panes for this client
-        for (client.pane_uuids.items, 0..) |uuid, pi| {
-            if (pi > 0) try writer.writeAll(",");
+        var first_pane = true;
+        for (client.pane_uuids.items) |uuid| {
             if (ses_state.panes.get(uuid)) |pane| {
+                if (!first_pane) try writer.writeAll(",");
+                first_pane = false;
                 try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d}", .{
                     uuid,
                     pane.child_pid,

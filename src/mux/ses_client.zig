@@ -292,6 +292,62 @@ pub const SesClient = struct {
         if (line == null) return error.ConnectionClosed;
     }
 
+    /// Pane auxiliary info returned from getPaneAux
+    pub const PaneAuxInfo = struct {
+        created_from: ?[32]u8,
+        focused_from: ?[32]u8,
+    };
+
+    /// Get auxiliary pane info (created_from, focused_from) from ses
+    pub fn getPaneAux(self: *SesClient, uuid: [32]u8) !PaneAuxInfo {
+        const conn = &(self.conn orelse return error.NotConnected);
+
+        var buf: [128]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid});
+        try conn.sendLine(msg);
+
+        // Wait for response
+        var resp_buf: [2048]u8 = undefined;
+        const line = try conn.recvLine(&resp_buf);
+        if (line == null) return error.ConnectionClosed;
+
+        // Parse JSON response
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch {
+            return error.InvalidResponse;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        if (root.get("type")) |t| {
+            if (std.mem.eql(u8, t.string, "error")) {
+                return error.PaneNotFound;
+            }
+        }
+
+        var info: PaneAuxInfo = .{
+            .created_from = null,
+            .focused_from = null,
+        };
+
+        if (root.get("created_from")) |cf| {
+            if (cf == .string and cf.string.len == 32) {
+                var created: [32]u8 = undefined;
+                @memcpy(&created, cf.string[0..32]);
+                info.created_from = created;
+            }
+        }
+
+        if (root.get("focused_from")) |ff| {
+            if (ff == .string and ff.string.len == 32) {
+                var focused: [32]u8 = undefined;
+                @memcpy(&focused, ff.string[0..32]);
+                info.focused_from = focused;
+            }
+        }
+
+        return info;
+    }
+
     /// Ping ses to check if it's alive
     pub fn ping(self: *SesClient) !bool {
         const conn = &(self.conn orelse return false);

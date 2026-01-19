@@ -2152,6 +2152,12 @@ fn performDisown(state: *State) void {
             // Get current working directory from the process before orphaning
             const cwd = p.getRealCwd();
 
+            // Get the old pane's auxiliary info (created_from, focused_from) to inherit
+            const old_aux = state.ses_client.getPaneAux(p.uuid) catch SesClient.PaneAuxInfo{
+                .created_from = null,
+                .focused_from = null,
+            };
+
             // Orphan the current pane in ses (keeps process alive)
             state.ses_client.orphanPane(p.uuid) catch {};
 
@@ -2162,6 +2168,23 @@ fn performDisown(state: *State) void {
                     state.needs_render = true;
                     return;
                 };
+
+                // Sync inherited auxiliary info to the new pane
+                const pane_type: SesClient.PaneType = if (p.floating) .float else .split;
+                const cursor = p.getCursorPos();
+                state.ses_client.updatePaneAux(
+                    p.uuid,
+                    p.floating,
+                    p.focused,
+                    pane_type,
+                    old_aux.created_from, // Inherit creator
+                    old_aux.focused_from, // Inherit last focus
+                    .{ .x = cursor.x, .y = cursor.y },
+                    p.getRealCwd(),
+                    p.getFgProcess(),
+                    p.getFgPid(),
+                ) catch {};
+
                 state.notifications.show("Pane disowned (adopt with Alt+a)");
             } else |_| {
                 // Fallback: respawn locally if ses fails
