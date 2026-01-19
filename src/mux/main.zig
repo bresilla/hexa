@@ -2,7 +2,16 @@ const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
 const shp = @import("shp");
+const statusbar = @import("statusbar.zig");
+const popup_render = @import("popup_render.zig");
 const pop = @import("pop");
+const input = @import("input.zig");
+const borders = @import("borders.zig");
+const terminal = @import("terminal.zig");
+
+const c = @cImport({
+    @cInclude("stdlib.h");
+});
 
 const Pane = @import("pane.zig").Pane;
 const layout_mod = @import("layout.zig");
@@ -16,11 +25,6 @@ const SesClient = ses_client.SesClient;
 const OrphanedPaneInfo = ses_client.OrphanedPaneInfo;
 const notification = @import("notification.zig");
 const NotificationManager = notification.NotificationManager;
-
-const c = @cImport({
-    @cInclude("sys/ioctl.h");
-    @cInclude("stdlib.h");
-});
 
 /// A tab contains a layout with splits (splits)
 const Tab = struct {
@@ -884,7 +888,7 @@ pub fn run(mux_args: MuxArgs) !void {
     }
 
     // Get terminal size
-    const size = getTermSize();
+    const size = terminal.getTermSize();
 
     // Initialize state
     var state = try State.init(allocator, size.cols, size.rows);
@@ -970,8 +974,8 @@ fn runMainLoop(state: *State) !void {
     const allocator = state.allocator;
 
     // Enter raw mode
-    const orig_termios = try enableRawMode(posix.STDIN_FILENO);
-    defer disableRawMode(posix.STDIN_FILENO, orig_termios) catch {};
+    const orig_termios = try terminal.enableRawMode(posix.STDIN_FILENO);
+    defer terminal.disableRawMode(posix.STDIN_FILENO, orig_termios) catch {};
 
     // Enter alternate screen and reset it
     const stdout = std.fs.File.stdout();
@@ -1004,7 +1008,7 @@ fn runMainLoop(state: *State) !void {
     while (state.running) {
         // Check for terminal resize
         {
-            const new_size = getTermSize();
+            const new_size = terminal.getTermSize();
             if (new_size.cols != state.term_width or new_size.rows != state.term_height) {
                 state.term_width = new_size.cols;
                 state.term_height = new_size.rows;
@@ -1304,48 +1308,14 @@ fn runMainLoop(state: *State) !void {
     }
 }
 
-/// Convert arrow key escape sequences to vim-style keys for popup navigation
-/// Returns 0 for keys that should be ignored (like Alt+key sequences)
-fn convertArrowKey(input: []const u8) u8 {
-    if (input.len == 0) return 0;
-    // Check for ESC sequences
-    if (input[0] == 0x1b) {
-        // Arrow keys: ESC [ A/B/C/D
-        if (input.len >= 3 and input[1] == '[') {
-            return switch (input[2]) {
-                'C' => 'l', // Right arrow -> toggle
-                'D' => 'h', // Left arrow -> toggle
-                'A' => 'k', // Up arrow -> up (picker)
-                'B' => 'j', // Down arrow -> down (picker)
-                else => 0, // Ignore other CSI sequences
-            };
-        }
-        // Alt+key: ESC followed by printable char (not '[' or 'O')
-        // Ignore these - return 0
-        if (input.len >= 2 and input[1] != '[' and input[1] != 'O') {
-            return 0; // Ignore Alt+key
-        }
-        // Bare ESC key (no following char, or timeout)
-        return 27; // ESC to cancel
-    }
-    return input[0];
-}
-
-/// Handle popup input and return true if popup was dismissed
-fn handlePopupInput(popups: *pop.PopupManager, input: []const u8) bool {
-    const key = convertArrowKey(input);
-    const result = popups.handleInput(key);
-    return result == .dismissed;
-}
-
-fn handleInput(state: *State, input: []const u8) void {
-    if (input.len == 0) return;
+fn handleInput(state: *State, inp: []const u8) void {
+    if (inp.len == 0) return;
 
     // ==========================================================================
     // LEVEL 1: MUX-level popup blocks EVERYTHING
     // ==========================================================================
     if (state.popups.isBlocked()) {
-        if (handlePopupInput(&state.popups, input)) {
+        if (input.handlePopupInput(&state.popups, inp)) {
             sendPopResponse(state);
         }
         state.needs_render = true;
@@ -1358,17 +1328,17 @@ fn handleInput(state: *State, input: []const u8) void {
     const current_tab = &state.tabs.items[state.active_tab];
     if (current_tab.popups.isBlocked()) {
         // Allow tab switching (Alt+N, Alt+P)
-        if (input.len >= 2 and input[0] == 0x1b and input[1] != '[' and input[1] != 'O') {
+        if (inp.len >= 2 and inp[0] == 0x1b and inp[1] != '[' and inp[1] != 'O') {
             const cfg = &state.config;
-            if (input[1] == cfg.tabs.key_next or input[1] == cfg.tabs.key_prev) {
+            if (inp[1] == cfg.tabs.key_next or inp[1] == cfg.tabs.key_prev) {
                 // Allow tab switch
-                if (handleAltKey(state, input[1])) {
+                if (handleAltKey(state, inp[1])) {
                     return;
                 }
             }
         }
         // Block everything else - handle popup input
-        if (handlePopupInput(&current_tab.popups, input)) {
+        if (input.handlePopupInput(&current_tab.popups, inp)) {
             sendPopResponse(state);
         }
         state.needs_render = true;
@@ -1376,14 +1346,14 @@ fn handleInput(state: *State, input: []const u8) void {
     }
 
     var i: usize = 0;
-    while (i < input.len) {
+    while (i < inp.len) {
         // Check for Alt+key (ESC followed by key)
-        if (input[i] == 0x1b and i + 1 < input.len) {
-            const next = input[i + 1];
+        if (inp[i] == 0x1b and i + 1 < inp.len) {
+            const next = inp[i + 1];
             // Check for CSI sequences (ESC [)
-            if (next == '[' and i + 2 < input.len) {
+            if (next == '[' and i + 2 < inp.len) {
                 // Handle scroll keys
-                if (handleScrollKeys(state, input[i..])) |consumed| {
+                if (handleScrollKeys(state, inp[i..])) |consumed| {
                     i += consumed;
                     continue;
                 }
@@ -1398,7 +1368,7 @@ fn handleInput(state: *State, input: []const u8) void {
         }
 
         // Check for Ctrl+Q to quit
-        if (input[i] == 0x11) {
+        if (inp[i] == 0x11) {
             state.running = false;
             return;
         }
@@ -1417,7 +1387,7 @@ fn handleInput(state: *State, input: []const u8) void {
             if (fpane.visible and can_interact) {
                 // Check if this float pane has a blocking popup
                 if (fpane.popups.isBlocked()) {
-                    if (handlePopupInput(&fpane.popups, input[i..])) {
+                    if (input.handlePopupInput(&fpane.popups, inp[i..])) {
                         sendPopResponse(state);
                     }
                     state.needs_render = true;
@@ -1427,13 +1397,13 @@ fn handleInput(state: *State, input: []const u8) void {
                     fpane.scrollToBottom();
                     state.needs_render = true;
                 }
-                fpane.write(input[i..]) catch {};
+                fpane.write(inp[i..]) catch {};
             } else {
                 // Can't input to tab-bound float on wrong tab, forward to tiled pane
                 if (state.currentLayout().getFocusedPane()) |pane| {
                     // Check if this pane has a blocking popup
                     if (pane.popups.isBlocked()) {
-                        if (handlePopupInput(&pane.popups, input[i..])) {
+                        if (input.handlePopupInput(&pane.popups, inp[i..])) {
                             sendPopResponse(state);
                         }
                         state.needs_render = true;
@@ -1443,13 +1413,13 @@ fn handleInput(state: *State, input: []const u8) void {
                         pane.scrollToBottom();
                         state.needs_render = true;
                     }
-                    pane.write(input[i..]) catch {};
+                    pane.write(inp[i..]) catch {};
                 }
             }
         } else if (state.currentLayout().getFocusedPane()) |pane| {
             // Check if this pane has a blocking popup
             if (pane.popups.isBlocked()) {
-                if (handlePopupInput(&pane.popups, input[i..])) {
+                if (input.handlePopupInput(&pane.popups, inp[i..])) {
                     sendPopResponse(state);
                 }
                 state.needs_render = true;
@@ -1459,7 +1429,7 @@ fn handleInput(state: *State, input: []const u8) void {
                 pane.scrollToBottom();
                 state.needs_render = true;
             }
-            pane.write(input[i..]) catch {};
+            pane.write(inp[i..]) catch {};
         }
         return;
     }
@@ -1769,9 +1739,9 @@ fn handleIpcConnection(state: *State, buffer: []u8) void {
 
 /// Handle scroll-related escape sequences
 /// Returns number of bytes consumed, or null if not a scroll sequence
-fn handleScrollKeys(state: *State, input: []const u8) ?usize {
+fn handleScrollKeys(state: *State, inp: []const u8) ?usize {
     // Must start with ESC [
-    if (input.len < 3 or input[0] != 0x1b or input[1] != '[') return null;
+    if (inp.len < 3 or inp[0] != 0x1b or inp[1] != '[') return null;
 
     // Get the focused pane
     const pane = if (state.active_floating) |idx|
@@ -1780,13 +1750,13 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
         state.currentLayout().getFocusedPane() orelse return null;
 
     // SGR mouse format: ESC [ < btn ; x ; y M (press) or m (release)
-    if (input.len >= 4 and input[2] == '<') {
+    if (inp.len >= 4 and inp[2] == '<') {
         // Find the 'M' or 'm' terminator
         var end: usize = 3;
-        while (end < input.len and input[end] != 'M' and input[end] != 'm') : (end += 1) {}
-        if (end >= input.len) return null;
+        while (end < inp.len and inp[end] != 'M' and inp[end] != 'm') : (end += 1) {}
+        if (end >= inp.len) return null;
 
-        const is_release = input[end] == 'm';
+        const is_release = inp[end] == 'm';
 
         // Parse: btn ; x ; y
         var btn: u16 = 0;
@@ -1795,10 +1765,10 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
         var field: u8 = 0;
         var i: usize = 3;
         while (i < end) : (i += 1) {
-            if (input[i] == ';') {
+            if (inp[i] == ';') {
                 field += 1;
-            } else if (input[i] >= '0' and input[i] <= '9') {
-                const digit = input[i] - '0';
+            } else if (inp[i] >= '0' and inp[i] <= '9') {
+                const digit = inp[i] - '0';
                 switch (field) {
                     0 => btn = btn * 10 + digit,
                     1 => mouse_x = mouse_x * 10 + digit,
@@ -1869,66 +1839,66 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
     }
 
     // Page Up: ESC [ 5 ~
-    if (input.len >= 4 and input[2] == '5' and input[3] == '~') {
+    if (inp.len >= 4 and inp[2] == '5' and inp[3] == '~') {
         pane.scrollUp(pane.height / 2);
         state.needs_render = true;
         return 4;
     }
 
     // Page Down: ESC [ 6 ~
-    if (input.len >= 4 and input[2] == '6' and input[3] == '~') {
+    if (inp.len >= 4 and inp[2] == '6' and inp[3] == '~') {
         pane.scrollDown(pane.height / 2);
         state.needs_render = true;
         return 4;
     }
 
     // Shift+Page Up: ESC [ 5 ; 2 ~
-    if (input.len >= 6 and input[2] == '5' and input[3] == ';' and input[4] == '2' and input[5] == '~') {
+    if (inp.len >= 6 and inp[2] == '5' and inp[3] == ';' and inp[4] == '2' and inp[5] == '~') {
         pane.scrollUp(pane.height);
         state.needs_render = true;
         return 6;
     }
 
     // Shift+Page Down: ESC [ 6 ; 2 ~
-    if (input.len >= 6 and input[2] == '6' and input[3] == ';' and input[4] == '2' and input[5] == '~') {
+    if (inp.len >= 6 and inp[2] == '6' and inp[3] == ';' and inp[4] == '2' and inp[5] == '~') {
         pane.scrollDown(pane.height);
         state.needs_render = true;
         return 6;
     }
 
     // Home (scroll to top): ESC [ H or ESC [ 1 ~
-    if (input.len >= 3 and input[2] == 'H') {
+    if (inp.len >= 3 and inp[2] == 'H') {
         pane.scrollToTop();
         state.needs_render = true;
         return 3;
     }
-    if (input.len >= 4 and input[2] == '1' and input[3] == '~') {
+    if (inp.len >= 4 and inp[2] == '1' and inp[3] == '~') {
         pane.scrollToTop();
         state.needs_render = true;
         return 4;
     }
 
     // End (scroll to bottom): ESC [ F or ESC [ 4 ~
-    if (input.len >= 3 and input[2] == 'F') {
+    if (inp.len >= 3 and inp[2] == 'F') {
         pane.scrollToBottom();
         state.needs_render = true;
         return 3;
     }
-    if (input.len >= 4 and input[2] == '4' and input[3] == '~') {
+    if (inp.len >= 4 and inp[2] == '4' and inp[3] == '~') {
         pane.scrollToBottom();
         state.needs_render = true;
         return 4;
     }
 
     // Shift+Up: ESC [ 1 ; 2 A - scroll up one line
-    if (input.len >= 6 and input[2] == '1' and input[3] == ';' and input[4] == '2' and input[5] == 'A') {
+    if (inp.len >= 6 and inp[2] == '1' and inp[3] == ';' and inp[4] == '2' and inp[5] == 'A') {
         pane.scrollUp(1);
         state.needs_render = true;
         return 6;
     }
 
     // Shift+Down: ESC [ 1 ; 2 B - scroll down one line
-    if (input.len >= 6 and input[2] == '1' and input[3] == ';' and input[4] == '2' and input[5] == 'B') {
+    if (inp.len >= 6 and inp[2] == '1' and inp[3] == ';' and inp[4] == '2' and inp[5] == 'B') {
         pane.scrollDown(1);
         state.needs_render = true;
         return 6;
@@ -2417,7 +2387,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
         // Draw scroll indicator if pane is scrolled
         if (is_scrolled) {
-            drawScrollIndicator(renderer, pane.*.x, pane.*.y, pane.*.width);
+            borders.drawScrollIndicator(renderer, pane.*.x, pane.*.y, pane.*.width);
         }
 
         // Draw pane-local notification (PANE realm - bottom of pane)
@@ -2428,7 +2398,8 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
     // Draw split borders when there are multiple splits
     if (state.currentLayout().splitCount() > 1) {
-        drawSplitBorders(state, renderer);
+        const content_height = state.term_height - state.status_height;
+        borders.drawSplitBorders(renderer, state.currentLayout(), &state.config.splits, state.term_width, content_height);
     }
 
     // Draw visible floats (on top of splits)
@@ -2441,13 +2412,13 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
             if (parent != state.active_tab) continue;
         }
 
-        drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, "", pane.border_color, pane.float_style);
+        borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, "", pane.border_color, pane.float_style);
 
         const render_state = pane.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
 
         if (pane.isScrolled()) {
-            drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
+            borders.drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
         }
 
         // Draw pane-local notification (PANE realm - bottom of pane)
@@ -2465,14 +2436,14 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         else
             true;
         if (pane.visible and can_render) {
-            drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, "", pane.border_color, pane.float_style);
+            borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, "", pane.border_color, pane.float_style);
 
             if (pane.getRenderState()) |render_state| {
                 renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
             } else |_| {}
 
             if (pane.isScrolled()) {
-                drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
+                borders.drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
             }
 
             // Draw pane-local notification (PANE realm - bottom of pane)
@@ -2484,7 +2455,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
     // Draw status bar if enabled
     if (state.config.tabs.status.enabled) {
-        drawStatusBar(state, renderer);
+        statusbar.draw(renderer, state.allocator, &state.config, state.term_width, state.term_height, state.tabs, state.active_tab, state.session_name);
     }
 
     // Draw TAB realm notifications (center of screen, below MUX)
@@ -2495,13 +2466,13 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     var split_iter = current_tab.layout.splits.valueIterator();
     while (split_iter.next()) |pane| {
         if (pane.*.popups.getActivePopup()) |popup| {
-            drawPopupInBounds(state, renderer, popup, pane.*.x, pane.*.y, pane.*.width, pane.*.height);
+            popup_render.drawInBounds(renderer, popup, &state.pop_config.carrier, pane.*.x, pane.*.y, pane.*.width, pane.*.height);
         }
     }
     // Check all floats
     for (state.floats.items) |fpane| {
         if (fpane.popups.getActivePopup()) |popup| {
-            drawPopupInBounds(state, renderer, popup, fpane.x, fpane.y, fpane.width, fpane.height);
+            popup_render.drawInBounds(renderer, popup, &state.pop_config.carrier, fpane.x, fpane.y, fpane.width, fpane.height);
         }
     }
     if (current_tab.notifications.hasActive()) {
@@ -2511,7 +2482,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
     // Draw TAB-level blocking popup (below MUX popup)
     if (current_tab.popups.getActivePopup()) |popup| {
-        drawPopup(state, renderer, popup);
+        popup_render.draw(renderer, popup, &state.pop_config.carrier, state.term_width, state.term_height);
     }
 
     // Draw MUX realm notifications overlay (top of screen)
@@ -2519,7 +2490,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
     // Draw MUX-level blocking popup overlay (on top of everything)
     if (state.popups.getActivePopup()) |popup| {
-        drawPopup(state, renderer, popup);
+        popup_render.draw(renderer, popup, &state.pop_config.carrier, state.term_width, state.term_height);
     }
 
     // End frame with differential render
@@ -2572,878 +2543,4 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         .{ .base = &cursor_buf, .len = cursor_len },
     };
     try stdout.writevAll(iovecs[0..]);
-}
-
-/// Draw a blocking popup (confirm or picker) centered on screen
-fn drawPopup(state: *State, renderer: *Renderer, popup: pop.Popup) void {
-    drawPopupInBounds(state, renderer, popup, 0, 0, state.term_width, state.term_height);
-}
-
-fn drawPopupInBounds(state: *State, renderer: *Renderer, popup: pop.Popup, bounds_x: u16, bounds_y: u16, bounds_w: u16, bounds_h: u16) void {
-    const cfg = &state.pop_config.carrier;
-
-    switch (popup) {
-        .confirm => |confirm| drawConfirmPopupInBounds(renderer, confirm, cfg.confirm, bounds_x, bounds_y, bounds_w, bounds_h),
-        .picker => |picker| drawPickerPopupInBounds(renderer, picker, cfg.choose, bounds_x, bounds_y, bounds_w, bounds_h),
-    }
-}
-
-fn drawConfirmPopupInBounds(renderer: *Renderer, confirm: *pop.Confirm, cfg: pop.ConfirmStyle, bounds_x: u16, bounds_y: u16, bounds_w: u16, bounds_h: u16) void {
-    const dims = confirm.getBoxDimensions();
-
-    // Ensure minimum width for the box
-    const min_width: u16 = 30;
-    const box_width = @max(dims.width, min_width);
-    const box_height = dims.height;
-
-    // Center within bounds
-    const center_x = bounds_x + bounds_w / 2;
-    const center_y = bounds_y + bounds_h / 2;
-    const box_x = center_x -| (box_width / 2);
-    const box_y = center_y -| (box_height / 2);
-
-    const fg: render.Color = .{ .palette = cfg.fg };
-    const bg: render.Color = .{ .palette = cfg.bg };
-    const padding_x = cfg.padding_x;
-    const padding_y = cfg.padding_y;
-
-    // Inner content area (excluding border)
-    const inner_width = box_width - 2;
-    const inner_x = box_x + 1;
-
-    // Draw box background (fill entire box including border area)
-    var y: u16 = box_y;
-    while (y < box_y + box_height) : (y += 1) {
-        var x: u16 = box_x;
-        while (x < box_x + box_width) : (x += 1) {
-            renderer.setCell(x, y, .{ .char = ' ', .fg = fg, .bg = bg });
-        }
-    }
-
-    // Draw border on top of background
-    // Top border
-    renderer.setCell(box_x, box_y, .{ .char = '┌', .fg = fg, .bg = bg });
-    var x: u16 = box_x + 1;
-    while (x < box_x + box_width - 1) : (x += 1) {
-        renderer.setCell(x, box_y, .{ .char = '─', .fg = fg, .bg = bg });
-    }
-    renderer.setCell(box_x + box_width - 1, box_y, .{ .char = '┐', .fg = fg, .bg = bg });
-
-    // Bottom border
-    renderer.setCell(box_x, box_y + box_height - 1, .{ .char = '└', .fg = fg, .bg = bg });
-    x = box_x + 1;
-    while (x < box_x + box_width - 1) : (x += 1) {
-        renderer.setCell(x, box_y + box_height - 1, .{ .char = '─', .fg = fg, .bg = bg });
-    }
-    renderer.setCell(box_x + box_width - 1, box_y + box_height - 1, .{ .char = '┘', .fg = fg, .bg = bg });
-
-    // Side borders
-    y = box_y + 1;
-    while (y < box_y + box_height - 1) : (y += 1) {
-        renderer.setCell(box_x, y, .{ .char = '│', .fg = fg, .bg = bg });
-        renderer.setCell(box_x + box_width - 1, y, .{ .char = '│', .fg = fg, .bg = bg });
-    }
-
-    // Draw message (centered in inner area)
-    const msg_y = box_y + 1 + padding_y;
-    const msg = confirm.message;
-    const msg_len: u16 = @intCast(@min(msg.len, inner_width - padding_x * 2));
-    const msg_x = inner_x + padding_x + (inner_width - padding_x * 2 -| msg_len) / 2;
-    for (msg[0..msg_len], 0..) |char, i| {
-        const cx = msg_x + @as(u16, @intCast(i));
-        if (cx < box_x + box_width - 1) {
-            renderer.setCell(cx, msg_y, .{ .char = char, .fg = fg, .bg = bg, .bold = cfg.bold });
-        }
-    }
-
-    // Draw buttons (centered, 2 lines below message)
-    const buttons_y = msg_y + 2;
-    const yes_label = confirm.yes_label;
-    const no_label = confirm.no_label;
-
-    // Button format: "[ Yes ]    [ No ]"
-    const yes_text_len: u16 = @intCast(yes_label.len + 4); // "[ Yes ]"
-    const no_text_len: u16 = @intCast(no_label.len + 4); // "[ No ]"
-    const total_buttons_width = yes_text_len + 4 + no_text_len; // 4 spaces between
-    const buttons_start_x = inner_x + (inner_width -| total_buttons_width) / 2;
-
-    // Draw Yes button
-    const yes_selected = confirm.selected == .yes;
-    const yes_fg: render.Color = if (yes_selected) bg else fg;
-    const yes_bg: render.Color = if (yes_selected) fg else bg;
-    var bx = buttons_start_x;
-    renderer.setCell(bx, buttons_y, .{ .char = '[', .fg = yes_fg, .bg = yes_bg });
-    bx += 1;
-    renderer.setCell(bx, buttons_y, .{ .char = ' ', .fg = yes_fg, .bg = yes_bg });
-    bx += 1;
-    for (yes_label) |char| {
-        renderer.setCell(bx, buttons_y, .{ .char = char, .fg = yes_fg, .bg = yes_bg, .bold = yes_selected });
-        bx += 1;
-    }
-    renderer.setCell(bx, buttons_y, .{ .char = ' ', .fg = yes_fg, .bg = yes_bg });
-    bx += 1;
-    renderer.setCell(bx, buttons_y, .{ .char = ']', .fg = yes_fg, .bg = yes_bg });
-    bx += 1;
-
-    // Spacing between buttons
-    bx += 4;
-
-    // Draw No button
-    const no_selected = confirm.selected == .no;
-    const no_fg: render.Color = if (no_selected) bg else fg;
-    const no_bg: render.Color = if (no_selected) fg else bg;
-    renderer.setCell(bx, buttons_y, .{ .char = '[', .fg = no_fg, .bg = no_bg });
-    bx += 1;
-    renderer.setCell(bx, buttons_y, .{ .char = ' ', .fg = no_fg, .bg = no_bg });
-    bx += 1;
-    for (no_label) |char| {
-        renderer.setCell(bx, buttons_y, .{ .char = char, .fg = no_fg, .bg = no_bg, .bold = no_selected });
-        bx += 1;
-    }
-    renderer.setCell(bx, buttons_y, .{ .char = ' ', .fg = no_fg, .bg = no_bg });
-    bx += 1;
-    renderer.setCell(bx, buttons_y, .{ .char = ']', .fg = no_fg, .bg = no_bg });
-}
-
-fn drawPickerPopupInBounds(renderer: *Renderer, picker: *pop.Picker, cfg: pop.ChooseStyle, bounds_x: u16, bounds_y: u16, bounds_w: u16, bounds_h: u16) void {
-    const dims = picker.getBoxDimensions();
-
-    // Ensure minimum width
-    const min_width: u16 = 20;
-    const box_width = @max(dims.width, min_width);
-    const box_height = dims.height + 2; // +2 for border
-
-    // Center within bounds
-    const center_x = bounds_x + bounds_w / 2;
-    const center_y = bounds_y + bounds_h / 2;
-    const box_x = center_x -| (box_width / 2);
-    const box_y = center_y -| (box_height / 2);
-
-    const fg: render.Color = .{ .palette = cfg.fg };
-    const bg: render.Color = .{ .palette = cfg.bg };
-    const highlight_fg: render.Color = .{ .palette = cfg.highlight_fg };
-    const highlight_bg: render.Color = .{ .palette = cfg.highlight_bg };
-
-    // Draw box background
-    var y: u16 = box_y;
-    while (y < box_y + box_height) : (y += 1) {
-        var x: u16 = box_x;
-        while (x < box_x + box_width) : (x += 1) {
-            renderer.setCell(x, y, .{ .char = ' ', .fg = fg, .bg = bg });
-        }
-    }
-
-    // Draw border with optional title
-    // Top border
-    renderer.setCell(box_x, box_y, .{ .char = '┌', .fg = fg, .bg = bg });
-    var x: u16 = box_x + 1;
-    if (picker.title) |title| {
-        // Draw title in border
-        renderer.setCell(x, box_y, .{ .char = '─', .fg = fg, .bg = bg });
-        x += 1;
-        renderer.setCell(x, box_y, .{ .char = ' ', .fg = fg, .bg = bg });
-        x += 1;
-        for (title) |char| {
-            if (x < box_x + box_width - 2) {
-                renderer.setCell(x, box_y, .{ .char = char, .fg = fg, .bg = bg, .bold = true });
-                x += 1;
-            }
-        }
-        renderer.setCell(x, box_y, .{ .char = ' ', .fg = fg, .bg = bg });
-        x += 1;
-    }
-    while (x < box_x + box_width - 1) : (x += 1) {
-        renderer.setCell(x, box_y, .{ .char = '─', .fg = fg, .bg = bg });
-    }
-    renderer.setCell(box_x + box_width - 1, box_y, .{ .char = '┐', .fg = fg, .bg = bg });
-
-    // Bottom border
-    renderer.setCell(box_x, box_y + box_height - 1, .{ .char = '└', .fg = fg, .bg = bg });
-    x = box_x + 1;
-    while (x < box_x + box_width - 1) : (x += 1) {
-        renderer.setCell(x, box_y + box_height - 1, .{ .char = '─', .fg = fg, .bg = bg });
-    }
-    renderer.setCell(box_x + box_width - 1, box_y + box_height - 1, .{ .char = '┘', .fg = fg, .bg = bg });
-
-    // Side borders
-    y = box_y + 1;
-    while (y < box_y + box_height - 1) : (y += 1) {
-        renderer.setCell(box_x, y, .{ .char = '│', .fg = fg, .bg = bg });
-        renderer.setCell(box_x + box_width - 1, y, .{ .char = '│', .fg = fg, .bg = bg });
-    }
-
-    // Draw items
-    const content_x = box_x + 2;
-    var content_y = box_y + 1;
-    const visible_end = @min(picker.scroll_offset + picker.visible_count, picker.items.len);
-
-    var i = picker.scroll_offset;
-    while (i < visible_end) : (i += 1) {
-        const item = picker.items[i];
-        const is_selected = i == picker.selected;
-        const item_fg: render.Color = if (is_selected) highlight_fg else fg;
-        const item_bg: render.Color = if (is_selected) highlight_bg else bg;
-
-        // Draw selection indicator
-        renderer.setCell(content_x, content_y, .{ .char = if (is_selected) '>' else ' ', .fg = item_fg, .bg = item_bg });
-        renderer.setCell(content_x + 1, content_y, .{ .char = ' ', .fg = item_fg, .bg = item_bg });
-
-        // Draw item text
-        var ix: u16 = content_x + 2;
-        for (item) |char| {
-            if (ix < box_x + box_width - 2) {
-                renderer.setCell(ix, content_y, .{ .char = char, .fg = item_fg, .bg = item_bg, .bold = is_selected });
-                ix += 1;
-            }
-        }
-        // Fill rest of line with background
-        while (ix < box_x + box_width - 1) : (ix += 1) {
-            renderer.setCell(ix, content_y, .{ .char = ' ', .fg = item_fg, .bg = item_bg });
-        }
-
-        content_y += 1;
-    }
-}
-
-fn drawSplitBorders(state: *State, renderer: *Renderer) void {
-    const splits = &state.config.splits;
-    const content_height = state.term_height - state.status_height;
-
-    // Get characters and color from config
-    const v_char: u21 = if (splits.style) |s| s.vertical else splits.separator_v;
-    const h_char: u21 = if (splits.style) |s| s.horizontal else splits.separator_h;
-    const color: u8 = splits.color.passive; // splits use passive color
-
-    // Junction characters (only used if style is set)
-    const cross_char: u21 = if (splits.style) |s| s.cross else v_char;
-    const top_t: u21 = if (splits.style) |s| s.top_t else v_char;
-    const bottom_t: u21 = if (splits.style) |s| s.bottom_t else v_char;
-    const left_t: u21 = if (splits.style) |s| s.left_t else h_char;
-    const right_t: u21 = if (splits.style) |s| s.right_t else h_char;
-
-    // Collect vertical and horizontal line positions
-    var v_lines: [64]u16 = undefined;
-    var v_line_count: usize = 0;
-    var h_lines: [64]u16 = undefined;
-    var h_line_count: usize = 0;
-
-    var pane_it = state.currentLayout().splitIterator();
-    while (pane_it.next()) |pane| {
-        const right_edge = pane.*.x + pane.*.width;
-        const bottom_edge = pane.*.y + pane.*.height;
-
-        // Record vertical line position
-        if (right_edge < state.term_width and v_line_count < v_lines.len) {
-            // Check if already recorded
-            var found = false;
-            for (v_lines[0..v_line_count]) |x| {
-                if (x == right_edge) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                v_lines[v_line_count] = right_edge;
-                v_line_count += 1;
-            }
-        }
-
-        // Record horizontal line position
-        if (bottom_edge < content_height and h_line_count < h_lines.len) {
-            var found = false;
-            for (h_lines[0..h_line_count]) |y| {
-                if (y == bottom_edge) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                h_lines[h_line_count] = bottom_edge;
-                h_line_count += 1;
-            }
-        }
-    }
-
-    // Draw vertical lines
-    for (v_lines[0..v_line_count]) |x| {
-        for (0..content_height) |row| {
-            const y: u16 = @intCast(row);
-            var char = v_char;
-
-            // Check for junctions with horizontal lines
-            if (splits.style != null) {
-                for (h_lines[0..h_line_count]) |hy| {
-                    if (y == hy) {
-                        // Check if this is a cross, top_t, or bottom_t
-                        const at_top = (y == 0);
-                        const at_bottom = (y == content_height - 1);
-                        if (at_top) {
-                            char = top_t;
-                        } else if (at_bottom) {
-                            char = bottom_t;
-                        } else {
-                            char = cross_char;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            renderer.setCell(x, y, .{ .char = char, .fg = .{ .palette = color } });
-        }
-    }
-
-    // Draw horizontal lines
-    for (h_lines[0..h_line_count]) |y| {
-        for (0..state.term_width) |col| {
-            const x: u16 = @intCast(col);
-
-            // Skip if already drawn by vertical line (junction)
-            var is_junction = false;
-            for (v_lines[0..v_line_count]) |vx| {
-                if (x == vx) {
-                    is_junction = true;
-                    break;
-                }
-            }
-            if (is_junction) continue;
-
-            var char = h_char;
-
-            // Check for edge junctions
-            if (splits.style != null) {
-                const at_left = (x == 0);
-                const at_right = (x == state.term_width - 1);
-                if (at_left) {
-                    char = left_t;
-                } else if (at_right) {
-                    char = right_t;
-                }
-            }
-
-            renderer.setCell(x, y, .{ .char = char, .fg = .{ .palette = color } });
-        }
-    }
-}
-
-fn drawScrollIndicator(renderer: *Renderer, pane_x: u16, pane_y: u16, pane_width: u16) void {
-    // Display a scroll indicator at top-right of pane
-    const indicator = " \xe2\x96\xb2\xe2\x96\xb2\xe2\x96\xb2 "; // " ▲▲▲ "
-    const indicator_chars = [_]u21{ ' ', 0x25b2, 0x25b2, 0x25b2, ' ' };
-
-    // Position at top-right corner (inside pane bounds)
-    const indicator_len: u16 = 5;
-    const x_pos = pane_x + pane_width -| indicator_len;
-
-    // Yellow background (palette 3), black text (palette 0)
-    for (indicator_chars, 0..) |char, i| {
-        renderer.setCell(x_pos + @as(u16, @intCast(i)), pane_y, .{
-            .char = char,
-            .fg = .{ .palette = 0 }, // black
-            .bg = .{ .palette = 3 }, // yellow
-        });
-    }
-    _ = indicator;
-}
-
-fn drawFloatingBorder(renderer: *Renderer, x: u16, y: u16, w: u16, h: u16, active: bool, name: []const u8, border_color: core.BorderColor, style: ?*const core.FloatStyle) void {
-    const color = if (active) border_color.active else border_color.passive;
-    const fg: render.Color = .{ .palette = color };
-    const bold = active;
-
-    // Get border characters from style or use defaults
-    const top_left: u21 = if (style) |s| s.top_left else 0x256D;
-    const top_right: u21 = if (style) |s| s.top_right else 0x256E;
-    const bottom_left: u21 = if (style) |s| s.bottom_left else 0x2570;
-    const bottom_right: u21 = if (style) |s| s.bottom_right else 0x256F;
-    const horizontal: u21 = if (style) |s| s.horizontal else 0x2500;
-    const vertical: u21 = if (style) |s| s.vertical else 0x2502;
-
-    // Clear the interior with spaces first
-    for (1..h -| 1) |row| {
-        for (1..w -| 1) |col| {
-            renderer.setCell(x + @as(u16, @intCast(col)), y + @as(u16, @intCast(row)), .{
-                .char = ' ',
-            });
-        }
-    }
-
-    // Top-left corner
-    renderer.setCell(x, y, .{ .char = top_left, .fg = fg, .bold = bold });
-
-    // Top border with optional title (centered)
-    if (name.len > 0) {
-        var title_buf: [32]u8 = undefined;
-        const title = std.fmt.bufPrint(&title_buf, "[ {s} ]", .{name}) catch "[ float ]";
-        const title_start = @as(usize, (w -| 2) -| title.len) / 2;
-
-        for (0..w -| 2) |col| {
-            const char: u21 = if (col >= title_start and col < title_start + title.len)
-                title[col - title_start]
-            else
-                horizontal;
-            renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = char, .fg = fg, .bold = bold });
-        }
-    } else {
-        for (0..w -| 2) |col| {
-            renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = horizontal, .fg = fg, .bold = bold });
-        }
-    }
-
-    // Top-right corner
-    renderer.setCell(x + w - 1, y, .{ .char = top_right, .fg = fg, .bold = bold });
-
-    // Side borders
-    for (1..h -| 1) |row| {
-        renderer.setCell(x, y + @as(u16, @intCast(row)), .{ .char = vertical, .fg = fg, .bold = bold });
-        renderer.setCell(x + w - 1, y + @as(u16, @intCast(row)), .{ .char = vertical, .fg = fg, .bold = bold });
-    }
-
-    // Bottom-left corner
-    renderer.setCell(x, y + h - 1, .{ .char = bottom_left, .fg = fg, .bold = bold });
-
-    // Bottom border
-    for (0..w -| 2) |col| {
-        renderer.setCell(x + @as(u16, @intCast(col)) + 1, y + h - 1, .{ .char = horizontal, .fg = fg, .bold = bold });
-    }
-
-    // Bottom-right corner
-    renderer.setCell(x + w - 1, y + h - 1, .{ .char = bottom_right, .fg = fg, .bold = bold });
-
-    // Render module in border if present
-    if (style) |s| {
-        if (s.module) |*module| {
-            if (s.position) |pos| {
-                // Run the module to get output
-                var output_buf: [256]u8 = undefined;
-                const output = runStatusModule(module, &output_buf) catch "";
-                if (output.len == 0) return;
-
-                // Render styled output
-                const segments = renderModuleOutput(module, output);
-
-                // Calculate position based on style position
-                const total_len = segments.total_len;
-                var draw_x: u16 = undefined;
-                var draw_y: u16 = undefined;
-
-                switch (pos) {
-                    .topleft => {
-                        draw_x = x + 2;
-                        draw_y = y;
-                    },
-                    .topcenter => {
-                        draw_x = x + @as(u16, @intCast((w -| total_len) / 2));
-                        draw_y = y;
-                    },
-                    .topright => {
-                        draw_x = x + w -| 2 -| @as(u16, @intCast(total_len));
-                        draw_y = y;
-                    },
-                    .bottomleft => {
-                        draw_x = x + 2;
-                        draw_y = y + h - 1;
-                    },
-                    .bottomcenter => {
-                        draw_x = x + @as(u16, @intCast((w -| total_len) / 2));
-                        draw_y = y + h - 1;
-                    },
-                    .bottomright => {
-                        draw_x = x + w -| 2 -| @as(u16, @intCast(total_len));
-                        draw_y = y + h - 1;
-                    },
-                }
-
-                // Draw each segment with its style
-                var cur_x = draw_x;
-                for (segments.items[0..segments.count]) |seg| {
-                    for (seg.text) |ch| {
-                        renderer.setCell(cur_x, draw_y, .{
-                            .char = ch,
-                            .fg = seg.fg,
-                            .bg = seg.bg,
-                            .bold = seg.bold,
-                            .italic = seg.italic,
-                        });
-                        cur_x += 1;
-                    }
-                }
-            }
-        }
-    }
-}
-
-const RenderedSegment = struct {
-    text: []const u8,
-    fg: render.Color,
-    bg: render.Color,
-    bold: bool,
-    italic: bool,
-};
-
-const RenderedSegments = struct {
-    items: [16]RenderedSegment,
-    buffers: [16][64]u8, // Each segment gets its own buffer
-    count: usize,
-    total_len: usize,
-};
-
-fn renderModuleOutput(module: *const core.StatusModule, output: []const u8) RenderedSegments {
-    var result = RenderedSegments{
-        .items = undefined,
-        .buffers = undefined,
-        .count = 0,
-        .total_len = 0,
-    };
-
-    for (module.outputs) |out| {
-        if (result.count >= 16) break;
-
-        // Replace $output in format with actual output
-        var text_len: usize = 0;
-        var i: usize = 0;
-        while (i < out.format.len and text_len < 64) {
-            if (i + 6 < out.format.len and std.mem.eql(u8, out.format[i .. i + 7], "$output")) {
-                const copy_len = @min(output.len, 64 - text_len);
-                @memcpy(result.buffers[result.count][text_len .. text_len + copy_len], output[0..copy_len]);
-                text_len += copy_len;
-                i += 7;
-            } else {
-                result.buffers[result.count][text_len] = out.format[i];
-                text_len += 1;
-                i += 1;
-            }
-        }
-
-        // Parse style
-        const style = shp.Style.parse(out.style);
-
-        result.items[result.count] = .{
-            .text = result.buffers[result.count][0..text_len],
-            .fg = if (style.fg != .none) styleColorToRender(style.fg) else .none,
-            .bg = if (style.bg != .none) styleColorToRender(style.bg) else .none,
-            .bold = style.bold,
-            .italic = style.italic,
-        };
-        result.total_len += text_len;
-        result.count += 1;
-    }
-
-    return result;
-}
-
-fn styleColorToRender(col: shp.Color) render.Color {
-    return switch (col) {
-        .none => .none,
-        .palette => |p| .{ .palette = p },
-        .rgb => |rgb| .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } },
-    };
-}
-
-fn runStatusModule(module: *const core.StatusModule, buf: []u8) ![]const u8 {
-    // For custom commands, run them
-    if (module.command) |cmd| {
-        const result = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
-            .argv = &.{ "/bin/sh", "-c", cmd },
-        }) catch return "";
-        defer std.heap.page_allocator.free(result.stdout);
-        defer std.heap.page_allocator.free(result.stderr);
-
-        // Copy to buffer, strip trailing newline
-        var len = result.stdout.len;
-        while (len > 0 and (result.stdout[len - 1] == '\n' or result.stdout[len - 1] == '\r')) {
-            len -= 1;
-        }
-        const copy_len = @min(len, buf.len);
-        @memcpy(buf[0..copy_len], result.stdout[0..copy_len]);
-        return buf[0..copy_len];
-    }
-
-    // For built-in modules, delegate to status module system
-    // For now just return module name as placeholder
-    const copy_len = @min(module.name.len, buf.len);
-    @memcpy(buf[0..copy_len], module.name[0..copy_len]);
-    return buf[0..copy_len];
-}
-
-fn drawStatusBar(state: *State, renderer: *Renderer) void {
-    const y = state.term_height - 1;
-    const width = state.term_width;
-    const cfg = &state.config.tabs.status;
-
-    // Clear status bar
-    for (0..width) |xi| {
-        renderer.setCell(@intCast(xi), y, .{ .char = ' ' });
-    }
-
-    // Create shp context
-    var ctx = shp.Context.init(state.allocator);
-    defer ctx.deinit();
-    ctx.terminal_width = width;
-
-    // Find the tabs module to check tab_title setting
-    var use_basename = true; // default to basename
-    for (cfg.center) |mod| {
-        if (std.mem.eql(u8, mod.name, "tabs")) {
-            use_basename = std.mem.eql(u8, mod.tab_title, "basename");
-            break;
-        }
-    }
-
-    // Collect tab titles for center section
-    var tab_names: [16][]const u8 = undefined;
-    var tab_count: usize = 0;
-    for (state.tabs.items) |*tab| {
-        if (tab_count < 16) {
-            if (use_basename) {
-                // Use the focused pane's cwd basename (reads /proc/<pid>/cwd)
-                if (tab.layout.getFocusedPane()) |pane| {
-                    const pwd = pane.getRealCwd();
-                    tab_names[tab_count] = if (pwd) |p| std.fs.path.basename(p) else tab.name;
-                } else {
-                    tab_names[tab_count] = tab.name;
-                }
-            } else {
-                // Use the static tab name
-                tab_names[tab_count] = tab.name;
-            }
-            tab_count += 1;
-        }
-    }
-    ctx.tab_names = tab_names[0..tab_count];
-    ctx.active_tab = state.active_tab;
-    ctx.session_name = state.session_name;
-
-    // === DRAW LEFT SECTION ===
-    var left_x: u16 = 0;
-    for (cfg.left) |mod| {
-        left_x = drawModule(renderer, &ctx, mod, left_x, y);
-    }
-
-    // === CALCULATE RIGHT WIDTH ===
-    var right_width: u16 = 0;
-    for (cfg.right) |mod| {
-        right_width += calcModuleWidth(&ctx, mod);
-    }
-    const right_start = width -| right_width;
-
-    // === DRAW RIGHT SECTION ===
-    var rx: u16 = right_start;
-    for (cfg.right) |mod| {
-        rx = drawModule(renderer, &ctx, mod, rx, y);
-    }
-
-    // === CALCULATE CENTER WIDTH ===
-    var center_width: u16 = 0;
-    for (cfg.center) |mod| {
-        if (std.mem.eql(u8, mod.name, "tabs")) {
-            for (ctx.tab_names, 0..) |tab_name, i| {
-                if (i > 0) center_width += @as(u16, @intCast(mod.separator.len));
-                center_width += 2 + @as(u16, @intCast(tab_name.len)) + 2; // arrows + space + name + space
-            }
-        }
-    }
-
-    // === DRAW CENTER SECTION (truly centered) ===
-    const center_start = (width -| center_width) / 2;
-    if (center_start > left_x + 2 and center_start + center_width < right_start -| 2) {
-        var cx: u16 = center_start;
-        for (cfg.center) |mod| {
-            if (std.mem.eql(u8, mod.name, "tabs")) {
-                const active_style = shp.Style.parse(mod.active_style);
-                const inactive_style = shp.Style.parse(mod.inactive_style);
-                const sep_style = shp.Style.parse(mod.separator_style);
-
-                for (ctx.tab_names, 0..) |tab_name, i| {
-                    if (i > 0) {
-                        cx = drawStyledText(renderer, cx, y, mod.separator, sep_style);
-                    }
-                    const is_active = i == ctx.active_tab;
-                    const style = if (is_active) active_style else inactive_style;
-                    const arrow_fg = if (is_active) active_style.bg else inactive_style.bg;
-                    const arrow_style = shp.Style{ .fg = arrow_fg };
-
-                    cx = drawStyledText(renderer, cx, y, "", arrow_style);
-                    cx = drawStyledText(renderer, cx, y, " ", style);
-                    cx = drawStyledText(renderer, cx, y, tab_name, style);
-                    cx = drawStyledText(renderer, cx, y, " ", style);
-                    cx = drawStyledText(renderer, cx, y, "", arrow_style);
-                }
-            }
-        }
-    }
-}
-
-fn drawModule(renderer: *Renderer, ctx: *shp.Context, mod: core.config.StatusModule, start_x: u16, y: u16) u16 {
-    var x = start_x;
-
-    // Get the output text for this module
-    var output_text: []const u8 = "";
-
-    // Special handling for "session"
-    if (std.mem.eql(u8, mod.name, "session")) {
-        output_text = ctx.session_name;
-    } else {
-        // Render segment to get output text
-        if (ctx.renderSegment(mod.name)) |segs| {
-            if (segs.len > 0) {
-                output_text = segs[0].text;
-            }
-        }
-    }
-
-    // Draw each output in the array
-    for (mod.outputs) |out| {
-        const style = shp.Style.parse(out.style);
-        x = drawFormatted(renderer, x, y, out.format, output_text, style);
-    }
-
-    return x;
-}
-
-fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const u8, output: []const u8, style: shp.Style) u16 {
-    var x = start_x;
-    var i: usize = 0;
-
-    while (i < format.len) {
-        // Look for $output
-        if (i + 7 <= format.len and std.mem.eql(u8, format[i..][0..7], "$output")) {
-            x = drawStyledText(renderer, x, y, output, style);
-            i += 7;
-        } else {
-            // Draw single char (handle UTF-8)
-            const len = std.unicode.utf8ByteSequenceLength(format[i]) catch 1;
-            const end = @min(i + len, format.len);
-            x = drawStyledText(renderer, x, y, format[i..end], style);
-            i = end;
-        }
-    }
-    return x;
-}
-
-fn calcModuleWidth(ctx: *shp.Context, mod: core.config.StatusModule) u16 {
-    var width: u16 = 0;
-
-    // Get the output text for this module
-    var output_text: []const u8 = "";
-
-    // Special handling for "session"
-    if (std.mem.eql(u8, mod.name, "session")) {
-        output_text = ctx.session_name;
-    } else {
-        // Render segment to get output text
-        if (ctx.renderSegment(mod.name)) |segs| {
-            if (segs.len > 0) {
-                output_text = segs[0].text;
-            }
-        }
-    }
-
-    // Sum width of all outputs
-    for (mod.outputs) |out| {
-        width += calcFormattedWidth(out.format, output_text);
-    }
-
-    return width;
-}
-
-fn calcFormattedWidth(format: []const u8, output: []const u8) u16 {
-    var width: u16 = 0;
-    var i: usize = 0;
-
-    while (i < format.len) {
-        if (i + 7 <= format.len and std.mem.eql(u8, format[i..][0..7], "$output")) {
-            // Count output chars
-            var j: usize = 0;
-            while (j < output.len) {
-                const len = std.unicode.utf8ByteSequenceLength(output[j]) catch 1;
-                j += len;
-                width += 1;
-            }
-            i += 7;
-        } else {
-            const len = std.unicode.utf8ByteSequenceLength(format[i]) catch 1;
-            i += len;
-            width += 1;
-        }
-    }
-    return width;
-}
-
-fn drawSegment(renderer: *Renderer, x: u16, y: u16, seg: shp.Segment, default_style: shp.Style) u16 {
-    const style = if (seg.style.isEmpty()) default_style else seg.style;
-    return drawStyledText(renderer, x, y, seg.text, style);
-}
-
-fn drawStyledText(renderer: *Renderer, start_x: u16, y: u16, text: []const u8, style: shp.Style) u16 {
-    var x = start_x;
-    var i: usize = 0;
-
-    while (i < text.len) {
-        // Decode UTF-8 codepoint
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        const codepoint = std.unicode.utf8Decode(text[i..][0..len]) catch ' ';
-
-        var cell = render.Cell{
-            .char = codepoint,
-            .bold = style.bold,
-            .italic = style.italic,
-        };
-
-        // Convert shp.Color to render.Color
-        switch (style.fg) {
-            .none => {},
-            .palette => |p| cell.fg = .{ .palette = p },
-            .rgb => |rgb| cell.fg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } },
-        }
-        switch (style.bg) {
-            .none => {},
-            .palette => |p| cell.bg = .{ .palette = p },
-            .rgb => |rgb| cell.bg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } },
-        }
-
-        renderer.setCell(x, y, cell);
-        x += 1;
-        i += len;
-    }
-
-    return x;
-}
-
-fn getTermSize() struct { cols: u16, rows: u16 } {
-    var ws: c.winsize = undefined;
-    if (c.ioctl(posix.STDOUT_FILENO, c.TIOCGWINSZ, &ws) == 0) {
-        return .{
-            .cols = if (ws.ws_col > 0) ws.ws_col else 80,
-            .rows = if (ws.ws_row > 0) ws.ws_row else 24,
-        };
-    }
-    return .{ .cols = 80, .rows = 24 };
-}
-
-fn enableRawMode(fd: posix.fd_t) !posix.termios {
-    var termios = try posix.tcgetattr(fd);
-    const orig = termios;
-
-    termios.iflag.BRKINT = false;
-    termios.iflag.ICRNL = false;
-    termios.iflag.INPCK = false;
-    termios.iflag.ISTRIP = false;
-    termios.iflag.IXON = false;
-    termios.oflag.OPOST = false;
-    termios.cflag.CSIZE = .CS8;
-    termios.lflag.ECHO = false;
-    termios.lflag.ICANON = false;
-    termios.lflag.IEXTEN = false;
-    termios.lflag.ISIG = false;
-    termios.cc[@intFromEnum(posix.V.MIN)] = 1;
-    termios.cc[@intFromEnum(posix.V.TIME)] = 0;
-
-    try posix.tcsetattr(fd, .FLUSH, termios);
-    return orig;
-}
-
-fn disableRawMode(fd: posix.fd_t, orig: posix.termios) !void {
-    try posix.tcsetattr(fd, .FLUSH, orig);
 }
