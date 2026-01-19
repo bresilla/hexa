@@ -381,14 +381,20 @@ pub fn handleUpdatePaneAux(
     if (root.get("focused_from")) |v| {
         switch (v) {
             .string => |s| {
+                std.debug.print("DEBUG ses: received focused_from string len={d}\n", .{s.len});
                 if (s.len == 32) {
                     var focused_uuid: [32]u8 = undefined;
                     @memcpy(&focused_uuid, s[0..32]);
                     pane.focused_from = focused_uuid;
+                    std.debug.print("DEBUG ses: set focused_from to {s}\n", .{focused_uuid});
                 }
             },
-            else => {}, // null or other = don't update, preserve existing value
+            else => {
+                std.debug.print("DEBUG ses: focused_from is null or other\n", .{});
+            },
         }
+    } else {
+        std.debug.print("DEBUG ses: no focused_from field in message\n", .{});
     }
 
     // Update cursor position

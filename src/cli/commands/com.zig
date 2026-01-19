@@ -99,7 +99,7 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
     }
 }
 
-pub fn runInfo(allocator: std.mem.Allocator) !void {
+pub fn runInfo(allocator: std.mem.Allocator, show_uuid: bool, show_creator: bool, show_last: bool) !void {
     const pane_uuid = std.posix.getenv("HEXA_PANE_UUID");
     const mux_socket = std.posix.getenv("HEXA_MUX_SOCKET");
 
@@ -108,6 +108,59 @@ pub fn runInfo(allocator: std.mem.Allocator) !void {
         return;
     }
 
+    // If specific flag is set, just print that UUID
+    if (show_uuid) {
+        if (pane_uuid) |uuid| {
+            print("{s}\n", .{uuid});
+        }
+        return;
+    }
+
+    // For --creator or --last, we need to query ses
+    if (show_creator or show_last) {
+        if (pane_uuid) |uuid| {
+            const socket_path = try ipc.getSesSocketPath(allocator);
+            defer allocator.free(socket_path);
+
+            var client = ipc.Client.connect(socket_path) catch |err| {
+                if (err == error.ConnectionRefused or err == error.FileNotFound) {
+                    print("ses daemon is not running\n", .{});
+                    return;
+                }
+                return err;
+            };
+            defer client.close();
+
+            var conn = client.toConnection();
+            var buf: [1024]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid});
+            try conn.sendLine(msg);
+
+            var resp_buf: [4096]u8 = undefined;
+            if (try conn.recvLine(&resp_buf)) |r| {
+                const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
+                defer parsed.deinit();
+
+                const root = parsed.value.object;
+                if (root.get("type")) |t| {
+                    if (std.mem.eql(u8, t.string, "pane_info")) {
+                        if (show_creator) {
+                            if (root.get("created_from")) |cf| {
+                                print("{s}\n", .{cf.string});
+                            }
+                        } else if (show_last) {
+                            if (root.get("focused_from")) |ff| {
+                                print("{s}\n", .{ff.string});
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Default: show all info
     print("Pane Info:\n", .{});
     if (pane_uuid) |uuid| {
         print("  UUID: {s}\n", .{uuid});
@@ -154,8 +207,11 @@ pub fn runInfo(allocator: std.mem.Allocator) !void {
                     if (root.get("session_name")) |sn| {
                         print("  Session: {s}\n", .{sn.string});
                     }
-                    if (root.get("parent_uuid")) |pu| {
-                        print("  Parent: {s}\n", .{pu.string[0..8]});
+                    if (root.get("created_from")) |cf| {
+                        print("  Creator: {s}\n", .{cf.string[0..8]});
+                    }
+                    if (root.get("focused_from")) |ff| {
+                        print("  Last: {s}\n", .{ff.string[0..8]});
                     }
                     if (root.get("cwd")) |cwd| {
                         print("  CWD: {s}\n", .{cwd.string});
@@ -166,7 +222,7 @@ pub fn runInfo(allocator: std.mem.Allocator) !void {
     }
 }
 
-pub fn runNotify(allocator: std.mem.Allocator, uuid: []const u8, broadcast: bool, message: []const u8) !void {
+pub fn runNotify(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, last: bool, broadcast: bool, message: []const u8) !void {
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
@@ -188,8 +244,58 @@ pub fn runNotify(allocator: std.mem.Allocator, uuid: []const u8, broadcast: bool
     var buf: [4096]u8 = undefined;
 
     var target_uuid: ?[]const u8 = null;
+    var uuid_buf: [32]u8 = undefined; // Buffer to copy UUID into (outlives JSON)
+
     if (uuid.len > 0) {
         target_uuid = uuid;
+    } else if (creator or last) {
+        // Query pane_info to get creator or last focused pane
+        const current_uuid = std.posix.getenv("HEXA_PANE_UUID") orelse {
+            print("Error: --creator/--last requires running inside hexa mux\n", .{});
+            return;
+        };
+
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{current_uuid});
+        try conn.sendLine(msg);
+
+        var resp_buf: [4096]u8 = undefined;
+        if (try conn.recvLine(&resp_buf)) |r| {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
+                print("Error: invalid response from daemon\n", .{});
+                return;
+            };
+            defer parsed.deinit();
+
+            const root = parsed.value.object;
+            if (root.get("type")) |t| {
+                if (std.mem.eql(u8, t.string, "pane_info")) {
+                    if (creator) {
+                        if (root.get("created_from")) |cf| {
+                            if (cf.string.len == 32) {
+                                @memcpy(&uuid_buf, cf.string[0..32]);
+                                target_uuid = &uuid_buf;
+                            }
+                        } else {
+                            print("Error: current pane has no creator\n", .{});
+                            return;
+                        }
+                    } else if (last) {
+                        if (root.get("focused_from")) |ff| {
+                            if (ff.string.len == 32) {
+                                @memcpy(&uuid_buf, ff.string[0..32]);
+                                target_uuid = &uuid_buf;
+                            }
+                        } else {
+                            print("Error: current pane has no previous focus\n", .{});
+                            return;
+                        }
+                    }
+                } else {
+                    print("Error: pane not found\n", .{});
+                    return;
+                }
+            }
+        }
     } else if (!broadcast) {
         target_uuid = std.posix.getenv("HEXA_PANE_UUID");
     }
