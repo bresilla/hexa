@@ -11,6 +11,12 @@ pub const PaneState = enum {
     orphaned, // fully orphaned, any mux can adopt
 };
 
+/// Pane type - split or float
+pub const PaneType = enum {
+    split,
+    float,
+};
+
 /// Minimal pane structure - just what's needed to keep process alive
 pub const Pane = struct {
     uuid: [32]u8,
@@ -31,6 +37,13 @@ pub const Pane = struct {
     // Timestamps
     created_at: i64,
     orphaned_at: ?i64,
+
+    // Auxiliary info (synced from mux)
+    is_float: bool = false,
+    is_focused: bool = false,
+    pane_type: PaneType = .split,
+    created_from: ?[32]u8 = null,
+    focused_from: ?[32]u8 = null,
 
     allocator: std.mem.Allocator,
 
@@ -429,11 +442,12 @@ pub const SesState = struct {
         sticky_pwd: ?[]const u8,
         sticky_key: ?u8,
     ) !*Pane {
-        // Spawn PTY with optional working directory
-        const pty = try core.Pty.spawnWithCwd(shell, cwd);
-
-        // Generate UUID
+        // Generate UUID first so we can pass it to the shell
         const uuid = ipc.generateUuid();
+
+        // Spawn PTY with UUID environment variable
+        const extra_env = [_][2][]const u8{.{ "HEXA_PANE_UUID", &uuid }};
+        const pty = try core.Pty.spawnWithEnv(shell, cwd, &extra_env);
 
         // Copy sticky_pwd if provided
         const owned_pwd: ?[]const u8 = if (sticky_pwd) |pwd|

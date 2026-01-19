@@ -30,8 +30,11 @@ pub fn main() !void {
     const com_list = try com_cmd.newCommand("list", "List all sessions and panes");
     const com_list_details = try com_list.flag("d", "details", null);
 
+    const com_info = try com_cmd.newCommand("info", "Show current pane info");
+
     const com_notify = try com_cmd.newCommand("notify", "Send notification");
     const com_notify_uuid = try com_notify.string("u", "uuid", null);
+    const com_notify_broadcast = try com_notify.flag("b", "broadcast", null);
     const com_notify_msg = try com_notify.stringPositional(null);
 
     // SES subcommands
@@ -78,6 +81,7 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "mux")) found_mux = true;
         if (std.mem.eql(u8, arg, "pop")) found_pop = true;
         if (std.mem.eql(u8, arg, "list")) found_list = true;
+        if (std.mem.eql(u8, arg, "info")) found_info = true;
         if (std.mem.eql(u8, arg, "notify")) found_notify = true;
         if (std.mem.eql(u8, arg, "daemon")) found_daemon = true;
         if (std.mem.eql(u8, arg, "info")) found_info = true;
@@ -90,7 +94,9 @@ pub fn main() !void {
     if (has_help) {
         // Show help for the most specific command found (manual strings to avoid argonaut crash)
         if (found_com and found_notify) {
-            print("Usage: hexa com notify [OPTIONS] <message>\n\nSend notification to muxes/panes\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n", .{});
+            print("Usage: hexa com notify [OPTIONS] <message>\n\nSend notification (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n  -b, --broadcast    Broadcast to all muxes\n", .{});
+        } else if (found_com and found_info) {
+            print("Usage: hexa com info\n\nShow information about current pane (only works inside mux)\n", .{});
         } else if (found_com and found_list) {
             print("Usage: hexa com list [OPTIONS]\n\nList all sessions and panes\n\nOptions:\n  -d, --details  Show extra details\n", .{});
         } else if (found_ses and found_daemon) {
@@ -106,7 +112,7 @@ pub fn main() !void {
         } else if (found_pop and found_init) {
             print("Usage: hexa pop init <shell>\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n", .{});
         } else if (found_com) {
-            print("Usage: hexa com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  notify  Send notification\n", .{});
+            print("Usage: hexa com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  info    Show current pane info\n  notify  Send notification\n", .{});
         } else if (found_ses) {
             print("Usage: hexa ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  info    Show daemon info\n", .{});
         } else if (found_mux) {
@@ -149,8 +155,10 @@ pub fn main() !void {
     if (com_cmd.happened) {
         if (com_list.happened) {
             try runComList(allocator, com_list_details.*);
+        } else if (com_info.happened) {
+            try runComInfo(allocator);
         } else if (com_notify.happened) {
-            try runComNotify(allocator, com_notify_uuid.*, com_notify_msg.*);
+            try runComNotify(allocator, com_notify_uuid.*, com_notify_broadcast.*, com_notify_msg.*);
         }
     } else if (ses_cmd.happened) {
         // Check which ses subcommand
@@ -184,8 +192,6 @@ pub fn main() !void {
 // ============================================================================
 
 fn runComList(allocator: std.mem.Allocator, details: bool) !void {
-    _ = details;
-
     const socket_path = try ipc.getSesSocketPath(allocator);
     defer allocator.free(socket_path);
 
@@ -199,7 +205,12 @@ fn runComList(allocator: std.mem.Allocator, details: bool) !void {
     defer client.close();
 
     var conn = client.toConnection();
-    try conn.sendLine("{\"type\":\"status\",\"full\":true}");
+    // Only request full mode (with mux_state) if details flag is set
+    if (details) {
+        try conn.sendLine("{\"type\":\"status\",\"full\":true}");
+    } else {
+        try conn.sendLine("{\"type\":\"status\"}");
+    }
 
     var buf: [65536]u8 = undefined;
     const line = try conn.recvLine(&buf);
@@ -276,7 +287,123 @@ fn runComList(allocator: std.mem.Allocator, details: bool) !void {
     }
 }
 
-fn runComNotify(allocator: std.mem.Allocator, uuid: []const u8, message: []const u8) !void {
+fn runComInfo(allocator: std.mem.Allocator) !void {
+    // Get pane UUID from environment
+    const pane_uuid = std.posix.getenv("HEXA_PANE_UUID");
+    const mux_socket = std.posix.getenv("HEXA_MUX_SOCKET");
+
+    if (pane_uuid == null and mux_socket == null) {
+        print("Not inside a hexa mux session\n", .{});
+        return;
+    }
+
+    print("Pane Info:\n", .{});
+    if (pane_uuid) |uuid| {
+        print("  UUID: {s}\n", .{uuid});
+    }
+    if (mux_socket) |socket| {
+        print("  Mux socket: {s}\n", .{socket});
+    }
+
+    // Query ses daemon for more info about this pane
+    if (pane_uuid) |uuid| {
+        const socket_path = try ipc.getSesSocketPath(allocator);
+        defer allocator.free(socket_path);
+
+        var client = ipc.Client.connect(socket_path) catch |err| {
+            if (err == error.ConnectionRefused or err == error.FileNotFound) {
+                print("  (ses daemon not running)\n", .{});
+                return;
+            }
+            return err;
+        };
+        defer client.close();
+
+        var conn = client.toConnection();
+
+        // Request pane info
+        var buf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid});
+        try conn.sendLine(msg);
+
+        var resp_buf: [4096]u8 = undefined;
+        if (try conn.recvLine(&resp_buf)) |r| {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
+            defer parsed.deinit();
+
+            const obj = parsed.value.object;
+
+            if (obj.get("type")) |t| {
+                if (std.mem.eql(u8, t.string, "error")) {
+                    if (obj.get("message")) |m| {
+                        print("  Error: {s}\n", .{m.string});
+                    }
+                    return;
+                }
+            }
+
+            if (obj.get("pid")) |pid| {
+                print("  PID: {d}\n", .{pid.integer});
+            }
+            if (obj.get("state")) |state| {
+                print("  State: {s}\n", .{state.string});
+            }
+            // Auxiliary info (synced from mux)
+            if (obj.get("pane_type")) |pt| {
+                switch (pt) {
+                    .string => |s| print("  Type: {s}\n", .{s}),
+                    else => {},
+                }
+            }
+            if (obj.get("is_focused")) |f| {
+                switch (f) {
+                    .bool => |b| print("  Focused: {s}\n", .{if (b) "yes" else "no"}),
+                    else => {},
+                }
+            }
+            if (obj.get("created_from")) |cf| {
+                switch (cf) {
+                    .string => |s| {
+                        if (s.len >= 8) {
+                            print("  Created from: {s}\n", .{s[0..8]});
+                        }
+                    },
+                    else => {}, // null or other - don't print
+                }
+            }
+            if (obj.get("focused_from")) |ff| {
+                switch (ff) {
+                    .string => |s| {
+                        if (s.len >= 8) {
+                            print("  Focused from: {s}\n", .{s[0..8]});
+                        }
+                    },
+                    else => {}, // null or other - don't print
+                }
+            }
+            if (obj.get("sticky_pwd")) |pwd| {
+                print("  Sticky PWD: {s}\n", .{pwd.string});
+            }
+            if (obj.get("sticky_key")) |key| {
+                print("  Sticky Key: {s}\n", .{key.string});
+            }
+            if (obj.get("session_name")) |name| {
+                print("  Session: {s}\n", .{name.string});
+            }
+            if (obj.get("session_id")) |sid| {
+                print("  Session ID: {s}\n", .{sid.string});
+            }
+            if (obj.get("created_at")) |ts| {
+                print("  Created: {d}\n", .{ts.integer});
+            }
+            if (obj.get("orphaned_at")) |ts| {
+                print("  Orphaned at: {d}\n", .{ts.integer});
+            }
+        }
+    }
+}
+
+fn runComNotify(allocator: std.mem.Allocator, uuid: []const u8, broadcast: bool, message: []const u8) !void {
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
@@ -297,8 +424,18 @@ fn runComNotify(allocator: std.mem.Allocator, uuid: []const u8, message: []const
     var conn = client.toConnection();
 
     var buf: [4096]u8 = undefined;
+
+    // Determine target: explicit uuid > current pane > broadcast
+    var target_uuid: ?[]const u8 = null;
     if (uuid.len > 0) {
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"targeted_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ uuid, message });
+        target_uuid = uuid;
+    } else if (!broadcast) {
+        // Check if we're inside a pane
+        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+    }
+
+    if (target_uuid) |t| {
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"targeted_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
         try conn.sendLine(msg);
     } else {
         const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"broadcast_notify\",\"message\":\"{s}\"}}", .{message});

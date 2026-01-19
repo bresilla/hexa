@@ -22,7 +22,11 @@ pub const Pty = struct {
     }
 
     pub fn spawnWithCwd(shell: []const u8, cwd: ?[]const u8) !Pty {
-        return spawnInternal(shell, cwd);
+        return spawnInternal(shell, cwd, null);
+    }
+
+    pub fn spawnWithEnv(shell: []const u8, cwd: ?[]const u8, extra_env: ?[]const [2][]const u8) !Pty {
+        return spawnInternal(shell, cwd, extra_env);
     }
 
     /// Create a Pty from an existing file descriptor
@@ -36,7 +40,7 @@ pub const Pty = struct {
         };
     }
 
-    fn spawnInternal(shell: []const u8, cwd: ?[]const u8) !Pty {
+    fn spawnInternal(shell: []const u8, cwd: ?[]const u8, extra_env: ?[]const [2][]const u8) !Pty {
         var master_fd: c_int = 0;
         var slave_fd: c_int = 0;
 
@@ -76,8 +80,8 @@ pub const Pty = struct {
                 posix.chdir(dir) catch {};
             }
 
-            // Build environment: inherit parent env + BOX=1 + TERM override
-            const envp = buildEnv() catch posix.exit(1);
+            // Build environment: inherit parent env + BOX=1 + TERM override + extra
+            const envp = buildEnv(extra_env) catch posix.exit(1);
 
             // Check if command has spaces (needs shell wrapper)
             const has_spaces = std.mem.indexOfScalar(u8, shell, ' ') != null;
@@ -104,23 +108,55 @@ pub const Pty = struct {
         };
     }
 
-    fn buildEnv() ![*:null]const ?[*:0]const u8 {
+    fn buildEnv(extra_env: ?[]const [2][]const u8) ![*:null]const ?[*:0]const u8 {
         const allocator = std.heap.c_allocator;
         var env_list: std.ArrayList(?[*:0]const u8) = .empty;
 
+        // Build list of keys to skip (our overrides + extra env keys)
+        var skip_keys: [16][]const u8 = undefined;
+        var skip_count: usize = 0;
+        skip_keys[skip_count] = "BOX";
+        skip_count += 1;
+        skip_keys[skip_count] = "TERM";
+        skip_count += 1;
+        if (extra_env) |extras| {
+            for (extras) |kv| {
+                if (skip_count < skip_keys.len) {
+                    skip_keys[skip_count] = kv[0];
+                    skip_count += 1;
+                }
+            }
+        }
+
         // Copy parent environment from C environ (includes setenv changes)
         var i: usize = 0;
-        while (environ[i]) |env_ptr| : (i += 1) {
+        outer: while (environ[i]) |env_ptr| : (i += 1) {
             const env_str = std.mem.span(env_ptr);
-            // Skip BOX and TERM - we'll add our own
-            if (std.mem.startsWith(u8, env_str, "BOX=")) continue;
-            if (std.mem.startsWith(u8, env_str, "TERM=")) continue;
+            // Skip keys we're overriding
+            for (skip_keys[0..skip_count]) |key| {
+                if (std.mem.startsWith(u8, env_str, key) and env_str.len > key.len and env_str[key.len] == '=') {
+                    continue :outer;
+                }
+            }
             try env_list.append(allocator, env_ptr);
         }
 
         // Add our environment variables
         try env_list.append(allocator, "BOX=1");
         try env_list.append(allocator, "TERM=xterm-256color");
+
+        // Add extra environment variables
+        if (extra_env) |extras| {
+            for (extras) |kv| {
+                // Calculate length needed: key + '=' + value + null
+                const len = kv[0].len + 1 + kv[1].len;
+                const buf = try allocator.allocSentinel(u8, len, 0);
+                @memcpy(buf[0..kv[0].len], kv[0]);
+                buf[kv[0].len] = '=';
+                @memcpy(buf[kv[0].len + 1 ..][0..kv[1].len], kv[1]);
+                try env_list.append(allocator, buf.ptr);
+            }
+        }
 
         // Null-terminate
         try env_list.append(allocator, null);

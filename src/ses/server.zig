@@ -220,12 +220,16 @@ pub const Server = struct {
             try self.handleBroadcastNotify(conn, root);
         } else if (std.mem.eql(u8, type_str, "targeted_notify")) {
             try self.handleTargetedNotify(conn, root);
+        } else if (std.mem.eql(u8, type_str, "pane_info")) {
+            try self.handlePaneInfo(conn, root);
         } else if (std.mem.eql(u8, type_str, "detach_session")) {
             try self.handleDetachSession(conn, cid, root);
         } else if (std.mem.eql(u8, type_str, "reattach")) {
             try self.handleReattach(conn, cid, root);
         } else if (std.mem.eql(u8, type_str, "list_sessions")) {
             try self.handleListSessions(conn);
+        } else if (std.mem.eql(u8, type_str, "update_pane_aux")) {
+            try self.handleUpdatePaneAux(conn, root);
         } else {
             try self.sendError(conn, "unknown_type");
         }
@@ -852,6 +856,88 @@ pub const Server = struct {
         try conn.send(stream.getWritten());
     }
 
+    fn handlePaneInfo(self: *Server, conn: *ipc.Connection, root: std.json.ObjectMap) !void {
+        const uuid_str = (root.get("uuid") orelse return self.sendError(conn, "missing_uuid")).string;
+        if (uuid_str.len != 32) return self.sendError(conn, "invalid_uuid");
+
+        var uuid: [32]u8 = undefined;
+        @memcpy(&uuid, uuid_str[0..32]);
+
+        const pane = self.ses_state.panes.get(uuid) orelse {
+            return self.sendError(conn, "pane_not_found");
+        };
+
+        var json_buf: [2048]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&json_buf);
+        var writer = stream.writer();
+
+        const state_str = switch (pane.state) {
+            .attached => "attached",
+            .detached => "detached",
+            .sticky => "sticky",
+            .orphaned => "orphaned",
+        };
+
+        try writer.print("{{\"type\":\"pane_info\",\"uuid\":\"{s}\",\"pid\":{d},\"state\":\"{s}\"", .{
+            uuid,
+            pane.child_pid,
+            state_str,
+        });
+
+        // Include sticky info if present
+        if (pane.sticky_pwd) |pwd| {
+            try writer.print(",\"sticky_pwd\":\"{s}\"", .{pwd});
+        }
+        if (pane.sticky_key) |key| {
+            try writer.print(",\"sticky_key\":\"{c}\"", .{key});
+        }
+
+        // Include attached_to client info
+        if (pane.attached_to) |client_id| {
+            try writer.print(",\"attached_to\":{d}", .{client_id});
+            // Also include session info if available
+            if (self.ses_state.getClient(client_id)) |client| {
+                if (client.session_id) |sid| {
+                    const hex_id: [32]u8 = std.fmt.bytesToHex(&sid, .lower);
+                    try writer.print(",\"session_id\":\"{s}\"", .{&hex_id});
+                }
+                if (client.session_name) |name| {
+                    try writer.print(",\"session_name\":\"{s}\"", .{name});
+                }
+            }
+        }
+
+        // Include session_id for detached panes
+        if (pane.session_id) |sid| {
+            const hex_id: [32]u8 = std.fmt.bytesToHex(&sid, .lower);
+            try writer.print(",\"detached_session_id\":\"{s}\"", .{&hex_id});
+        }
+
+        // Timestamps
+        try writer.print(",\"created_at\":{d}", .{pane.created_at});
+        if (pane.orphaned_at) |orphaned| {
+            try writer.print(",\"orphaned_at\":{d}", .{orphaned});
+        }
+
+        // Auxiliary info (synced from mux)
+        try writer.print(",\"is_float\":{}", .{pane.is_float});
+        try writer.print(",\"is_focused\":{}", .{pane.is_focused});
+        const pane_type_str = switch (pane.pane_type) {
+            .split => "split",
+            .float => "float",
+        };
+        try writer.print(",\"pane_type\":\"{s}\"", .{pane_type_str});
+        if (pane.created_from) |created_uuid| {
+            try writer.print(",\"created_from\":\"{s}\"", .{created_uuid});
+        }
+        if (pane.focused_from) |focused_uuid| {
+            try writer.print(",\"focused_from\":\"{s}\"", .{focused_uuid});
+        }
+
+        try writer.writeAll("}\n");
+        try conn.send(stream.getWritten());
+    }
+
     fn handleListSessions(self: *Server, conn: *ipc.Connection) !void {
         const sessions = self.ses_state.listDetachedSessions(self.allocator) catch {
             return self.sendError(conn, "list_failed");
@@ -876,6 +962,84 @@ pub const Server = struct {
 
         try writer.writeAll("]}\n");
         try conn.send(stream.getWritten());
+    }
+
+    fn handleUpdatePaneAux(self: *Server, conn: *ipc.Connection, root: std.json.ObjectMap) !void {
+        const uuid_val = root.get("uuid") orelse return self.sendError(conn, "missing_uuid");
+        const uuid_str = switch (uuid_val) {
+            .string => |s| s,
+            else => return self.sendError(conn, "invalid_uuid"),
+        };
+        if (uuid_str.len != 32) return self.sendError(conn, "invalid_uuid");
+
+        var uuid: [32]u8 = undefined;
+        @memcpy(&uuid, uuid_str[0..32]);
+
+        const pane = self.ses_state.panes.getPtr(uuid) orelse {
+            return self.sendError(conn, "pane_not_found");
+        };
+
+        // Update is_float
+        if (root.get("is_float")) |v| {
+            switch (v) {
+                .bool => |b| pane.is_float = b,
+                else => {},
+            }
+        }
+
+        // Update is_focused
+        if (root.get("is_focused")) |v| {
+            switch (v) {
+                .bool => |b| pane.is_focused = b,
+                else => {},
+            }
+        }
+
+        // Update pane_type
+        if (root.get("pane_type")) |v| {
+            switch (v) {
+                .string => |s| {
+                    if (std.mem.eql(u8, s, "float")) {
+                        pane.pane_type = .float;
+                    } else {
+                        pane.pane_type = .split;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Update created_from
+        if (root.get("created_from")) |v| {
+            switch (v) {
+                .null => pane.created_from = null,
+                .string => |s| {
+                    if (s.len == 32) {
+                        var created_uuid: [32]u8 = undefined;
+                        @memcpy(&created_uuid, s[0..32]);
+                        pane.created_from = created_uuid;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Update focused_from
+        if (root.get("focused_from")) |v| {
+            switch (v) {
+                .null => pane.focused_from = null,
+                .string => |s| {
+                    if (s.len == 32) {
+                        var focused_uuid: [32]u8 = undefined;
+                        @memcpy(&focused_uuid, s[0..32]);
+                        pane.focused_from = focused_uuid;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        try conn.sendLine("{\"type\":\"ok\"}");
     }
 
     pub fn stop(self: *Server) void {

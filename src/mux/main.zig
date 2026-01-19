@@ -157,6 +157,7 @@ const State = struct {
 
     /// Create a new tab with one pane
     fn createTab(self: *State) !void {
+        const parent_uuid = self.getCurrentFocusedUuid();
         // Get cwd from currently focused pane, or use mux's cwd for first tab
         var cwd: ?[]const u8 = null;
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -176,9 +177,10 @@ const State = struct {
         }
         // Set pane notification config
         tab.layout.setPaneNotificationConfig(&self.config.notifications.pane);
-        _ = try tab.layout.createFirstPane(cwd);
+        const first_pane = try tab.layout.createFirstPane(cwd);
         try self.tabs.append(self.allocator, tab);
         self.active_tab = self.tabs.items.len - 1;
+        self.syncPaneAux(first_pane, parent_uuid);
         self.renderer.invalidate();
         self.force_full_render = true;
         self.syncStateToSes();
@@ -624,6 +626,114 @@ const State = struct {
         defer self.allocator.free(mux_state_json);
 
         self.ses_client.syncState(mux_state_json) catch {};
+    }
+
+    /// Get UUID of currently focused pane (in layout or floating)
+    fn getCurrentFocusedUuid(self: *State) ?[32]u8 {
+        if (self.active_floating) |idx| {
+            if (idx < self.floating_panes.items.len) {
+                return self.floating_panes.items[idx].uuid;
+            }
+        }
+        // Guard against no tabs existing yet
+        if (self.tabs.items.len == 0) return null;
+        if (self.currentLayout().getFocusedPane()) |pane| {
+            return pane.uuid;
+        }
+        return null;
+    }
+
+    /// Sync auxiliary pane info to ses (for newly created panes)
+    fn syncPaneAux(self: *State, pane: *Pane, created_from: ?[32]u8) void {
+        // Only sync if connected and pane has a valid UUID
+        if (!self.ses_client.isConnected()) return;
+        if (pane.uuid[0] == 0) return; // Skip if UUID not set
+
+        // If this pane is focused, unfocus all others first
+        if (pane.focused) {
+            self.unfocusAllPanes();
+            pane.focused = true; // Restore since unfocusAllPanes cleared it
+        }
+
+        const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
+        self.ses_client.updatePaneAux(
+            pane.uuid,
+            pane.floating,
+            pane.focused,
+            pane_type,
+            created_from,
+            null, // focused_from is null for new panes
+        ) catch {
+            // Silently ignore errors - pane might not exist in ses yet or anymore
+        };
+    }
+
+    /// Unfocus all panes in ses (call before focusing a new pane)
+    fn unfocusAllPanes(self: *State) void {
+        if (!self.ses_client.isConnected()) return;
+
+        // Unfocus all tiled panes in all tabs
+        for (self.tabs.items) |*tab| {
+            var pane_it = tab.layout.paneIterator();
+            while (pane_it.next()) |p| {
+                if (p.*.uuid[0] != 0) {
+                    p.*.focused = false;
+                    const pane_type: SesClient.PaneType = if (p.*.floating) .float else .split;
+                    self.ses_client.updatePaneAux(p.*.uuid, p.*.floating, false, pane_type, null, null) catch {};
+                }
+            }
+        }
+
+        // Unfocus all floating panes
+        for (self.floating_panes.items) |fp| {
+            if (fp.uuid[0] != 0) {
+                fp.focused = false;
+                self.ses_client.updatePaneAux(fp.uuid, fp.floating, false, .float, null, null) catch {};
+            }
+        }
+    }
+
+    /// Sync focus change to ses (updates is_focused and focused_from)
+    fn syncPaneFocus(self: *State, pane: *Pane, focused_from: ?[32]u8) void {
+        // Only sync if connected and pane has a valid UUID
+        if (!self.ses_client.isConnected()) return;
+        if (pane.uuid[0] == 0) return; // Skip if UUID not set
+
+        // First unfocus all panes
+        self.unfocusAllPanes();
+
+        // Then focus this pane
+        pane.focused = true;
+        const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
+        self.ses_client.updatePaneAux(
+            pane.uuid,
+            pane.floating,
+            true, // is_focused
+            pane_type,
+            null, // don't update created_from on focus change
+            focused_from,
+        ) catch {
+            // Silently ignore errors - pane might not exist in ses
+        };
+    }
+
+    /// Sync that a pane lost focus
+    fn syncPaneUnfocus(self: *State, pane: *Pane) void {
+        // Only sync if connected and pane has a valid UUID
+        if (!self.ses_client.isConnected()) return;
+        if (pane.uuid[0] == 0) return; // Skip if UUID not set
+
+        const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
+        self.ses_client.updatePaneAux(
+            pane.uuid,
+            pane.floating,
+            false, // is_focused = false
+            pane_type,
+            null,
+            null,
+        ) catch {
+            // Silently ignore errors - pane might not exist in ses
+        };
     }
 };
 
@@ -1380,10 +1490,13 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
             }
 
             if (clicked_float) |fi| {
+                const old_uuid = state.getCurrentFocusedUuid();
                 state.active_floating = fi;
+                state.syncPaneFocus(state.floating_panes.items[fi], old_uuid);
                 state.needs_render = true;
             } else {
                 // Check tiled panes in current tab
+                const old_uuid = state.getCurrentFocusedUuid();
                 state.active_floating = null;
                 var pane_it = state.currentLayout().paneIterator();
                 while (pane_it.next()) |p| {
@@ -1391,6 +1504,7 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
                         mouse_y >= p.*.y and mouse_y < p.*.y + p.*.height)
                     {
                         state.currentLayout().focused_pane_id = p.*.id;
+                        state.syncPaneFocus(p.*, old_uuid);
                         state.needs_render = true;
                         break;
                     }
@@ -1523,16 +1637,22 @@ fn handleAltKey(state: *State, key: u8) bool {
     const split_v_key = cfg.splits.key_split_v;
 
     if (key == split_h_key) {
+        const parent_uuid = state.getCurrentFocusedUuid();
         const cwd = if (state.currentLayout().getFocusedPane()) |p| p.getRealCwd() else null;
-        _ = state.currentLayout().splitFocused(.horizontal, cwd) catch null;
+        if (state.currentLayout().splitFocused(.horizontal, cwd) catch null) |new_pane| {
+            state.syncPaneAux(new_pane, parent_uuid);
+        }
         state.needs_render = true;
         state.syncStateToSes();
         return true;
     }
 
     if (key == split_v_key) {
+        const parent_uuid = state.getCurrentFocusedUuid();
         const cwd = if (state.currentLayout().getFocusedPane()) |p| p.getRealCwd() else null;
-        _ = state.currentLayout().splitFocused(.vertical, cwd) catch null;
+        if (state.currentLayout().splitFocused(.vertical, cwd) catch null) |new_pane| {
+            state.syncPaneAux(new_pane, parent_uuid);
+        }
         state.needs_render = true;
         state.syncStateToSes();
         return true;
@@ -1548,16 +1668,38 @@ fn handleAltKey(state: *State, key: u8) bool {
 
     // Alt+n = next tab
     if (key == cfg.panes.key_next) {
+        const old_uuid = state.getCurrentFocusedUuid();
+        if (state.active_floating) |idx| {
+            if (idx < state.floating_panes.items.len) {
+                state.syncPaneUnfocus(state.floating_panes.items[idx]);
+            }
+        } else if (state.currentLayout().getFocusedPane()) |old_pane| {
+            state.syncPaneUnfocus(old_pane);
+        }
         state.active_floating = null;
         state.nextTab();
+        if (state.currentLayout().getFocusedPane()) |new_pane| {
+            state.syncPaneFocus(new_pane, old_uuid);
+        }
         state.needs_render = true;
         return true;
     }
 
     // Alt+p = previous tab
     if (key == cfg.panes.key_prev) {
+        const old_uuid = state.getCurrentFocusedUuid();
+        if (state.active_floating) |idx| {
+            if (idx < state.floating_panes.items.len) {
+                state.syncPaneUnfocus(state.floating_panes.items[idx]);
+            }
+        } else if (state.currentLayout().getFocusedPane()) |old_pane| {
+            state.syncPaneUnfocus(old_pane);
+        }
         state.active_floating = null;
         state.prevTab();
+        if (state.currentLayout().getFocusedPane()) |new_pane| {
+            state.syncPaneFocus(new_pane, old_uuid);
+        }
         state.needs_render = true;
         return true;
     }
@@ -1607,10 +1749,23 @@ fn handleAltKey(state: *State, key: u8) bool {
     // Alt+space - toggle floating focus (always space)
     if (key == ' ') {
         if (state.floating_panes.items.len > 0) {
-            if (state.active_floating) |_| {
+            const old_uuid = state.getCurrentFocusedUuid();
+            if (state.active_floating) |idx| {
+                if (idx < state.floating_panes.items.len) {
+                    state.syncPaneUnfocus(state.floating_panes.items[idx]);
+                }
                 state.active_floating = null;
+                if (state.currentLayout().getFocusedPane()) |new_pane| {
+                    state.syncPaneFocus(new_pane, old_uuid);
+                }
             } else {
+                if (state.currentLayout().getFocusedPane()) |old_pane| {
+                    state.syncPaneUnfocus(old_pane);
+                }
                 state.active_floating = 0;
+                if (state.floating_panes.items.len > 0) {
+                    state.syncPaneFocus(state.floating_panes.items[0], old_uuid);
+                }
             }
             state.needs_render = true;
         }
@@ -1734,6 +1889,7 @@ fn resizeFloatingPanes(state: *State) void {
 }
 
 fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir: ?[]const u8) !void {
+    const parent_uuid = state.getCurrentFocusedUuid();
     const pane = try state.allocator.create(Pane);
     errdefer state.allocator.destroy(pane);
 
@@ -1817,6 +1973,7 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
 
     try state.floating_panes.append(state.allocator, pane);
     state.active_floating = state.floating_panes.items.len - 1;
+    state.syncPaneAux(pane, parent_uuid);
     state.syncStateToSes();
 }
 

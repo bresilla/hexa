@@ -214,6 +214,11 @@ pub const Layout = struct {
         // Recalculate all pane positions
         self.recalculateLayout();
 
+        // Focus the new pane (like tmux behavior)
+        focused.focused = false;
+        new_pane.focused = true;
+        self.focused_pane_id = new_id;
+
         return new_pane;
     }
 

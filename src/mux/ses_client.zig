@@ -305,6 +305,62 @@ pub const SesClient = struct {
         return std.mem.indexOf(u8, line.?, "pong") != null;
     }
 
+    /// Pane type enum for auxiliary info
+    pub const PaneType = enum {
+        split,
+        float,
+    };
+
+    /// Update auxiliary pane info (synced from mux to ses)
+    pub fn updatePaneAux(
+        self: *SesClient,
+        uuid: [32]u8,
+        is_float: bool,
+        is_focused: bool,
+        pane_type: PaneType,
+        created_from: ?[32]u8,
+        focused_from: ?[32]u8,
+    ) !void {
+        const conn = &(self.conn orelse return error.NotConnected);
+
+        var buf: [512]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&buf);
+        var writer = stream.writer();
+
+        const pane_type_str = switch (pane_type) {
+            .split => "split",
+            .float => "float",
+        };
+
+        try writer.print("{{\"type\":\"update_pane_aux\",\"uuid\":\"{s}\",\"is_float\":{},\"is_focused\":{},\"pane_type\":\"{s}\"", .{
+            uuid,
+            is_float,
+            is_focused,
+            pane_type_str,
+        });
+
+        if (created_from) |cf| {
+            try writer.print(",\"created_from\":\"{s}\"", .{cf});
+        } else {
+            try writer.writeAll(",\"created_from\":null");
+        }
+
+        if (focused_from) |ff| {
+            try writer.print(",\"focused_from\":\"{s}\"", .{ff});
+        } else {
+            try writer.writeAll(",\"focused_from\":null");
+        }
+
+        try writer.writeAll("}");
+
+        try conn.sendLine(stream.getWritten());
+
+        // Wait for OK response
+        var resp_buf: [256]u8 = undefined;
+        const line = try conn.recvLine(&resp_buf);
+        if (line == null) return error.ConnectionClosed;
+    }
+
     /// Adopt an orphaned pane
     pub fn adoptPane(self: *SesClient, uuid: [32]u8) !struct { uuid: [32]u8, fd: posix.fd_t, pid: posix.pid_t } {
         const conn = &(self.conn orelse return error.NotConnected);
