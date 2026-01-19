@@ -26,7 +26,11 @@ pub const Pane = struct {
     // Is this a floating pane?
     floating: bool = false,
     // Is this pane visible? (for floating panes that can be toggled)
+    // For tab-bound floats, this is the simple visibility state
     visible: bool = true,
+    // For global floats (parent_tab == null), per-tab visibility bitmask
+    // Bit N = visible on tab N (supports up to 64 tabs)
+    tab_visible: u64 = 0,
     // Key binding for this float (for matching)
     float_key: u8 = 0,
     // Outer border dimensions (for floating panes with padding)
@@ -66,6 +70,43 @@ pub const Pane = struct {
     // Pane-local popups (blocking at PANE level)
     popups: pop.PopupManager = undefined,
     popups_initialized: bool = false,
+
+    /// Check if this float is visible on a specific tab
+    /// For global floats (parent_tab == null), uses per-tab bitmask
+    /// For tab-bound floats, uses the simple visible field
+    pub fn isVisibleOnTab(self: *const Pane, tab: usize) bool {
+        if (self.parent_tab != null) {
+            // Tab-bound float - only visible on parent tab, use simple visible
+            return self.visible;
+        }
+        // Global float - use per-tab bitmask
+        if (tab >= 64) return false;
+        return (self.tab_visible & (@as(u64, 1) << @intCast(tab))) != 0;
+    }
+
+    /// Set visibility for this float on a specific tab
+    /// For global floats, updates the per-tab bitmask
+    /// For tab-bound floats, updates the simple visible field
+    pub fn setVisibleOnTab(self: *Pane, tab: usize, vis: bool) void {
+        if (self.parent_tab != null) {
+            // Tab-bound float - use simple visible
+            self.visible = vis;
+            return;
+        }
+        // Global float - update per-tab bitmask
+        if (tab >= 64) return;
+        const mask = @as(u64, 1) << @intCast(tab);
+        if (vis) {
+            self.tab_visible |= mask;
+        } else {
+            self.tab_visible &= ~mask;
+        }
+    }
+
+    /// Toggle visibility for this float on a specific tab
+    pub fn toggleVisibleOnTab(self: *Pane, tab: usize) void {
+        self.setVisibleOnTab(tab, !self.isVisibleOnTab(tab));
+    }
 
     pub fn init(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16) !void {
         return self.initWithCommand(allocator, id, x, y, width, height, null);

@@ -410,6 +410,7 @@ const State = struct {
         try writer.print("\"focused\":{},", .{pane.focused});
         try writer.print("\"floating\":{},", .{pane.floating});
         try writer.print("\"visible\":{},", .{pane.visible});
+        try writer.print("\"tab_visible\":{d},", .{pane.tab_visible});
         try writer.print("\"float_key\":{d},", .{pane.float_key});
         try writer.print("\"border_x\":{d},\"border_y\":{d},\"border_w\":{d},\"border_h\":{d},", .{ pane.border_x, pane.border_y, pane.border_w, pane.border_h });
         try writer.print("\"float_width_pct\":{d},\"float_height_pct\":{d},", .{ pane.float_width_pct, pane.float_height_pct });
@@ -579,6 +580,7 @@ const State = struct {
                     // Restore float properties
                     pane.floating = true;
                     pane.visible = if (pane_obj.get("visible")) |v| (v != .bool or v.bool) else true;
+                    pane.tab_visible = if (pane_obj.get("tab_visible")) |tv| @intCast(tv.integer) else 0;
                     pane.float_key = if (pane_obj.get("float_key")) |fk| @intCast(fk.integer) else 0;
                     pane.float_width_pct = if (pane_obj.get("float_width_pct")) |wp| @intCast(wp.integer) else 60;
                     pane.float_height_pct = if (pane_obj.get("float_height_pct")) |hp| @intCast(hp.integer) else 60;
@@ -1505,7 +1507,7 @@ fn handleInput(state: *State, inp: []const u8) void {
             else
                 true;
 
-            if (fpane.visible and can_interact) {
+            if (fpane.isVisibleOnTab(state.active_tab) and can_interact) {
                 // Check if this float pane has a blocking popup
                 if (fpane.popups.isBlocked()) {
                     if (input.handlePopupInput(&fpane.popups, inp[i..])) {
@@ -2007,7 +2009,7 @@ fn handleScrollKeys(state: *State, inp: []const u8) ?usize {
                 if (fp.parent_tab) |parent| {
                     if (parent != state.active_tab) continue;
                 }
-                if (fp.visible and mouse_x >= fp.x and mouse_x < fp.x + fp.width and
+                if (fp.isVisibleOnTab(state.active_tab) and mouse_x >= fp.x and mouse_x < fp.x + fp.width and
                     mouse_y >= fp.y and mouse_y < fp.y + fp.height)
                 {
                     clicked_float = fi;
@@ -2388,10 +2390,10 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                 if (!dirs_match) continue;
             }
 
-            // Toggle visibility
+            // Toggle visibility (per-tab for global floats)
             const old_uuid = state.getCurrentFocusedUuid();
-            pane.visible = !pane.visible;
-            if (pane.visible) {
+            pane.toggleVisibleOnTab(state.active_tab);
+            if (pane.isVisibleOnTab(state.active_tab)) {
                 // Unfocus current pane (tiled or another float)
                 if (state.active_floating) |afi| {
                     if (afi < state.floats.items.len) {
@@ -2402,19 +2404,19 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                 }
                 state.active_floating = i;
                 state.syncPaneFocus(pane, old_uuid);
-                // If alone mode, hide all other floats
+                // If alone mode, hide all other floats on this tab
                 if (float_def.alone) {
                     for (state.floats.items) |other| {
                         if (other.float_key != float_def.key) {
-                            other.visible = false;
+                            other.setVisibleOnTab(state.active_tab, false);
                         }
                     }
                 }
-                // For pwd floats, hide other instances of same float (different dirs)
+                // For pwd floats, hide other instances of same float (different dirs) on this tab
                 if (float_def.pwd) {
                     for (state.floats.items, 0..) |other, j| {
                         if (j != i and other.float_key == float_def.key) {
-                            other.visible = false;
+                            other.setVisibleOnTab(state.active_tab, false);
                         }
                     }
                 }
@@ -2454,20 +2456,20 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
         state.syncPaneFocus(state.floats.items[state.floats.items.len - 1], old_uuid);
     }
 
-    // If alone mode, hide all other floats after creation
+    // If alone mode, hide all other floats on this tab after creation
     if (float_def.alone) {
         for (state.floats.items) |pane| {
             if (pane.float_key != float_def.key) {
-                pane.visible = false;
+                pane.setVisibleOnTab(state.active_tab, false);
             }
         }
     }
-    // For pwd floats, hide other instances of same float (different dirs)
+    // For pwd floats, hide other instances of same float (different dirs) on this tab
     if (float_def.pwd) {
         const new_idx = state.floats.items.len - 1;
         for (state.floats.items, 0..) |pane, i| {
             if (i != new_idx and pane.float_key == float_def.key) {
-                pane.visible = false;
+                pane.setVisibleOnTab(state.active_tab, false);
             }
         }
     }
@@ -2556,8 +2558,14 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     }
     pane.floating = true;
     pane.focused = true;
-    pane.visible = true;
     pane.float_key = float_def.key;
+    // For global floats (special or pwd), set per-tab visibility
+    // For tab-bound floats, use simple visible field
+    if (float_def.special or float_def.pwd) {
+        pane.setVisibleOnTab(state.active_tab, true);
+    } else {
+        pane.visible = true;
+    }
     // Store outer dimensions and style for border rendering
     pane.border_x = outer_x;
     pane.border_y = outer_y;
@@ -2634,7 +2642,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     // Draw visible floats (on top of splits)
     // Draw inactive floats first, then active one last so it's on top
     for (state.floats.items, 0..) |pane, i| {
-        if (!pane.visible) continue;
+        if (!pane.isVisibleOnTab(state.active_tab)) continue;
         if (state.active_floating == i) continue; // Skip active, draw it last
         // Skip tab-bound floats on wrong tab
         if (pane.parent_tab) |parent| {
@@ -2664,7 +2672,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
             parent == state.active_tab
         else
             true;
-        if (pane.visible and can_render) {
+        if (pane.isVisibleOnTab(state.active_tab) and can_render) {
             borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, "", pane.border_color, pane.float_style);
 
             if (pane.getRenderState()) |render_state| {
