@@ -14,6 +14,10 @@ pub fn handlePopConfirm(
 ) !void {
     const message = (root.get("message") orelse return sendError(conn, "missing_message")).string;
     const uuid_str = (root.get("uuid") orelse return sendError(conn, "missing_uuid")).string;
+    const timeout_ms: ?i64 = if (root.get("timeout_ms")) |v| switch (v) {
+        .integer => |i| i,
+        else => null,
+    } else null;
 
     // Find target mux by session_id
     const found_mux = findMuxByUuid(ses_state, uuid_str) orelse {
@@ -22,9 +26,14 @@ pub fn handlePopConfirm(
 
     // Send pop_confirm request to mux (include target_uuid for scope detection)
     var msg_buf: [4096]u8 = undefined;
-    const pop_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pop_confirm\",\"message\":\"{s}\",\"target_uuid\":\"{s}\"}}\n", .{ message, uuid_str }) catch {
-        return sendError(conn, "message_too_long");
-    };
+    const pop_msg = if (timeout_ms) |t|
+        std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pop_confirm\",\"message\":\"{s}\",\"target_uuid\":\"{s}\",\"timeout_ms\":{d}}}\n", .{ message, uuid_str, t }) catch {
+            return sendError(conn, "message_too_long");
+        }
+    else
+        std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pop_confirm\",\"message\":\"{s}\",\"target_uuid\":\"{s}\"}}\n", .{ message, uuid_str }) catch {
+            return sendError(conn, "message_too_long");
+        };
     var mux_conn = ipc.Connection{ .fd = found_mux.fd };
     mux_conn.send(pop_msg) catch {
         return sendError(conn, "send_failed");
@@ -48,6 +57,10 @@ pub fn handlePopChoose(
     const uuid_str = (root.get("uuid") orelse return sendError(conn, "missing_uuid")).string;
     const items_val = root.get("items") orelse return sendError(conn, "missing_items");
     if (items_val != .array) return sendError(conn, "invalid_items");
+    const timeout_ms: ?i64 = if (root.get("timeout_ms")) |v| switch (v) {
+        .integer => |i| i,
+        else => null,
+    } else null;
 
     // Find target mux by session_id
     const found_mux = findMuxByUuid(ses_state, uuid_str) orelse {
@@ -83,9 +96,14 @@ pub fn handlePopChoose(
 
     // Send pop_choose request to mux
     var msg_buf: [8192]u8 = undefined;
-    const pop_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pop_choose\",\"message\":\"{s}\",\"items\":{s}}}\n", .{ message, items_buf[0..items_len] }) catch {
-        return sendError(conn, "message_too_long");
-    };
+    const pop_msg = if (timeout_ms) |t|
+        std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pop_choose\",\"message\":\"{s}\",\"items\":{s},\"timeout_ms\":{d}}}\n", .{ message, items_buf[0..items_len], t }) catch {
+            return sendError(conn, "message_too_long");
+        }
+    else
+        std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pop_choose\",\"message\":\"{s}\",\"items\":{s}}}\n", .{ message, items_buf[0..items_len] }) catch {
+            return sendError(conn, "message_too_long");
+        };
     var mux_conn = ipc.Connection{ .fd = found_mux.fd };
     mux_conn.send(pop_msg) catch {
         return sendError(conn, "send_failed");
