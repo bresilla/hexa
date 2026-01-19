@@ -8,11 +8,26 @@ const server = @import("server.zig");
 /// Arguments for ses commands
 pub const SesArgs = struct {
     daemon: bool = false,
+    debug: bool = false,
     list: bool = false,
     full: bool = false,
     notify_message: ?[]const u8 = null,
     notify_uuid: ?[]const u8 = null,
 };
+
+/// Debug logging - only outputs when debug mode is enabled
+pub var debug_enabled: bool = false;
+
+pub fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    if (!debug_enabled) return;
+    std.debug.print("[ses] " ++ fmt ++ "\n", args);
+}
+
+pub fn debugLogUuid(uuid: []const u8, comptime fmt: []const u8, args: anytype) void {
+    if (!debug_enabled) return;
+    const short_uuid = if (uuid.len >= 8) uuid[0..8] else uuid;
+    std.debug.print("[ses][{s}] " ++ fmt ++ "\n", .{short_uuid} ++ args);
+}
 
 /// Entry point for ses daemon - can be called directly from unified CLI
 pub fn run(args: SesArgs) !void {
@@ -29,6 +44,9 @@ pub fn run(args: SesArgs) !void {
         try listStatus(page_alloc, args.full);
         return;
     }
+
+    // Enable debug mode if requested
+    debug_enabled = args.debug;
 
     // Daemonize BEFORE creating GPA
     if (args.daemon) {

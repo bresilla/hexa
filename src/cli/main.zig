@@ -33,7 +33,7 @@ pub fn main() !void {
     const com_list_details = try com_list.flag("d", "details", null);
 
     const com_info = try com_cmd.newCommand("info", "Show current pane info");
-    const com_info_uuid = try com_info.flag("u", "uuid", null);
+    const com_info_uuid = try com_info.string("u", "uuid", null);
     const com_info_creator = try com_info.flag("c", "creator", null);
     const com_info_last = try com_info.flag("l", "last", null);
 
@@ -47,6 +47,7 @@ pub fn main() !void {
     // SES subcommands
     const ses_daemon = try ses_cmd.newCommand("daemon", "Start the session daemon");
     const ses_daemon_fg = try ses_daemon.flag("f", "foreground", null);
+    const ses_daemon_dbg = try ses_daemon.flag("d", "debug", null);
     _ = try ses_cmd.newCommand("info", "Show daemon info");
 
     // MUX subcommands
@@ -124,11 +125,11 @@ pub fn main() !void {
         if (found_com and found_notify) {
             print("Usage: hexa com notify [OPTIONS] <message>\n\nSend notification (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all muxes\n", .{});
         } else if (found_com and found_info) {
-            print("Usage: hexa com info [OPTIONS]\n\nShow information about current pane (only works inside mux)\n\nOptions:\n  -u, --uuid     Print only the current pane UUID\n  -c, --creator  Print only the creator pane UUID\n  -l, --last     Print only the last focused pane UUID\n", .{});
+            print("Usage: hexa com info [OPTIONS]\n\nShow information about a pane\n\nOptions:\n  -u, --uuid <UUID>  Query specific pane by UUID (works from anywhere)\n  -c, --creator      Print only the creator pane UUID\n  -l, --last         Print only the last focused pane UUID\n\nWithout --uuid, queries current pane (requires running inside mux)\n", .{});
         } else if (found_com and found_list) {
             print("Usage: hexa com list [OPTIONS]\n\nList all sessions and panes\n\nOptions:\n  -d, --details  Show extra details\n", .{});
         } else if (found_ses and found_daemon) {
-            print("Usage: hexa ses daemon [OPTIONS]\n\nStart the session daemon\n\nOptions:\n  -f, --foreground  Run in foreground (don't daemonize)\n", .{});
+            print("Usage: hexa ses daemon [OPTIONS]\n\nStart the session daemon\n\nOptions:\n  -f, --foreground  Run in foreground (don't daemonize)\n  -d, --debug       Enable debug output\n", .{});
         } else if (found_ses and found_info) {
             print("Usage: hexa ses info\n\nShow daemon status and socket path\n", .{});
         } else if (found_mux and found_new) {
@@ -204,7 +205,7 @@ pub fn main() !void {
         for (ses_cmd.commands.items) |cmd| {
             if (cmd.happened) {
                 if (std.mem.eql(u8, cmd.name, "daemon")) {
-                    try runSesDaemon(ses_daemon_fg.*);
+                    try runSesDaemon(ses_daemon_fg.*, ses_daemon_dbg.*);
                 } else if (std.mem.eql(u8, cmd.name, "info")) {
                     try runSesInfo(allocator);
                 }
@@ -238,9 +239,9 @@ pub fn main() !void {
 // SES handlers
 // ============================================================================
 
-fn runSesDaemon(foreground: bool) !void {
+fn runSesDaemon(foreground: bool, debug: bool) !void {
     // Call ses run() - daemon mode unless foreground flag is set
-    try ses.run(.{ .daemon = !foreground });
+    try ses.run(.{ .daemon = !foreground, .debug = debug });
 }
 
 fn runSesInfo(allocator: std.mem.Allocator) !void {

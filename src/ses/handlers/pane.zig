@@ -3,6 +3,7 @@ const posix = std.posix;
 const core = @import("core");
 const ipc = core.ipc;
 const state = @import("../state.zig");
+const ses = @import("../main.zig");
 
 /// Handle create_pane request
 pub fn handleCreatePane(
@@ -27,6 +28,7 @@ pub fn handleCreatePane(
 
     // Create pane
     const pane = try ses_state.createPane(client_id, shell, cwd, sticky_pwd, sticky_key);
+    ses.debugLog("pane created: {s} (pid={d})", .{ pane.uuid[0..8], pane.child_pid });
 
     // Send response with fd
     var response_buf: [256]u8 = undefined;
@@ -371,9 +373,10 @@ pub fn handleUpdatePaneAux(
                     var created_uuid: [32]u8 = undefined;
                     @memcpy(&created_uuid, s[0..32]);
                     pane.created_from = created_uuid;
+                    ses.debugLogUuid(&uuid, "created_from <- {s}", .{created_uuid[0..8]});
                 }
             },
-            else => {}, // null or other = don't update, preserve existing value
+            else => {},
         }
     }
 
@@ -381,20 +384,15 @@ pub fn handleUpdatePaneAux(
     if (root.get("focused_from")) |v| {
         switch (v) {
             .string => |s| {
-                std.debug.print("DEBUG ses: received focused_from string len={d}\n", .{s.len});
                 if (s.len == 32) {
                     var focused_uuid: [32]u8 = undefined;
                     @memcpy(&focused_uuid, s[0..32]);
                     pane.focused_from = focused_uuid;
-                    std.debug.print("DEBUG ses: set focused_from to {s}\n", .{focused_uuid});
+                    ses.debugLogUuid(&uuid, "focused_from <- {s}", .{focused_uuid[0..8]});
                 }
             },
-            else => {
-                std.debug.print("DEBUG ses: focused_from is null or other\n", .{});
-            },
+            else => {},
         }
-    } else {
-        std.debug.print("DEBUG ses: no focused_from field in message\n", .{});
     }
 
     // Update cursor position

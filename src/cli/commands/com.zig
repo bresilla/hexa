@@ -99,126 +99,103 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
     }
 }
 
-pub fn runInfo(allocator: std.mem.Allocator, show_uuid: bool, show_creator: bool, show_last: bool) !void {
-    const pane_uuid = std.posix.getenv("HEXA_PANE_UUID");
-    const mux_socket = std.posix.getenv("HEXA_MUX_SOCKET");
+pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator: bool, show_last: bool) !void {
+    // Determine which UUID to query
+    var target_uuid: ?[]const u8 = null;
 
-    if (pane_uuid == null and mux_socket == null) {
-        print("Not inside a hexa mux session\n", .{});
+    if (uuid_arg.len > 0) {
+        // Explicit UUID provided - can query from anywhere
+        target_uuid = uuid_arg;
+    } else {
+        // Need to be inside mux session
+        const pane_uuid = std.posix.getenv("HEXA_PANE_UUID");
+        if (pane_uuid == null) {
+            print("Not inside a hexa mux session (use --uuid to query specific pane)\n", .{});
+            return;
+        }
+        target_uuid = pane_uuid;
+    }
+
+    const uuid = target_uuid orelse return;
+
+    // Connect to ses
+    const socket_path = try ipc.getSesSocketPath(allocator);
+    defer allocator.free(socket_path);
+
+    var client = ipc.Client.connect(socket_path) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            print("ses daemon is not running\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+    var buf: [1024]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid});
+    try conn.sendLine(msg);
+
+    var resp_buf: [4096]u8 = undefined;
+    const response = try conn.recvLine(&resp_buf);
+    if (response == null) {
+        print("No response from daemon\n", .{});
         return;
     }
 
-    // If specific flag is set, just print that UUID
-    if (show_uuid) {
-        if (pane_uuid) |uuid| {
-            print("{s}\n", .{uuid});
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response.?, .{}) catch {
+        print("Invalid response from daemon\n", .{});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+
+    // Check for error
+    if (root.get("type")) |t| {
+        if (std.mem.eql(u8, t.string, "error")) {
+            if (root.get("message")) |m| {
+                print("Error: {s}\n", .{m.string});
+            }
+            return;
+        }
+    }
+
+    // If --creator or --last, just print that UUID
+    if (show_creator) {
+        if (root.get("created_from")) |cf| {
+            print("{s}\n", .{cf.string});
         }
         return;
     }
-
-    // For --creator or --last, we need to query ses
-    if (show_creator or show_last) {
-        if (pane_uuid) |uuid| {
-            const socket_path = try ipc.getSesSocketPath(allocator);
-            defer allocator.free(socket_path);
-
-            var client = ipc.Client.connect(socket_path) catch |err| {
-                if (err == error.ConnectionRefused or err == error.FileNotFound) {
-                    print("ses daemon is not running\n", .{});
-                    return;
-                }
-                return err;
-            };
-            defer client.close();
-
-            var conn = client.toConnection();
-            var buf: [1024]u8 = undefined;
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid});
-            try conn.sendLine(msg);
-
-            var resp_buf: [4096]u8 = undefined;
-            if (try conn.recvLine(&resp_buf)) |r| {
-                const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
-                defer parsed.deinit();
-
-                const root = parsed.value.object;
-                if (root.get("type")) |t| {
-                    if (std.mem.eql(u8, t.string, "pane_info")) {
-                        if (show_creator) {
-                            if (root.get("created_from")) |cf| {
-                                print("{s}\n", .{cf.string});
-                            }
-                        } else if (show_last) {
-                            if (root.get("focused_from")) |ff| {
-                                print("{s}\n", .{ff.string});
-                            }
-                        }
-                    }
-                }
-            }
+    if (show_last) {
+        if (root.get("focused_from")) |ff| {
+            print("{s}\n", .{ff.string});
         }
         return;
     }
 
     // Default: show all info
     print("Pane Info:\n", .{});
-    if (pane_uuid) |uuid| {
-        print("  UUID: {s}\n", .{uuid});
+    print("  UUID: {s}\n", .{uuid});
+
+    if (root.get("pid")) |pid| {
+        print("  PID: {d}\n", .{pid.integer});
     }
-    if (mux_socket) |socket| {
-        print("  Mux socket: {s}\n", .{socket});
+    if (root.get("session_name")) |sn| {
+        print("  Session: {s}\n", .{sn.string});
     }
-
-    // Query ses daemon for more info about this pane
-    if (pane_uuid) |uuid| {
-        const socket_path = try ipc.getSesSocketPath(allocator);
-        defer allocator.free(socket_path);
-
-        var client = ipc.Client.connect(socket_path) catch |err| {
-            if (err == error.ConnectionRefused or err == error.FileNotFound) {
-                return;
-            }
-            return err;
-        };
-        defer client.close();
-
-        var conn = client.toConnection();
-        var buf: [1024]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid});
-        try conn.sendLine(msg);
-
-        var resp_buf: [4096]u8 = undefined;
-        if (try conn.recvLine(&resp_buf)) |r| {
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
-            defer parsed.deinit();
-
-            const root = parsed.value.object;
-            if (root.get("type")) |t| {
-                if (std.mem.eql(u8, t.string, "pane_info")) {
-                    if (root.get("pid")) |pid| {
-                        print("  PID: {d}\n", .{pid.integer});
-                    }
-                    if (root.get("sticky")) |sticky| {
-                        print("  Sticky: {}\n", .{sticky.bool});
-                    }
-                    if (root.get("mux_id")) |mid| {
-                        print("  Mux ID: {d}\n", .{mid.integer});
-                    }
-                    if (root.get("session_name")) |sn| {
-                        print("  Session: {s}\n", .{sn.string});
-                    }
-                    if (root.get("created_from")) |cf| {
-                        print("  Creator: {s}\n", .{cf.string[0..8]});
-                    }
-                    if (root.get("focused_from")) |ff| {
-                        print("  Last: {s}\n", .{ff.string[0..8]});
-                    }
-                    if (root.get("cwd")) |cwd| {
-                        print("  CWD: {s}\n", .{cwd.string});
-                    }
-                }
-            }
-        }
+    if (root.get("created_from")) |cf| {
+        print("  Creator: {s}\n", .{cf.string[0..8]});
+    }
+    if (root.get("focused_from")) |ff| {
+        print("  Last: {s}\n", .{ff.string[0..8]});
+    }
+    if (root.get("is_focused")) |f| {
+        print("  Focused: {}\n", .{f.bool});
+    }
+    if (root.get("pane_type")) |pt| {
+        print("  Type: {s}\n", .{pt.string});
     }
 }
 

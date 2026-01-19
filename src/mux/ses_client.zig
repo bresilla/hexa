@@ -358,13 +358,7 @@ pub const SesClient = struct {
 
         try writer.writeAll("}");
 
-        // DEBUG: Print what we're sending for created_from/focused_from
-        const sent = stream.getWritten();
-        if (created_from != null or focused_from != null) {
-            std.debug.print("DEBUG updatePaneAux: {s}\n", .{sent});
-        }
-
-        try conn.sendLine(sent);
+        try conn.sendLine(stream.getWritten());
 
         // Wait for OK response
         var resp_buf: [256]u8 = undefined;
