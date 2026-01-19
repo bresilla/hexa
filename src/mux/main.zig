@@ -842,6 +842,36 @@ const State = struct {
             // Silently ignore errors - pane might not exist in ses
         };
     }
+
+    /// Periodically sync focused pane info (CWD, fg_process) to ses
+    fn syncFocusedPaneInfo(self: *State) void {
+        if (!self.ses_client.isConnected()) return;
+
+        // Get the currently focused pane
+        const pane = if (self.active_floating) |idx| blk: {
+            if (idx < self.floats.items.len) break :blk self.floats.items[idx];
+            break :blk @as(?*Pane, null);
+        } else self.currentLayout().getFocusedPane();
+
+        if (pane == null) return;
+        const p = pane.?;
+        if (p.uuid[0] == 0) return;
+
+        const pane_type: SesClient.PaneType = if (p.floating) .float else .split;
+        const cursor = p.getCursorPos();
+        self.ses_client.updatePaneAux(
+            p.uuid,
+            p.floating,
+            true,
+            pane_type,
+            null, // don't update created_from
+            null, // don't update focused_from
+            .{ .x = cursor.x, .y = cursor.y },
+            p.getRealCwd(),
+            p.getFgProcess(),
+            p.getFgPid(),
+        ) catch {};
+    }
 };
 
 /// Arguments for mux commands
@@ -1033,7 +1063,9 @@ fn runMainLoop(state: *State) !void {
     // Frame timing
     var last_render: i64 = std.time.milliTimestamp();
     var last_status_update: i64 = last_render;
+    var last_pane_sync: i64 = last_render;
     const status_update_interval: i64 = 250; // Update status bar every 250ms
+    const pane_sync_interval: i64 = 1000; // Sync pane info (CWD, process) every 1s
 
     // Main loop
     while (state.running) {
@@ -1161,6 +1193,12 @@ fn runMainLoop(state: *State) !void {
         if (now2 - last_status_update >= status_update_interval) {
             state.needs_render = true;
             last_status_update = now2;
+        }
+
+        // Periodic sync of pane info (CWD, fg_process) to ses
+        if (now2 - last_pane_sync >= pane_sync_interval) {
+            last_pane_sync = now2;
+            state.syncFocusedPaneInfo();
         }
 
         // Handle stdin
