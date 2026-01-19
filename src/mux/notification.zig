@@ -78,6 +78,28 @@ pub const NotificationManager = struct {
         };
     }
 
+    /// Initialize with pop.NotificationStyle config
+    pub fn initWithPopConfig(allocator: std.mem.Allocator, cfg: anytype) NotificationManager {
+        // Parse align from string
+        const align_val: Align = if (std.mem.eql(u8, cfg.alignment, "left")) .left else if (std.mem.eql(u8, cfg.alignment, "right")) .right else .center;
+
+        return .{
+            .allocator = allocator,
+            .current = null,
+            .queue = .empty,
+            .default_style = .{
+                .fg = .{ .palette = cfg.fg },
+                .bg = .{ .palette = cfg.bg },
+                .bold = cfg.bold,
+                .padding_x = cfg.padding_x,
+                .padding_y = cfg.padding_y,
+                .offset = cfg.offset,
+                .alignment = align_val,
+            },
+            .default_duration_ms = @intCast(cfg.duration_ms),
+        };
+    }
+
     pub fn deinit(self: *NotificationManager) void {
         // Free current notification if owned
         if (self.current) |notif| {

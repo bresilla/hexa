@@ -27,7 +27,14 @@ pub fn build(b: *std.Build) void {
         core_module.addImport("ghostty-vt", vt);
     }
 
-    // Create pop module (prompt/status bar segments)
+    // Create shp module (shell prompt/status bar segments)
+    const shp_module = b.createModule(.{
+        .root_source_file = b.path("src/shp/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Create pop module (popup/overlay system)
     const pop_module = b.createModule(.{
         .root_source_file = b.path("src/pop/mod.zig"),
         .target = target,
@@ -42,6 +49,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mux_module.addImport("core", core_module);
+    mux_module.addImport("shp", shp_module);
     mux_module.addImport("pop", pop_module);
     if (ghostty_vt_mod) |vt| {
         mux_module.addImport("ghostty-vt", vt);
@@ -66,7 +74,7 @@ pub fn build(b: *std.Build) void {
     cli_root.addImport("core", core_module);
     cli_root.addImport("mux", mux_module);
     cli_root.addImport("ses", ses_module);
-    cli_root.addImport("pop", pop_module);
+    cli_root.addImport("shp", shp_module);
     if (argonaut_mod) |arg| {
         cli_root.addImport("argonaut", arg);
     }

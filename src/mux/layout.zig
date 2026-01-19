@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
+const pop = @import("pop");
 const Pane = @import("pane.zig").Pane;
 const SesClient = @import("ses_client.zig").SesClient;
 
@@ -37,8 +38,8 @@ pub const Layout = struct {
     height: u16,
     // Optional ses client for pane creation
     ses_client: ?*SesClient,
-    // Optional pane notification config
-    pane_notification_cfg: ?*const core.NotificationStyleConfig,
+    // Optional pane notification config (from pop.json)
+    pane_pop_cfg: ?*const pop.NotificationStyle,
 
     pub fn init(allocator: std.mem.Allocator, width: u16, height: u16) Layout {
         return .{
@@ -52,7 +53,7 @@ pub const Layout = struct {
             .width = width,
             .height = height,
             .ses_client = null,
-            .pane_notification_cfg = null,
+            .pane_pop_cfg = null,
         };
     }
 
@@ -61,15 +62,15 @@ pub const Layout = struct {
         self.ses_client = client;
     }
 
-    /// Set the pane notification config
-    pub fn setPaneNotificationConfig(self: *Layout, cfg: *const core.NotificationStyleConfig) void {
-        self.pane_notification_cfg = cfg;
+    /// Set the pane notification config from pop.json
+    pub fn setPanePopConfig(self: *Layout, cfg: *const pop.NotificationStyle) void {
+        self.pane_pop_cfg = cfg;
     }
 
     /// Apply notification config to a pane
     fn configurePaneNotifications(self: *Layout, pane: *Pane) void {
-        if (self.pane_notification_cfg) |cfg| {
-            pane.configureNotifications(cfg);
+        if (self.pane_pop_cfg) |cfg| {
+            pane.configureNotificationsFromPop(cfg);
         }
     }
 

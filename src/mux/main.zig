@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
+const shp = @import("shp");
 const pop = @import("pop");
 
 const Pane = @import("pane.zig").Pane;
@@ -26,23 +27,29 @@ const Tab = struct {
     layout: Layout,
     name: []const u8,
     uuid: [32]u8,
+    notifications: NotificationManager,
+    allocator: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator, width: u16, height: u16, name: []const u8) Tab {
+    fn init(allocator: std.mem.Allocator, width: u16, height: u16, name: []const u8, notif_cfg: pop.NotificationStyle) Tab {
         return .{
             .layout = Layout.init(allocator, width, height),
             .name = name,
             .uuid = core.ipc.generateUuid(),
+            .notifications = NotificationManager.initWithPopConfig(allocator, notif_cfg),
+            .allocator = allocator,
         };
     }
 
     fn deinit(self: *Tab) void {
         self.layout.deinit();
+        self.notifications.deinit();
     }
 };
 
 const State = struct {
     allocator: std.mem.Allocator,
     config: core.Config,
+    pop_config: pop.PopConfig,
     tabs: std.ArrayList(Tab),
     active_tab: usize,
     floats: std.ArrayList(*Pane),
@@ -67,6 +74,7 @@ const State = struct {
 
     fn init(allocator: std.mem.Allocator, width: u16, height: u16) !State {
         const cfg = core.Config.load(allocator);
+        const pop_cfg = pop.PopConfig.load(allocator);
         const status_h: u16 = if (cfg.tabs.status.enabled) 1 else 0;
         const layout_h = height - status_h;
 
@@ -84,6 +92,7 @@ const State = struct {
         return .{
             .allocator = allocator,
             .config = cfg,
+            .pop_config = pop_cfg,
             .tabs = .empty,
             .active_tab = 0,
             .floats = .empty,
@@ -99,7 +108,7 @@ const State = struct {
             .layout_height = layout_h,
             .renderer = try Renderer.init(allocator, width, height),
             .ses_client = SesClient.init(allocator, uuid, session_name, true), // keepalive=true by default
-            .notifications = NotificationManager.initWithConfig(allocator, cfg.notifications.mux),
+            .notifications = NotificationManager.initWithPopConfig(allocator, pop_cfg.carrier.notification),
             .uuid = uuid,
             .session_name = session_name,
             .session_name_owned = null,
@@ -172,13 +181,13 @@ const State = struct {
             cwd = std.posix.getcwd(&cwd_buf) catch null;
         }
 
-        var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, "tab");
+        var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, "tab", self.pop_config.carrier.notification);
         // Set ses client if connected (for new tabs after startup)
         if (self.ses_client.isConnected()) {
             tab.layout.setSesClient(&self.ses_client);
         }
         // Set pane notification config
-        tab.layout.setPaneNotificationConfig(&self.config.notifications.pane);
+        tab.layout.setPanePopConfig(&self.pop_config.pane.notification);
         const first_pane = try tab.layout.createFirstPane(cwd);
         try self.tabs.append(self.allocator, tab);
         self.active_tab = self.tabs.items.len - 1;
@@ -458,7 +467,7 @@ const State = struct {
 
                 // Dupe the name since parsed JSON will be freed
                 const name = self.allocator.dupe(u8, name_json) catch continue;
-                var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, name);
+                var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, name, self.pop_config.carrier.notification);
 
                 // Restore tab UUID if present
                 if (tab_obj.get("uuid")) |uuid_val| {
@@ -471,7 +480,7 @@ const State = struct {
                 if (self.ses_client.isConnected()) {
                     tab.layout.setSesClient(&self.ses_client);
                 }
-                tab.layout.setPaneNotificationConfig(&self.config.notifications.pane);
+                tab.layout.setPanePopConfig(&self.pop_config.pane.notification);
                 tab.layout.focused_split_id = focused_split_id;
                 tab.layout.next_split_id = next_split_id;
 
@@ -555,7 +564,7 @@ const State = struct {
                         null;
 
                     // Configure pane notifications
-                    pane.configureNotifications(&self.config.notifications.pane);
+                    pane.configureNotificationsFromPop(&self.pop_config.pane.notification);
 
                     self.floats.append(self.allocator, pane) catch {
                         pane.deinit();
@@ -631,11 +640,11 @@ const State = struct {
                 const result = self.ses_client.adoptPane(p.uuid) catch return false;
 
                 // Create a new tab with this pane
-                var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, "attached");
+                var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, "attached", self.pop_config.carrier.notification);
                 if (self.ses_client.isConnected()) {
                     tab.layout.setSesClient(&self.ses_client);
                 }
-                tab.layout.setPaneNotificationConfig(&self.config.notifications.pane);
+                tab.layout.setPanePopConfig(&self.pop_config.pane.notification);
 
                 // Create pane with adopted fd
                 const pane = self.allocator.create(Pane) catch return false;
@@ -644,7 +653,7 @@ const State = struct {
                     return false;
                 };
                 pane.focused = true;
-                pane.configureNotifications(&self.config.notifications.pane);
+                pane.configureNotificationsFromPop(&self.pop_config.pane.notification);
 
                 // Add pane to layout manually
                 tab.layout.splits.put(0, pane) catch {
@@ -1248,6 +1257,11 @@ fn runMainLoop(state: *State) !void {
             state.needs_render = true;
         }
 
+        // Update TAB realm notifications (current tab only)
+        if (state.tabs.items[state.active_tab].notifications.update()) {
+            state.needs_render = true;
+        }
+
         // Update PANE realm notifications (splits)
         var notif_pane_it = state.currentLayout().splitIterator();
         while (notif_pane_it.next()) |pane| {
@@ -1420,6 +1434,34 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
 
         if (!found) {
             // Pane not found, free the copy
+            state.allocator.free(msg_copy);
+        }
+        state.needs_render = true;
+    }
+    // Handle TAB realm notification (targeted to specific tab)
+    else if (std.mem.eql(u8, msg_type, "tab_notification")) {
+        const uuid_str = (root.get("uuid") orelse return).string;
+        if (uuid_str.len < 8) return; // At least 8 char prefix
+
+        const msg = (root.get("message") orelse return).string;
+        const msg_copy = state.allocator.dupe(u8, msg) catch return;
+
+        // Find the tab by UUID prefix
+        var found = false;
+        for (state.tabs.items) |*tab| {
+            if (std.mem.startsWith(u8, &tab.uuid, uuid_str)) {
+                tab.notifications.showWithOptions(
+                    msg_copy,
+                    tab.notifications.default_duration_ms,
+                    tab.notifications.default_style,
+                    true,
+                );
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
             state.allocator.free(msg_copy);
         }
         state.needs_render = true;
@@ -2110,7 +2152,7 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     }
 
     // Configure pane notifications
-    pane.configureNotifications(&state.config.notifications.pane);
+    pane.configureNotificationsFromPop(&state.pop_config.pane.notification);
 
     try state.floats.append(state.allocator, pane);
     state.active_floating = state.floats.items.len - 1;
@@ -2204,7 +2246,14 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         drawStatusBar(state, renderer);
     }
 
-    // Draw notifications overlay
+    // Draw TAB realm notifications (center of screen, below MUX)
+    const current_tab = &state.tabs.items[state.active_tab];
+    if (current_tab.notifications.hasActive()) {
+        // TAB notifications render in center area (distinct from MUX at top)
+        current_tab.notifications.renderInBounds(renderer, 0, 0, state.term_width, state.layout_height, true);
+    }
+
+    // Draw MUX realm notifications overlay (top of screen)
     state.notifications.render(renderer, state.term_width, state.term_height);
 
     // End frame with differential render
@@ -2570,7 +2619,7 @@ fn renderModuleOutput(module: *const core.StatusModule, output: []const u8) Rend
         }
 
         // Parse style
-        const style = pop.Style.parse(out.style);
+        const style = shp.Style.parse(out.style);
 
         result.items[result.count] = .{
             .text = result.buffers[result.count][0..text_len],
@@ -2586,7 +2635,7 @@ fn renderModuleOutput(module: *const core.StatusModule, output: []const u8) Rend
     return result;
 }
 
-fn styleColorToRender(col: pop.Color) render.Color {
+fn styleColorToRender(col: shp.Color) render.Color {
     return switch (col) {
         .none => .none,
         .palette => |p| .{ .palette = p },
@@ -2631,8 +2680,8 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
         renderer.setCell(@intCast(xi), y, .{ .char = ' ' });
     }
 
-    // Create pop context
-    var ctx = pop.Context.init(state.allocator);
+    // Create shp context
+    var ctx = shp.Context.init(state.allocator);
     defer ctx.deinit();
     ctx.terminal_width = width;
 
@@ -2705,9 +2754,9 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
         var cx: u16 = center_start;
         for (cfg.center) |mod| {
             if (std.mem.eql(u8, mod.name, "tabs")) {
-                const active_style = pop.Style.parse(mod.active_style);
-                const inactive_style = pop.Style.parse(mod.inactive_style);
-                const sep_style = pop.Style.parse(mod.separator_style);
+                const active_style = shp.Style.parse(mod.active_style);
+                const inactive_style = shp.Style.parse(mod.inactive_style);
+                const sep_style = shp.Style.parse(mod.separator_style);
 
                 for (ctx.tab_names, 0..) |tab_name, i| {
                     if (i > 0) {
@@ -2716,7 +2765,7 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
                     const is_active = i == ctx.active_tab;
                     const style = if (is_active) active_style else inactive_style;
                     const arrow_fg = if (is_active) active_style.bg else inactive_style.bg;
-                    const arrow_style = pop.Style{ .fg = arrow_fg };
+                    const arrow_style = shp.Style{ .fg = arrow_fg };
 
                     cx = drawStyledText(renderer, cx, y, "", arrow_style);
                     cx = drawStyledText(renderer, cx, y, " ", style);
@@ -2729,7 +2778,7 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
     }
 }
 
-fn drawModule(renderer: *Renderer, ctx: *pop.Context, mod: core.config.StatusModule, start_x: u16, y: u16) u16 {
+fn drawModule(renderer: *Renderer, ctx: *shp.Context, mod: core.config.StatusModule, start_x: u16, y: u16) u16 {
     var x = start_x;
 
     // Get the output text for this module
@@ -2749,14 +2798,14 @@ fn drawModule(renderer: *Renderer, ctx: *pop.Context, mod: core.config.StatusMod
 
     // Draw each output in the array
     for (mod.outputs) |out| {
-        const style = pop.Style.parse(out.style);
+        const style = shp.Style.parse(out.style);
         x = drawFormatted(renderer, x, y, out.format, output_text, style);
     }
 
     return x;
 }
 
-fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const u8, output: []const u8, style: pop.Style) u16 {
+fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const u8, output: []const u8, style: shp.Style) u16 {
     var x = start_x;
     var i: usize = 0;
 
@@ -2776,7 +2825,7 @@ fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const u8, 
     return x;
 }
 
-fn calcModuleWidth(ctx: *pop.Context, mod: core.config.StatusModule) u16 {
+fn calcModuleWidth(ctx: *shp.Context, mod: core.config.StatusModule) u16 {
     var width: u16 = 0;
 
     // Get the output text for this module
@@ -2825,12 +2874,12 @@ fn calcFormattedWidth(format: []const u8, output: []const u8) u16 {
     return width;
 }
 
-fn drawSegment(renderer: *Renderer, x: u16, y: u16, seg: pop.Segment, default_style: pop.Style) u16 {
+fn drawSegment(renderer: *Renderer, x: u16, y: u16, seg: shp.Segment, default_style: shp.Style) u16 {
     const style = if (seg.style.isEmpty()) default_style else seg.style;
     return drawStyledText(renderer, x, y, seg.text, style);
 }
 
-fn drawStyledText(renderer: *Renderer, start_x: u16, y: u16, text: []const u8, style: pop.Style) u16 {
+fn drawStyledText(renderer: *Renderer, start_x: u16, y: u16, text: []const u8, style: shp.Style) u16 {
     var x = start_x;
     var i: usize = 0;
 
@@ -2845,7 +2894,7 @@ fn drawStyledText(renderer: *Renderer, start_x: u16, y: u16, text: []const u8, s
             .italic = style.italic,
         };
 
-        // Convert pop.Color to render.Color
+        // Convert shp.Color to render.Color
         switch (style.fg) {
             .none => {},
             .palette => |p| cell.fg = .{ .palette = p },

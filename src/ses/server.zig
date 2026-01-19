@@ -220,6 +220,13 @@ pub const Server = struct {
             try self.handleBroadcastNotify(conn, root);
         } else if (std.mem.eql(u8, type_str, "targeted_notify")) {
             try self.handleTargetedNotify(conn, root);
+        } else if (std.mem.eql(u8, type_str, "pop_notify")) {
+            // Pop notify is same as targeted_notify
+            try self.handleTargetedNotify(conn, root);
+        } else if (std.mem.eql(u8, type_str, "pop_confirm")) {
+            try self.handlePopConfirm(conn, root);
+        } else if (std.mem.eql(u8, type_str, "pop_choose")) {
+            try self.handlePopChoose(conn, root);
         } else if (std.mem.eql(u8, type_str, "pane_info")) {
             try self.handlePaneInfo(conn, root);
         } else if (std.mem.eql(u8, type_str, "detach_session")) {
@@ -570,6 +577,27 @@ pub const Server = struct {
                         return;
                     }
                 }
+            }
+        }
+
+        // Try as TAB notification - broadcast to all muxes, let them check if they own the tab
+        // Tab UUIDs are typically 8-char prefixes in output
+        if (uuid_str.len >= 4) {
+            var msg_buf: [4096]u8 = undefined;
+            const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"tab_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ uuid_str, message }) catch {
+                return self.sendError(conn, "message_too_long");
+            };
+
+            var sent = false;
+            for (self.ses_state.clients.items) |*client| {
+                var client_conn = ipc.Connection{ .fd = client.fd };
+                client_conn.send(notify_msg) catch continue;
+                sent = true;
+            }
+
+            if (sent) {
+                try conn.sendLine("{\"type\":\"ok\",\"realm\":\"tab\"}");
+                return;
             }
         }
 
@@ -1038,6 +1066,20 @@ pub const Server = struct {
         }
 
         try conn.sendLine("{\"type\":\"ok\"}");
+    }
+
+    fn handlePopConfirm(self: *Server, conn: *ipc.Connection, root: std.json.ObjectMap) !void {
+        _ = root;
+        // Pop confirm requires blocking and tracking pending requests - not yet implemented
+        // For now, return an error indicating the feature is not available
+        return self.sendError(conn, "pop_confirm_not_implemented");
+    }
+
+    fn handlePopChoose(self: *Server, conn: *ipc.Connection, root: std.json.ObjectMap) !void {
+        _ = root;
+        // Pop choose requires blocking and tracking pending requests - not yet implemented
+        // For now, return an error indicating the feature is not available
+        return self.sendError(conn, "pop_choose_not_implemented");
     }
 
     pub fn stop(self: *Server) void {

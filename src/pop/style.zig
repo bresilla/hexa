@@ -1,198 +1,125 @@
 const std = @import("std");
 
-/// Color representation - compatible with mux/render.zig Color
+/// Horizontal alignment
+pub const Align = enum {
+    left,
+    center,
+    right,
+
+    pub fn fromString(s: []const u8) Align {
+        if (std.mem.eql(u8, s, "left")) return .left;
+        if (std.mem.eql(u8, s, "right")) return .right;
+        return .center;
+    }
+};
+
+/// Vertical position
+pub const Position = enum {
+    top,
+    center,
+    bottom,
+};
+
+/// Color representation (matches render.zig)
 pub const Color = union(enum) {
     none,
-    palette: u8, // 0-255
+    palette: u8,
     rgb: RGB,
 
     pub const RGB = struct {
         r: u8,
         g: u8,
         b: u8,
+
+        pub fn eql(self: RGB, other: RGB) bool {
+            return self.r == other.r and self.g == other.g and self.b == other.b;
+        }
     };
 
-    /// Parse a color from string
-    /// Supports: "red", "1", "237", "#ff5500", "rgb(255,85,0)"
-    pub fn parse(str: []const u8) ?Color {
-        const trimmed = std.mem.trim(u8, str, " \t");
-        if (trimmed.len == 0) return null;
-
-        // Named colors
-        if (fromName(trimmed)) |c| return c;
-
-        // Hex color: #RRGGBB or #RGB
-        if (trimmed[0] == '#') {
-            return parseHex(trimmed[1..]);
-        }
-
-        // Numeric palette: just a number
-        const num = std.fmt.parseInt(u8, trimmed, 10) catch return null;
-        return .{ .palette = num };
-    }
-
-    fn parseHex(hex: []const u8) ?Color {
-        if (hex.len == 6) {
-            const r = std.fmt.parseInt(u8, hex[0..2], 16) catch return null;
-            const g = std.fmt.parseInt(u8, hex[2..4], 16) catch return null;
-            const b = std.fmt.parseInt(u8, hex[4..6], 16) catch return null;
-            return .{ .rgb = .{ .r = r, .g = g, .b = b } };
-        } else if (hex.len == 3) {
-            const r = std.fmt.parseInt(u8, hex[0..1], 16) catch return null;
-            const g = std.fmt.parseInt(u8, hex[1..2], 16) catch return null;
-            const b = std.fmt.parseInt(u8, hex[2..3], 16) catch return null;
-            return .{ .rgb = .{ .r = r * 17, .g = g * 17, .b = b * 17 } };
-        }
-        return null;
-    }
-
-    /// Named color lookup
-    pub fn fromName(name: []const u8) ?Color {
-        const names = std.StaticStringMap(u8).initComptime(.{
-            .{ "black", 0 },
-            .{ "red", 1 },
-            .{ "green", 2 },
-            .{ "yellow", 3 },
-            .{ "blue", 4 },
-            .{ "magenta", 5 },
-            .{ "purple", 5 },
-            .{ "cyan", 6 },
-            .{ "white", 7 },
-            .{ "bright_black", 8 },
-            .{ "bright_red", 9 },
-            .{ "bright_green", 10 },
-            .{ "bright_yellow", 11 },
-            .{ "bright_blue", 12 },
-            .{ "bright_magenta", 13 },
-            .{ "bright_cyan", 14 },
-            .{ "bright_white", 15 },
-        });
-
-        if (names.get(name)) |idx| {
-            return .{ .palette = idx };
-        }
-        return null;
-    }
-
-    /// Write ANSI foreground color sequence
-    pub fn toAnsiFg(self: Color, writer: anytype) !void {
-        switch (self) {
-            .none => try writer.writeAll("\x1b[39m"),
-            .palette => |idx| {
-                if (idx < 8) {
-                    try writer.print("\x1b[{d}m", .{30 + idx});
-                } else if (idx < 16) {
-                    try writer.print("\x1b[{d}m", .{90 + idx - 8});
-                } else {
-                    try writer.print("\x1b[38;5;{d}m", .{idx});
-                }
-            },
-            .rgb => |rgb| try writer.print("\x1b[38;2;{d};{d};{d}m", .{ rgb.r, rgb.g, rgb.b }),
-        }
-    }
-
-    /// Write ANSI background color sequence
-    pub fn toAnsiBg(self: Color, writer: anytype) !void {
-        switch (self) {
-            .none => try writer.writeAll("\x1b[49m"),
-            .palette => |idx| {
-                if (idx < 8) {
-                    try writer.print("\x1b[{d}m", .{40 + idx});
-                } else if (idx < 16) {
-                    try writer.print("\x1b[{d}m", .{100 + idx - 8});
-                } else {
-                    try writer.print("\x1b[48;5;{d}m", .{idx});
-                }
-            },
-            .rgb => |rgb| try writer.print("\x1b[48;2;{d};{d};{d}m", .{ rgb.r, rgb.g, rgb.b }),
-        }
+    pub fn eql(self: Color, other: Color) bool {
+        return switch (self) {
+            .none => other == .none,
+            .palette => |p| other == .palette and other.palette == p,
+            .rgb => |rgb| other == .rgb and rgb.eql(other.rgb),
+        };
     }
 };
 
-/// Style with foreground, background, and attributes
+/// Style configuration for popups
 pub const Style = struct {
-    fg: Color = .none,
-    bg: Color = .none,
-    bold: bool = false,
-    italic: bool = false,
-    underline: bool = false,
-    dim: bool = false,
+    fg: Color = .{ .palette = 0 }, // black text
+    bg: Color = .{ .palette = 1 }, // red background (default)
+    bold: bool = true,
+    padding_x: u16 = 1, // horizontal padding inside box
+    padding_y: u16 = 0, // vertical padding inside box
+    offset: u16 = 1, // cells from edge
+    alignment: Align = .center,
 
-    /// Parse a style string like "bold bg:237 fg:15" or "bg:1 fg:0"
-    pub fn parse(str: []const u8) Style {
-        var result = Style{};
-        var iter = std.mem.tokenizeAny(u8, str, " \t");
-
-        while (iter.next()) |token| {
-            // Check for fg:COLOR or bg:COLOR
-            if (std.mem.startsWith(u8, token, "fg:")) {
-                if (Color.parse(token[3..])) |c| {
-                    result.fg = c;
-                }
-            } else if (std.mem.startsWith(u8, token, "bg:")) {
-                if (Color.parse(token[3..])) |c| {
-                    result.bg = c;
-                }
-            } else if (std.mem.eql(u8, token, "bold")) {
-                result.bold = true;
-            } else if (std.mem.eql(u8, token, "italic")) {
-                result.italic = true;
-            } else if (std.mem.eql(u8, token, "underline")) {
-                result.underline = true;
-            } else if (std.mem.eql(u8, token, "dim")) {
-                result.dim = true;
-            } else {
-                // Try as a color name or number (defaults to foreground)
-                if (Color.parse(token)) |c| {
-                    result.fg = c;
-                }
-            }
-        }
-
-        return result;
+    /// Create style from config
+    pub fn fromConfig(cfg: anytype) Style {
+        return .{
+            .fg = .{ .palette = cfg.fg },
+            .bg = .{ .palette = cfg.bg },
+            .bold = cfg.bold,
+            .padding_x = cfg.padding_x,
+            .padding_y = cfg.padding_y,
+            .offset = cfg.offset,
+            .alignment = Align.fromString(cfg.alignment),
+        };
     }
 
-    /// Write ANSI escape sequences for this style
-    pub fn toAnsi(self: Style, writer: anytype) !void {
-        // Attributes
-        if (self.bold) try writer.writeAll("\x1b[1m");
-        if (self.dim) try writer.writeAll("\x1b[2m");
-        if (self.italic) try writer.writeAll("\x1b[3m");
-        if (self.underline) try writer.writeAll("\x1b[4m");
-
-        // Colors
-        if (self.fg != .none) try self.fg.toAnsiFg(writer);
-        if (self.bg != .none) try self.bg.toAnsiBg(writer);
-    }
-
-    /// Reset all attributes
-    pub fn reset(writer: anytype) !void {
-        try writer.writeAll("\x1b[0m");
-    }
-
-    /// Check if style has any attributes set
-    pub fn isEmpty(self: Style) bool {
-        return self.fg == .none and self.bg == .none and
-            !self.bold and !self.italic and !self.underline and !self.dim;
+    /// Create a default style with given colors
+    pub fn withColors(fg_palette: u8, bg_palette: u8) Style {
+        return .{
+            .fg = .{ .palette = fg_palette },
+            .bg = .{ .palette = bg_palette },
+        };
     }
 };
 
-test "parse style" {
-    const s1 = Style.parse("bold bg:237 fg:15");
-    try std.testing.expect(s1.bold);
-    try std.testing.expectEqual(@as(u8, 237), s1.bg.palette);
-    try std.testing.expectEqual(@as(u8, 15), s1.fg.palette);
+/// Bounds for rendering popups
+pub const Bounds = struct {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
 
-    const s2 = Style.parse("bg:1 fg:0");
-    try std.testing.expectEqual(@as(u8, 1), s2.bg.palette);
-    try std.testing.expectEqual(@as(u8, 0), s2.fg.palette);
+    pub fn init(x: u16, y: u16, width: u16, height: u16) Bounds {
+        return .{ .x = x, .y = y, .width = width, .height = height };
+    }
 
-    const s3 = Style.parse("red");
-    try std.testing.expectEqual(@as(u8, 1), s3.fg.palette);
-}
+    /// Create bounds for full screen
+    pub fn fullScreen(width: u16, height: u16) Bounds {
+        return .{ .x = 0, .y = 0, .width = width, .height = height };
+    }
 
-test "parse color" {
-    try std.testing.expectEqual(Color{ .palette = 1 }, Color.parse("red").?);
-    try std.testing.expectEqual(Color{ .palette = 237 }, Color.parse("237").?);
-    try std.testing.expectEqual(Color{ .rgb = .{ .r = 255, .g = 85, .b = 0 } }, Color.parse("#ff5500").?);
-}
+    /// Calculate centered position for a box of given size within these bounds
+    pub fn centerBox(self: Bounds, box_width: u16, box_height: u16) struct { x: u16, y: u16 } {
+        return .{
+            .x = self.x + (self.width -| box_width) / 2,
+            .y = self.y + (self.height -| box_height) / 2,
+        };
+    }
+
+    /// Calculate position for a box with given alignment
+    pub fn alignBox(self: Bounds, box_width: u16, box_height: u16, h_align: Align, v_pos: Position, offset: u16) struct { x: u16, y: u16 } {
+        const x: u16 = switch (h_align) {
+            .left => self.x + offset,
+            .center => self.x + (self.width -| box_width) / 2,
+            .right => self.x + self.width -| box_width -| offset,
+        };
+        const y: u16 = switch (v_pos) {
+            .top => self.y + offset,
+            .center => self.y + (self.height -| box_height) / 2,
+            .bottom => self.y + self.height -| box_height -| offset,
+        };
+        return .{ .x = x, .y = y };
+    }
+};
+
+/// Input handling result
+pub const InputResult = enum {
+    consumed, // Input handled, popup still active
+    dismissed, // Popup done, remove it
+    pass_through, // Input not handled, let caller process
+};

@@ -337,3 +337,79 @@ pub fn getMuxSocketPath(allocator: std.mem.Allocator, uuid: []const u8) ![]const
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/mux-{s}.sock", .{ dir, uuid });
 }
+
+// ============================================================================
+// Pop IPC types - for CLI popup commands
+// ============================================================================
+
+/// Pop request kind
+pub const PopKind = enum {
+    notify,
+    confirm,
+    choose,
+};
+
+/// Pop request - sent from CLI to mux via ses
+pub const PopRequest = struct {
+    kind: PopKind,
+    target_uuid: [32]u8,
+    message: []const u8,
+    items: ?[]const []const u8 = null, // for choose
+    duration_ms: ?i64 = null, // for notify
+
+    /// Serialize to JSON for IPC
+    pub fn toJson(self: PopRequest, allocator: std.mem.Allocator) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const writer = buf.writer(allocator);
+
+        try writer.writeAll("{\"type\":\"pop_request\",");
+        try writer.print("\"kind\":\"{s}\",", .{@tagName(self.kind)});
+        try writer.print("\"uuid\":\"{s}\",", .{self.target_uuid});
+        try writer.print("\"message\":\"{s}\"", .{self.message});
+        if (self.duration_ms) |dur| {
+            try writer.print(",\"duration_ms\":{d}", .{dur});
+        }
+        if (self.items) |items| {
+            try writer.writeAll(",\"items\":[");
+            for (items, 0..) |item, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.print("\"{s}\"", .{item});
+            }
+            try writer.writeAll("]");
+        }
+        try writer.writeAll("}");
+
+        return buf.toOwnedSlice(allocator);
+    }
+};
+
+/// Pop response - sent from mux back to CLI via ses
+pub const PopResponse = struct {
+    success: bool = true,
+    confirmed: ?bool = null, // for confirm
+    selected: ?usize = null, // for choose
+    error_msg: ?[]const u8 = null,
+
+    /// Serialize to JSON for IPC
+    pub fn toJson(self: PopResponse, allocator: std.mem.Allocator) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const writer = buf.writer(allocator);
+
+        try writer.writeAll("{\"type\":\"pop_response\",");
+        try writer.print("\"success\":{}", .{self.success});
+        if (self.confirmed) |conf| {
+            try writer.print(",\"confirmed\":{}", .{conf});
+        }
+        if (self.selected) |sel| {
+            try writer.print(",\"selected\":{d}", .{sel});
+        }
+        if (self.error_msg) |msg| {
+            try writer.print(",\"error\":\"{s}\"", .{msg});
+        }
+        try writer.writeAll("}");
+
+        return buf.toOwnedSlice(allocator);
+    }
+};

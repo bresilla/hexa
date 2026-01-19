@@ -4,7 +4,7 @@ const core = @import("core");
 const ipc = core.ipc;
 const mux = @import("mux");
 const ses = @import("ses");
-const pop = @import("pop");
+const shp = @import("shp");
 
 const print = std.debug.print;
 
@@ -24,7 +24,8 @@ pub fn main() !void {
     const com_cmd = try parser.newCommand("com", "Communication with sessions and panes");
     const ses_cmd = try parser.newCommand("ses", "Session daemon management");
     const mux_cmd = try parser.newCommand("mux", "Terminal multiplexer");
-    const pop_cmd = try parser.newCommand("pop", "Prompt and status bar renderer");
+    const shp_cmd = try parser.newCommand("shp", "Shell prompt renderer");
+    const pop_cmd = try parser.newCommand("pop", "Popup overlays");
 
     // COM subcommands
     const com_list = try com_cmd.newCommand("list", "List all sessions and panes");
@@ -49,22 +50,36 @@ pub fn main() !void {
     const mux_attach_name = try mux_attach.stringPositional(null);
 
     // POP subcommands
-    const pop_prompt = try pop_cmd.newCommand("prompt", "Render shell prompt");
-    const pop_prompt_status = try pop_prompt.int("s", "status", null);
-    const pop_prompt_duration = try pop_prompt.int("d", "duration", null);
-    const pop_prompt_right = try pop_prompt.flag("r", "right", null);
-    const pop_prompt_shell = try pop_prompt.string("S", "shell", null);
-    const pop_prompt_jobs = try pop_prompt.int("j", "jobs", null);
+    const shp_prompt = try shp_cmd.newCommand("prompt", "Render shell prompt");
+    const shp_prompt_status = try shp_prompt.int("s", "status", null);
+    const shp_prompt_duration = try shp_prompt.int("d", "duration", null);
+    const shp_prompt_right = try shp_prompt.flag("r", "right", null);
+    const shp_prompt_shell = try shp_prompt.string("S", "shell", null);
+    const shp_prompt_jobs = try shp_prompt.int("j", "jobs", null);
 
-    const pop_init = try pop_cmd.newCommand("init", "Print shell initialization script");
-    const pop_init_shell = try pop_init.stringPositional(null);
+    const shp_init = try shp_cmd.newCommand("init", "Print shell initialization script");
+    const shp_init_shell = try shp_init.stringPositional(null);
+
+    // POP subcommands
+    const pop_notify = try pop_cmd.newCommand("notify", "Show notification");
+    const pop_notify_uuid = try pop_notify.string("u", "uuid", null);
+    const pop_notify_msg = try pop_notify.stringPositional(null);
+
+    const pop_confirm = try pop_cmd.newCommand("confirm", "Yes/No dialog");
+    const pop_confirm_uuid = try pop_confirm.string("u", "uuid", null);
+    const pop_confirm_msg = try pop_confirm.stringPositional(null);
+
+    const pop_choose = try pop_cmd.newCommand("choose", "Select from options");
+    const pop_choose_uuid = try pop_choose.string("u", "uuid", null);
+    const pop_choose_items = try pop_choose.string("i", "items", null);
+    const pop_choose_msg = try pop_choose.stringPositional(null);
 
     // Check for help flag manually to avoid argonaut segfault
     var has_help = false;
     var found_com = false;
     var found_ses = false;
     var found_mux = false;
-    var found_pop = false;
+    var found_shp = false;
     var found_list = false;
     var found_notify = false;
     var found_daemon = false;
@@ -73,13 +88,16 @@ pub fn main() !void {
     var found_attach = false;
     var found_prompt = false;
     var found_init = false;
+    var found_pop = false;
+    var found_confirm = false;
+    var found_choose = false;
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) has_help = true;
         if (std.mem.eql(u8, arg, "com")) found_com = true;
         if (std.mem.eql(u8, arg, "ses")) found_ses = true;
         if (std.mem.eql(u8, arg, "mux")) found_mux = true;
-        if (std.mem.eql(u8, arg, "pop")) found_pop = true;
+        if (std.mem.eql(u8, arg, "shp")) found_shp = true;
         if (std.mem.eql(u8, arg, "list")) found_list = true;
         if (std.mem.eql(u8, arg, "info")) found_info = true;
         if (std.mem.eql(u8, arg, "notify")) found_notify = true;
@@ -89,6 +107,9 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "attach")) found_attach = true;
         if (std.mem.eql(u8, arg, "prompt")) found_prompt = true;
         if (std.mem.eql(u8, arg, "init")) found_init = true;
+        if (std.mem.eql(u8, arg, "pop")) found_pop = true;
+        if (std.mem.eql(u8, arg, "confirm")) found_confirm = true;
+        if (std.mem.eql(u8, arg, "choose")) found_choose = true;
     }
 
     if (has_help) {
@@ -107,20 +128,28 @@ pub fn main() !void {
             print("Usage: hexa mux new [OPTIONS]\n\nCreate new multiplexer session\n\nOptions:\n  -n, --name <NAME>  Session name\n", .{});
         } else if (found_mux and found_attach) {
             print("Usage: hexa mux attach <name>\n\nAttach to existing session by name or UUID prefix\n", .{});
-        } else if (found_pop and found_prompt) {
-            print("Usage: hexa pop prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
-        } else if (found_pop and found_init) {
-            print("Usage: hexa pop init <shell>\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n", .{});
+        } else if (found_shp and found_prompt) {
+            print("Usage: hexa shp prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
+        } else if (found_shp and found_init) {
+            print("Usage: hexa shp init <shell>\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n", .{});
+        } else if (found_pop and found_notify) {
+            print("Usage: hexa pop notify [OPTIONS] <message>\n\nShow notification\n\nOptions:\n  -u, --uuid <UUID>  Target mux/tab/pane UUID\n", .{});
+        } else if (found_pop and found_confirm) {
+            print("Usage: hexa pop confirm [OPTIONS] <message>\n\nYes/No dialog (blocking)\n\nOptions:\n  -u, --uuid <UUID>  Target mux/tab/pane UUID\n\nExit codes: 0=confirmed, 1=cancelled\n", .{});
+        } else if (found_pop and found_choose) {
+            print("Usage: hexa pop choose [OPTIONS] <message>\n\nSelect from options (blocking)\n\nOptions:\n  -u, --uuid <UUID>      Target mux/tab/pane UUID\n  -i, --items <ITEMS>    Comma-separated list of options\n\nExit codes: 0=selected (index on stdout), 1=cancelled\n", .{});
+        } else if (found_pop) {
+            print("Usage: hexa pop <command>\n\nPopup overlays\n\nCommands:\n  notify   Show notification\n  confirm  Yes/No dialog\n  choose   Select from options\n", .{});
         } else if (found_com) {
             print("Usage: hexa com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  info    Show current pane info\n  notify  Send notification\n", .{});
         } else if (found_ses) {
             print("Usage: hexa ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  info    Show daemon info\n", .{});
         } else if (found_mux) {
             print("Usage: hexa mux <command>\n\nTerminal multiplexer\n\nCommands:\n  new     Create new multiplexer session\n  attach  Attach to existing session\n", .{});
-        } else if (found_pop) {
-            print("Usage: hexa pop <command>\n\nPrompt and status bar renderer\n\nCommands:\n  prompt  Render shell prompt\n  init    Print shell initialization script\n", .{});
+        } else if (found_shp) {
+            print("Usage: hexa shp <command>\n\nShell prompt renderer\n\nCommands:\n  prompt  Render shell prompt\n  init    Print shell initialization script\n", .{});
         } else {
-            print("Usage: hexa <command>\n\nHexa terminal multiplexer\n\nCommands:\n  com  Communication with sessions and panes\n  ses  Session daemon management\n  mux  Terminal multiplexer\n  pop  Prompt and status bar renderer\n", .{});
+            print("Usage: hexa <command>\n\nHexa terminal multiplexer\n\nCommands:\n  com  Communication with sessions and panes\n  ses  Session daemon management\n  mux  Terminal multiplexer\n  shp  Shell prompt renderer\n  pop  Popup overlays\n", .{});
         }
         return;
     }
@@ -132,6 +161,9 @@ pub fn main() !void {
             // Show help for the deepest command that happened
             if (pop_cmd.happened) {
                 const help = try pop_cmd.usage(null);
+                print("{s}\n", .{help});
+            } else if (shp_cmd.happened) {
+                const help = try shp_cmd.usage(null);
                 print("{s}\n", .{help});
             } else if (mux_cmd.happened) {
                 const help = try mux_cmd.usage(null);
@@ -178,11 +210,19 @@ pub fn main() !void {
         } else if (mux_attach.happened) {
             try runMuxAttach(mux_attach_name.*);
         }
+    } else if (shp_cmd.happened) {
+        if (shp_prompt.happened) {
+            try runShpPrompt(shp_prompt_status.*, shp_prompt_duration.*, shp_prompt_right.*, shp_prompt_shell.*, shp_prompt_jobs.*);
+        } else if (shp_init.happened) {
+            try runShpInit(shp_init_shell.*);
+        }
     } else if (pop_cmd.happened) {
-        if (pop_prompt.happened) {
-            try runPopPrompt(pop_prompt_status.*, pop_prompt_duration.*, pop_prompt_right.*, pop_prompt_shell.*, pop_prompt_jobs.*);
-        } else if (pop_init.happened) {
-            try runPopInit(pop_init_shell.*);
+        if (pop_notify.happened) {
+            try runPopNotify(allocator, pop_notify_uuid.*, pop_notify_msg.*);
+        } else if (pop_confirm.happened) {
+            try runPopConfirm(allocator, pop_confirm_uuid.*, pop_confirm_msg.*);
+        } else if (pop_choose.happened) {
+            try runPopChoose(allocator, pop_choose_uuid.*, pop_choose_items.*, pop_choose_msg.*);
         }
     }
 }
@@ -509,11 +549,11 @@ fn runMuxAttach(name: []const u8) !void {
 }
 
 // ============================================================================
-// POP handlers
+// SHP handlers
 // ============================================================================
 
-fn runPopPrompt(status: i64, duration: i64, right: bool, shell: []const u8, jobs: i64) !void {
-    try pop.run(.{
+fn runShpPrompt(status: i64, duration: i64, right: bool, shell: []const u8, jobs: i64) !void {
+    try shp.run(.{
         .prompt = true,
         .status = status,
         .duration = duration,
@@ -523,12 +563,217 @@ fn runPopPrompt(status: i64, duration: i64, right: bool, shell: []const u8, jobs
     });
 }
 
-fn runPopInit(shell: []const u8) !void {
+fn runShpInit(shell: []const u8) !void {
     if (shell.len > 0) {
-        try pop.run(.{ .init_shell = shell });
+        try shp.run(.{ .init_shell = shell });
     } else {
         print("Error: shell name required (bash, zsh, fish)\n", .{});
     }
+}
+
+// ============================================================================
+// POP handlers
+// ============================================================================
+
+fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, message: []const u8) !void {
+    if (message.len == 0) {
+        print("Error: message is required\n", .{});
+        return;
+    }
+
+    const socket_path = try ipc.getSesSocketPath(allocator);
+    defer allocator.free(socket_path);
+
+    var client = ipc.Client.connect(socket_path) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            print("ses daemon is not running\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+    var buf: [4096]u8 = undefined;
+
+    // Determine target UUID: explicit > current pane
+    var target_uuid: ?[]const u8 = null;
+    if (uuid.len > 0) {
+        target_uuid = uuid;
+    } else {
+        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+    }
+
+    if (target_uuid) |t| {
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
+        try conn.sendLine(msg);
+    } else {
+        print("Error: --uuid required (or run inside hexa mux)\n", .{});
+        return;
+    }
+
+    var resp_buf: [1024]u8 = undefined;
+    if (try conn.recvLine(&resp_buf)) |r| {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
+        defer parsed.deinit();
+
+        if (parsed.value.object.get("type")) |t| {
+            if (std.mem.eql(u8, t.string, "error")) {
+                if (parsed.value.object.get("message")) |m| {
+                    print("Error: {s}\n", .{m.string});
+                }
+            }
+        }
+    }
+}
+
+fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, message: []const u8) !void {
+    if (message.len == 0) {
+        print("Error: message is required\n", .{});
+        return;
+    }
+
+    const socket_path = try ipc.getSesSocketPath(allocator);
+    defer allocator.free(socket_path);
+
+    var client = ipc.Client.connect(socket_path) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            print("ses daemon is not running\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+    var buf: [4096]u8 = undefined;
+
+    // Determine target UUID
+    var target_uuid: ?[]const u8 = null;
+    if (uuid.len > 0) {
+        target_uuid = uuid;
+    } else {
+        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+    }
+
+    if (target_uuid) |t| {
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_confirm\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
+        try conn.sendLine(msg);
+    } else {
+        print("Error: --uuid required (or run inside hexa mux)\n", .{});
+        return;
+    }
+
+    // Wait for response (blocking)
+    var resp_buf: [1024]u8 = undefined;
+    if (try conn.recvLine(&resp_buf)) |r| {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
+            std.process.exit(1);
+        };
+        defer parsed.deinit();
+
+        if (parsed.value.object.get("type")) |t| {
+            if (std.mem.eql(u8, t.string, "error")) {
+                if (parsed.value.object.get("message")) |m| {
+                    print("Error: {s}\n", .{m.string});
+                }
+                std.process.exit(1);
+            } else if (std.mem.eql(u8, t.string, "pop_response")) {
+                if (parsed.value.object.get("confirmed")) |conf| {
+                    if (conf == .bool and conf.bool) {
+                        std.process.exit(0); // Confirmed
+                    }
+                }
+                std.process.exit(1); // Cancelled or not confirmed
+            }
+        }
+    }
+    std.process.exit(1);
+}
+
+fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, items: []const u8, message: []const u8) !void {
+    if (items.len == 0) {
+        print("Error: --items is required\n", .{});
+        return;
+    }
+
+    const socket_path = try ipc.getSesSocketPath(allocator);
+    defer allocator.free(socket_path);
+
+    var client = ipc.Client.connect(socket_path) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            print("ses daemon is not running\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+    var buf: [8192]u8 = undefined;
+
+    // Determine target UUID
+    var target_uuid: ?[]const u8 = null;
+    if (uuid.len > 0) {
+        target_uuid = uuid;
+    } else {
+        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+    }
+
+    if (target_uuid) |t| {
+        // Build items JSON array from comma-separated string
+        var items_json: std.ArrayList(u8) = .empty;
+        defer items_json.deinit(allocator);
+        try items_json.appendSlice(allocator, "[");
+
+        var it = std.mem.splitScalar(u8, items, ',');
+        var first = true;
+        while (it.next()) |item| {
+            const trimmed = std.mem.trim(u8, item, " ");
+            if (trimmed.len > 0) {
+                if (!first) try items_json.appendSlice(allocator, ",");
+                try items_json.appendSlice(allocator, "\"");
+                try items_json.appendSlice(allocator, trimmed);
+                try items_json.appendSlice(allocator, "\"");
+                first = false;
+            }
+        }
+        try items_json.appendSlice(allocator, "]");
+
+        const title = if (message.len > 0) message else "Select option";
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_choose\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"items\":{s}}}", .{ t, title, items_json.items });
+        try conn.sendLine(msg);
+    } else {
+        print("Error: --uuid required (or run inside hexa mux)\n", .{});
+        return;
+    }
+
+    // Wait for response (blocking)
+    var resp_buf: [1024]u8 = undefined;
+    if (try conn.recvLine(&resp_buf)) |r| {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
+            std.process.exit(1);
+        };
+        defer parsed.deinit();
+
+        if (parsed.value.object.get("type")) |t| {
+            if (std.mem.eql(u8, t.string, "error")) {
+                if (parsed.value.object.get("message")) |m| {
+                    print("Error: {s}\n", .{m.string});
+                }
+                std.process.exit(1);
+            } else if (std.mem.eql(u8, t.string, "pop_response")) {
+                if (parsed.value.object.get("selected")) |sel| {
+                    if (sel == .integer) {
+                        print("{d}\n", .{sel.integer}); // Output selected index
+                        std.process.exit(0);
+                    }
+                }
+                std.process.exit(1); // Cancelled
+            }
+        }
+    }
+    std.process.exit(1);
 }
 
 // ============================================================================

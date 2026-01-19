@@ -26,7 +26,7 @@ const JsonConfig = struct {
     prompt: ?JsonPrompt = null,
 };
 
-/// Arguments for pop commands
+/// Arguments for shp commands
 pub const PopArgs = struct {
     init_shell: ?[]const u8 = null,
     prompt: bool = false,
@@ -37,7 +37,7 @@ pub const PopArgs = struct {
     jobs: i64 = 0,
 };
 
-/// Entry point for pop - can be called directly from unified CLI
+/// Entry point for shp - can be called directly from unified CLI
 pub fn run(args: PopArgs) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -98,11 +98,11 @@ pub fn main() !void {
     const command = args[1];
 
     if (std.mem.eql(u8, command, "init")) {
-        // pop init <shell>
+        // shp init <shell>
         const shell = if (args.len > 2) args[2] else "bash";
         try run(.{ .init_shell = shell });
     } else if (std.mem.eql(u8, command, "prompt")) {
-        // pop prompt [options]
+        // shp prompt [options]
         try renderPrompt(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage();
@@ -114,17 +114,17 @@ pub fn main() !void {
 fn printUsage() !void {
     const stdout = std.fs.File.stdout();
     try stdout.writeAll(
-        \\pop - Prompt decorator
+        \\shp - Shell prompt
         \\
         \\Usage:
-        \\  pop init <shell>     Print shell initialization script
-        \\  pop prompt [opts]    Render the prompt
-        \\  pop help             Show this help
+        \\  shp init <shell>     Print shell initialization script
+        \\  shp prompt [opts]    Render the prompt
+        \\  shp help             Show this help
         \\
         \\Shell init:
-        \\  pop init bash        Bash initialization
-        \\  pop init zsh         Zsh initialization
-        \\  pop init fish        Fish initialization
+        \\  shp init bash        Bash initialization
+        \\  shp init zsh         Zsh initialization
+        \\  shp init fish        Fish initialization
         \\
         \\Prompt options:
         \\  --status=<n>         Exit status of last command
@@ -141,45 +141,45 @@ fn printInit(shell: []const u8) !void {
     if (std.mem.eql(u8, shell, "bash")) {
         try stdout.writeAll(
             \\# Hexa prompt initialization for Bash
-            \\__pop_precmd() {
+            \\__shp_precmd() {
             \\    local exit_status=$?
             \\    local duration=0
-            \\    if [[ -n "$__pop_start" ]]; then
-            \\        duration=$(( $(date +%s%3N) - __pop_start ))
+            \\    if [[ -n "$__shp_start" ]]; then
+            \\        duration=$(( $(date +%s%3N) - __shp_start ))
             \\    fi
-            \\    PS1="$(hexa pop prompt --status=$exit_status --duration=$duration --jobs=$(jobs -p 2>/dev/null | wc -l)) "
-            \\    unset __pop_start
+            \\    PS1="$(hexa shp prompt --status=$exit_status --duration=$duration --jobs=$(jobs -p 2>/dev/null | wc -l)) "
+            \\    unset __shp_start
             \\}
             \\
-            \\__pop_preexec() {
-            \\    __pop_start=$(date +%s%3N)
+            \\__shp_preexec() {
+            \\    __shp_start=$(date +%s%3N)
             \\}
             \\
-            \\trap '__pop_preexec' DEBUG
-            \\PROMPT_COMMAND="__pop_precmd"
+            \\trap '__shp_preexec' DEBUG
+            \\PROMPT_COMMAND="__shp_precmd"
             \\
         );
     } else if (std.mem.eql(u8, shell, "zsh")) {
         try stdout.writeAll(
             \\# Hexa prompt initialization for Zsh
-            \\__pop_precmd() {
+            \\__shp_precmd() {
             \\    local exit_status=$?
             \\    local duration=0
-            \\    if [[ -n "$__pop_start" ]]; then
-            \\        duration=$(( $(date +%s%3N) - __pop_start ))
+            \\    if [[ -n "$__shp_start" ]]; then
+            \\        duration=$(( $(date +%s%3N) - __shp_start ))
             \\    fi
-            \\    PROMPT="$(hexa pop prompt --shell=zsh --status=$exit_status --duration=$duration --jobs=${(M)#jobstates}) "
-            \\    RPROMPT="$(hexa pop prompt --shell=zsh --right --status=$exit_status)"
-            \\    unset __pop_start
+            \\    PROMPT="$(hexa shp prompt --shell=zsh --status=$exit_status --duration=$duration --jobs=${(M)#jobstates}) "
+            \\    RPROMPT="$(hexa shp prompt --shell=zsh --right --status=$exit_status)"
+            \\    unset __shp_start
             \\}
             \\
-            \\__pop_preexec() {
-            \\    __pop_start=$(date +%s%3N)
+            \\__shp_preexec() {
+            \\    __shp_start=$(date +%s%3N)
             \\}
             \\
             \\autoload -Uz add-zsh-hook
-            \\add-zsh-hook precmd __pop_precmd
-            \\add-zsh-hook preexec __pop_preexec
+            \\add-zsh-hook precmd __shp_precmd
+            \\add-zsh-hook preexec __shp_preexec
             \\ZLE_RPROMPT_INDENT=0
             \\
         );
@@ -190,12 +190,12 @@ fn printInit(shell: []const u8) !void {
             \\    set -l exit_status $status
             \\    set -l duration (math $CMD_DURATION)
             \\    set -l jobs (count (jobs -p))
-            \\    hexa pop prompt --status=$exit_status --duration=$duration --jobs=$jobs
+            \\    hexa shp prompt --status=$exit_status --duration=$duration --jobs=$jobs
             \\    echo -n " "
             \\end
             \\
             \\function fish_right_prompt
-            \\    hexa pop prompt --right
+            \\    hexa shp prompt --right
             \\end
             \\
         );
@@ -311,11 +311,11 @@ fn loadConfig(allocator: std.mem.Allocator) ?std.json.Parsed(JsonConfig) {
 fn getConfigPath(allocator: std.mem.Allocator) ![]const u8 {
     const config_home = posix.getenv("XDG_CONFIG_HOME");
     if (config_home) |ch| {
-        return std.fmt.allocPrint(allocator, "{s}/hexa/pop.json", .{ch});
+        return std.fmt.allocPrint(allocator, "{s}/hexa/shp.json", .{ch});
     }
 
     const home = posix.getenv("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.config/hexa/pop.json", .{home});
+    return std.fmt.allocPrint(allocator, "{s}/.config/hexa/shp.json", .{home});
 }
 
 fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdout: std.fs.File, is_zsh: bool) !void {

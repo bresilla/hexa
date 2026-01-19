@@ -1,38 +1,256 @@
-// Pop - Prompt and status bar segment system
-// Used by both mux status bar and shell prompt
+const std = @import("std");
 
+// Re-export submodules
 pub const style = @import("style.zig");
-pub const format = @import("format.zig");
-pub const segment = @import("segment.zig");
-pub const segments = @import("segments/mod.zig");
-pub const entry = @import("main.zig");
+pub const notification = @import("notification.zig");
+pub const confirm = @import("confirm.zig");
+pub const picker = @import("picker.zig");
+pub const config = @import("config.zig");
 
+// Re-export config types
+pub const PopConfig = config.PopConfig;
+pub const NotificationStyle = config.NotificationStyle;
+pub const ConfirmStyle = config.ConfirmStyle;
+pub const ChooseStyle = config.ChooseStyle;
+pub const CarrierConfig = config.CarrierConfig;
+pub const PaneConfig = config.PaneConfig;
+
+// Re-export common types
 pub const Style = style.Style;
 pub const Color = style.Color;
-pub const FormatParser = format.FormatParser;
-pub const Segment = segment.Segment;
-pub const Context = segment.Context;
+pub const Align = style.Align;
+pub const Bounds = style.Bounds;
+pub const Position = style.Position;
+pub const InputResult = style.InputResult;
 
-// Re-export entry point types for CLI
-pub const PopArgs = entry.PopArgs;
-pub const run = entry.run;
+pub const Notification = notification.Notification;
+pub const NotificationManager = notification.NotificationManager;
+pub const NotifyOptions = notification.NotifyOptions;
 
-/// Render a format string with the given context
-pub fn render(allocator: std.mem.Allocator, format_str: []const u8, ctx: *Context) ![]Segment {
-    var parser = FormatParser.init(allocator, format_str);
-    return parser.render(ctx);
-}
+pub const Confirm = confirm.Confirm;
+pub const ConfirmOptions = confirm.ConfirmOptions;
+pub const Selection = confirm.Selection;
 
-/// Render a format string to ANSI output
-pub fn renderToAnsi(allocator: std.mem.Allocator, format_str: []const u8, ctx: *Context, writer: anytype) !void {
-    const segs = try render(allocator, format_str, ctx);
-    defer allocator.free(segs);
+pub const Picker = picker.Picker;
+pub const PickerOptions = picker.PickerOptions;
 
-    for (segs) |seg| {
-        try seg.style.toAnsi(writer);
-        try writer.writeAll(seg.text);
+/// Blocking popup scope
+pub const Scope = enum {
+    mux, // Blocks entire mux until resolved
+    tab, // Can switch tabs, but this tab blocked
+    pane, // Only this pane blocked
+};
+
+/// Active popup union - only one blocking popup at a time
+pub const Popup = union(enum) {
+    confirm: *Confirm,
+    picker: *Picker,
+
+    pub fn handleInput(self: Popup, key: u8) InputResult {
+        return switch (self) {
+            .confirm => |c| c.handleInput(key),
+            .picker => |p| p.handleInput(key),
+        };
     }
-    try Style.reset(writer);
-}
 
-const std = @import("std");
+    pub fn isBlocking(self: Popup) bool {
+        return switch (self) {
+            .confirm => |c| c.isBlocking(),
+            .picker => |p| p.isBlocking(),
+        };
+    }
+
+    pub fn deinit(self: Popup, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .confirm => |c| {
+                c.deinit();
+                allocator.destroy(c);
+            },
+            .picker => |p| {
+                p.deinit();
+                allocator.destroy(p);
+            },
+        }
+    }
+};
+
+/// PopupManager - manages popups for a single scope (mux, tab, or pane)
+pub const PopupManager = struct {
+    allocator: std.mem.Allocator,
+    notifications: NotificationManager,
+    active: ?Popup,
+
+    pub fn init(allocator: std.mem.Allocator) PopupManager {
+        return .{
+            .allocator = allocator,
+            .notifications = NotificationManager.init(allocator),
+            .active = null,
+        };
+    }
+
+    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: anytype) PopupManager {
+        return .{
+            .allocator = allocator,
+            .notifications = NotificationManager.initWithConfig(allocator, cfg),
+            .active = null,
+        };
+    }
+
+    pub fn deinit(self: *PopupManager) void {
+        self.notifications.deinit();
+        if (self.active) |popup| {
+            popup.deinit(self.allocator);
+        }
+    }
+
+    // =========================================================================
+    // Notification methods (non-blocking)
+    // =========================================================================
+
+    /// Show a notification with default settings
+    pub fn notify(self: *PopupManager, message: []const u8) void {
+        self.notifications.show(message);
+    }
+
+    /// Show a notification for a specific duration
+    pub fn notifyFor(self: *PopupManager, message: []const u8, duration_ms: i64) void {
+        self.notifications.showFor(message, duration_ms);
+    }
+
+    /// Show a notification with full options
+    pub fn notifyWithOptions(self: *PopupManager, message: []const u8, opts: NotifyOptions) void {
+        self.notifications.showWithOptions(message, opts);
+    }
+
+    // =========================================================================
+    // Confirm methods (blocking)
+    // =========================================================================
+
+    /// Show a confirm dialog (blocking)
+    pub fn showConfirm(self: *PopupManager, message: []const u8, opts: ConfirmOptions) !void {
+        if (self.active != null) return error.PopupAlreadyActive;
+
+        const c = try self.allocator.create(Confirm);
+        c.* = Confirm.init(self.allocator, message, opts);
+        self.active = .{ .confirm = c };
+    }
+
+    /// Show a confirm dialog with owned message (blocking)
+    pub fn showConfirmOwned(self: *PopupManager, message: []const u8, opts: ConfirmOptions) !void {
+        if (self.active != null) return error.PopupAlreadyActive;
+
+        const c = try self.allocator.create(Confirm);
+        c.* = try Confirm.initOwned(self.allocator, message, opts);
+        self.active = .{ .confirm = c };
+    }
+
+    // =========================================================================
+    // Picker methods (blocking)
+    // =========================================================================
+
+    /// Show a picker dialog (blocking)
+    pub fn showPicker(self: *PopupManager, items: []const []const u8, opts: PickerOptions) !void {
+        if (self.active != null) return error.PopupAlreadyActive;
+
+        const p = try self.allocator.create(Picker);
+        p.* = Picker.init(self.allocator, items, opts);
+        self.active = .{ .picker = p };
+    }
+
+    /// Show a picker dialog with owned items (blocking)
+    pub fn showPickerOwned(self: *PopupManager, items: []const []const u8, opts: PickerOptions) !void {
+        if (self.active != null) return error.PopupAlreadyActive;
+
+        const p = try self.allocator.create(Picker);
+        p.* = try Picker.initOwned(self.allocator, items, opts);
+        self.active = .{ .picker = p };
+    }
+
+    // =========================================================================
+    // Lifecycle methods
+    // =========================================================================
+
+    /// Update popup state - call each frame
+    /// Returns true if display needs refresh
+    pub fn update(self: *PopupManager) bool {
+        return self.notifications.update();
+    }
+
+    /// Handle keyboard input
+    /// Returns null if no popup handled it, otherwise the result
+    pub fn handleInput(self: *PopupManager, key: u8) ?InputResult {
+        if (self.active) |popup| {
+            const result = popup.handleInput(key);
+            if (result == .dismissed) {
+                // Popup is done, clean up
+                popup.deinit(self.allocator);
+                self.active = null;
+            }
+            return result;
+        }
+        return null;
+    }
+
+    /// Check if there's an active blocking popup
+    pub fn isBlocked(self: *PopupManager) bool {
+        if (self.active) |popup| {
+            return popup.isBlocking();
+        }
+        return false;
+    }
+
+    /// Check if there's any active content (notifications or popups)
+    pub fn hasActive(self: *PopupManager) bool {
+        return self.active != null or self.notifications.hasActive();
+    }
+
+    /// Check if there's an active notification
+    pub fn hasNotification(self: *PopupManager) bool {
+        return self.notifications.hasActive();
+    }
+
+    /// Get the active notification for rendering
+    pub fn getActiveNotification(self: *PopupManager) ?*const Notification {
+        return if (self.notifications.current) |*n| n else null;
+    }
+
+    /// Get the active popup for rendering
+    pub fn getActivePopup(self: *PopupManager) ?Popup {
+        return self.active;
+    }
+
+    /// Get result from the last confirm dialog (if any)
+    pub fn getConfirmResult(self: *PopupManager) ?bool {
+        if (self.active) |popup| {
+            switch (popup) {
+                .confirm => |c| return c.getResult(),
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Get result from the last picker dialog (if any)
+    pub fn getPickerResult(self: *PopupManager) ?usize {
+        if (self.active) |popup| {
+            switch (popup) {
+                .picker => |p| return p.getResult(),
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Dismiss the active popup without waiting for user input
+    pub fn dismiss(self: *PopupManager) void {
+        if (self.active) |popup| {
+            popup.deinit(self.allocator);
+            self.active = null;
+        }
+    }
+
+    /// Clear all notifications
+    pub fn clearNotifications(self: *PopupManager) void {
+        self.notifications.clear();
+    }
+};
