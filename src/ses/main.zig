@@ -15,6 +15,7 @@ pub fn main() !void {
     // Check for command modes
     var daemon_mode = false;
     var list_mode = false;
+    var full_mode = false;
     var notify_message: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -23,6 +24,8 @@ pub fn main() !void {
             daemon_mode = true;
         } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
             list_mode = true;
+        } else if (std.mem.eql(u8, arg, "--full") or std.mem.eql(u8, arg, "-f")) {
+            full_mode = true;
         } else if (std.mem.eql(u8, arg, "--notify") or std.mem.eql(u8, arg, "-n")) {
             // Next arg is the message
             if (i + 1 < args.len) {
@@ -46,7 +49,7 @@ pub fn main() !void {
 
     // List mode - connect to running daemon and show status (use page_alloc, no fork)
     if (list_mode) {
-        try listStatus(page_alloc);
+        try listStatus(page_alloc, full_mode);
         return;
     }
 
@@ -107,6 +110,7 @@ fn printUsage() !void {
         \\Options:
         \\  -d, --daemon       Run as a background daemon
         \\  -l, --list         List connected muxes and their panes
+        \\  -f, --full         Show full tree (use with --list)
         \\  -n, --notify MSG   Send notification to all connected muxes
         \\  -h, --help         Show this help message
         \\
@@ -153,7 +157,7 @@ fn sendNotify(allocator: std.mem.Allocator, message: []const u8) !void {
     }
 }
 
-fn listStatus(allocator: std.mem.Allocator) !void {
+fn listStatus(allocator: std.mem.Allocator, full_mode: bool) !void {
     // Connect to running daemon
     const socket_path = try ipc.getSesSocketPath(allocator);
     defer allocator.free(socket_path);
@@ -169,11 +173,15 @@ fn listStatus(allocator: std.mem.Allocator) !void {
 
     var conn = client.toConnection();
 
-    // Send status request
-    try conn.sendLine("{\"type\":\"status\"}");
+    // Send status request (with full flag if requested)
+    if (full_mode) {
+        try conn.sendLine("{\"type\":\"status\",\"full\":true}");
+    } else {
+        try conn.sendLine("{\"type\":\"status\"}");
+    }
 
-    // Receive response
-    var buf: [16384]u8 = undefined;
+    // Receive response - use larger buffer for full mode
+    var buf: [65536]u8 = undefined;
     const line = try conn.recvLine(&buf);
     if (line == null) {
         print("No response from daemon\n", .{});
@@ -199,19 +207,34 @@ fn listStatus(allocator: std.mem.Allocator) !void {
             const id = c.get("id").?.integer;
             const panes = c.get("panes").?.array;
 
-            print("  Mux #{d} ({d} panes)\n", .{ id, panes.items.len });
+            // Get session name and id if available
+            const name = if (c.get("session_name")) |n| n.string else "unknown";
+            const sid = if (c.get("session_id")) |s| s.string else null;
 
-            for (panes.items) |pane_val| {
-                const p = pane_val.object;
-                const uuid = p.get("uuid").?.string;
-                const pid = p.get("pid").?.integer;
+            if (sid) |session_id| {
+                print("  {s} [{s}] (mux #{d}, {d} panes)\n", .{ name, session_id[0..8], id, panes.items.len });
+            } else {
+                print("  {s} (mux #{d}, {d} panes)\n", .{ name, id, panes.items.len });
+            }
 
-                print("    [{s}] pid={d}", .{ uuid[0..8], pid });
+            if (full_mode) {
+                // Show full mux state tree if available
+                if (c.get("mux_state")) |mux_state_val| {
+                    printMuxStateTree(allocator, mux_state_val.string, "    ");
+                } else {
+                    for (panes.items) |pane_val| {
+                        const p = pane_val.object;
+                        const uuid = p.get("uuid").?.string;
+                        const pid = p.get("pid").?.integer;
 
-                if (p.get("sticky_pwd")) |pwd| {
-                    print(" pwd={s}", .{pwd.string});
+                        print("    [{s}] pid={d}", .{ uuid[0..8], pid });
+
+                        if (p.get("sticky_pwd")) |pwd| {
+                            print(" pwd={s}", .{pwd.string});
+                        }
+                        print("\n", .{});
+                    }
                 }
-                print("\n", .{});
             }
         }
     }
@@ -226,8 +249,16 @@ fn listStatus(allocator: std.mem.Allocator) !void {
                 const s = sess_val.object;
                 const sid = s.get("session_id").?.string;
                 const pane_count = s.get("pane_count").?.integer;
+                const name = if (s.get("session_name")) |n| n.string else "unknown";
 
-                print("  [{s}] {d} panes - reattach: hexa-mux -a {s}\n", .{ sid[0..8], pane_count, sid[0..8] });
+                print("  {s} [{s}] {d} panes - reattach: hexa-mux -a {s}\n", .{ name, sid[0..8], pane_count, name });
+
+                if (full_mode) {
+                    // Show full mux state tree if available
+                    if (s.get("mux_state")) |mux_state_val| {
+                        printMuxStateTree(allocator, mux_state_val.string, "    ");
+                    }
+                }
             }
         }
     }
@@ -271,6 +302,80 @@ fn listStatus(allocator: std.mem.Allocator) !void {
             }
         }
     }
+}
+
+fn printMuxStateTree(allocator: std.mem.Allocator, mux_state_json: []const u8, indent: []const u8) void {
+    // Parse the mux state JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, mux_state_json, .{}) catch {
+        print("{s}(failed to parse mux state)\n", .{indent});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+
+    // Print tabs
+    if (root.get("tabs")) |tabs_val| {
+        const tabs = tabs_val.array;
+        const active_tab = if (root.get("active_tab")) |at| @as(usize, @intCast(at.integer)) else 0;
+
+        for (tabs.items, 0..) |tab_val, ti| {
+            const tab = tab_val.object;
+            const tab_name = if (tab.get("name")) |n| n.string else "tab";
+            const marker = if (ti == active_tab) "*" else " ";
+
+            print("{s}{s} Tab: {s}\n", .{ indent, marker, tab_name });
+
+            // Print panes in this tab
+            if (tab.get("panes")) |panes_val| {
+                const panes = panes_val.array;
+                for (panes.items) |pane_val| {
+                    const pane = pane_val.object;
+                    const uuid = if (pane.get("uuid")) |u| u.string else "?";
+                    const pane_id = if (pane.get("id")) |id| @as(i64, id.integer) else 0;
+                    const focused = if (pane.get("focused")) |f| f.bool else false;
+                    const focus_marker = if (focused) ">" else " ";
+
+                    print("{s}  {s} Pane {d} [{s}]\n", .{ indent, focus_marker, pane_id, uuid[0..@min(8, uuid.len)] });
+                }
+            }
+
+            // Print layout tree if present
+            if (tab.get("tree")) |tree_val| {
+                if (tree_val != .null) {
+                    printLayoutTree(tree_val.object, indent, 2);
+                }
+            }
+        }
+    }
+
+    // Print floats
+    if (root.get("floats")) |floats_val| {
+        const floats = floats_val.array;
+        if (floats.items.len > 0) {
+            const active_float = if (root.get("active_floating")) |af|
+                if (af != .null) @as(?usize, @intCast(af.integer)) else null
+            else
+                null;
+
+            print("{s}Floats:\n", .{indent});
+            for (floats.items, 0..) |float_val, fi| {
+                const float = float_val.object;
+                const uuid = if (float.get("uuid")) |u| u.string else "?";
+                const visible = if (float.get("visible")) |v| v.bool else true;
+                const is_pwd = if (float.get("is_pwd")) |p| p.bool else false;
+                const marker = if (active_float != null and active_float.? == fi) "*" else " ";
+                const vis_str = if (visible) "" else " (hidden)";
+                const pwd_str = if (is_pwd) " [pwd]" else "";
+
+                print("{s}  {s} Float [{s}]{s}{s}\n", .{ indent, marker, uuid[0..@min(8, uuid.len)], pwd_str, vis_str });
+            }
+        }
+    }
+}
+
+fn printLayoutTree(_: std.json.ObjectMap, _: []const u8, _: usize) void {
+    // Layout tree printing is optional - the pane list above shows the essentials
 }
 
 fn daemonize() !void {

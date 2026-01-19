@@ -265,6 +265,48 @@ pub fn generateUuid() [32]u8 {
     return hex;
 }
 
+/// Pokemon names for session naming (Gen 1)
+const pokemon_names = [_][]const u8{
+    "bulbasaur",  "ivysaur",    "venusaur",   "charmander", "charmeleon",
+    "charizard",  "squirtle",   "wartortle",  "blastoise",  "caterpie",
+    "metapod",    "butterfree", "weedle",     "kakuna",     "beedrill",
+    "pidgey",     "pidgeotto",  "pidgeot",    "rattata",    "raticate",
+    "spearow",    "fearow",     "ekans",      "arbok",      "pikachu",
+    "raichu",     "sandshrew",  "sandslash",  "nidoran",    "nidorina",
+    "nidoqueen",  "nidorino",   "nidoking",   "clefairy",   "clefable",
+    "vulpix",     "ninetales",  "jigglypuff", "wigglytuff", "zubat",
+    "golbat",     "oddish",     "gloom",      "vileplume",  "paras",
+    "parasect",   "venonat",    "venomoth",   "diglett",    "dugtrio",
+    "meowth",     "persian",    "psyduck",    "golduck",    "mankey",
+    "primeape",   "growlithe",  "arcanine",   "poliwag",    "poliwhirl",
+    "poliwrath",  "abra",       "kadabra",    "alakazam",   "machop",
+    "machoke",    "machamp",    "bellsprout", "weepinbell", "victreebel",
+    "tentacool",  "tentacruel", "geodude",    "graveler",   "golem",
+    "ponyta",     "rapidash",   "slowpoke",   "slowbro",    "magnemite",
+    "magneton",   "farfetchd",  "doduo",      "dodrio",     "seel",
+    "dewgong",    "grimer",     "muk",        "shellder",   "cloyster",
+    "gastly",     "haunter",    "gengar",     "onix",       "drowzee",
+    "hypno",      "krabby",     "kingler",    "voltorb",    "electrode",
+    "exeggcute",  "exeggutor",  "cubone",     "marowak",    "hitmonlee",
+    "hitmonchan", "lickitung",  "koffing",    "weezing",    "rhyhorn",
+    "rhydon",     "chansey",    "tangela",    "kangaskhan", "horsea",
+    "seadra",     "goldeen",    "seaking",    "staryu",     "starmie",
+    "mrmime",     "scyther",    "jynx",       "electabuzz", "magmar",
+    "pinsir",     "tauros",     "magikarp",   "gyarados",   "lapras",
+    "ditto",      "eevee",      "vaporeon",   "jolteon",    "flareon",
+    "porygon",    "omanyte",    "omastar",    "kabuto",     "kabutops",
+    "aerodactyl", "snorlax",    "articuno",   "zapdos",     "moltres",
+    "dratini",    "dragonair",  "dragonite",  "mewtwo",     "mew",
+};
+
+/// Generate a random Pokemon name for session naming
+pub fn generateSessionName() []const u8 {
+    var rand_byte: [1]u8 = undefined;
+    std.crypto.random.bytes(&rand_byte);
+    const index = rand_byte[0] % pokemon_names.len;
+    return pokemon_names[index];
+}
+
 /// Get the socket directory path
 pub fn getSocketDir(allocator: std.mem.Allocator) ![]const u8 {
     // Use XDG_RUNTIME_DIR if available, otherwise /tmp

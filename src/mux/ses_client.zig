@@ -8,11 +8,19 @@ pub const SesClient = struct {
     conn: ?core.ipc.Connection,
     just_started_daemon: bool,
 
-    pub fn init(allocator: std.mem.Allocator) SesClient {
+    // Registration info
+    session_id: [32]u8, // mux UUID as hex string
+    session_name: []const u8, // Pokemon name
+    keepalive: bool,
+
+    pub fn init(allocator: std.mem.Allocator, session_id: [32]u8, session_name: []const u8, keepalive: bool) SesClient {
         return .{
             .allocator = allocator,
             .conn = null,
             .just_started_daemon = false,
+            .session_id = session_id,
+            .session_name = session_name,
+            .keepalive = keepalive,
         };
     }
 
@@ -33,6 +41,7 @@ pub const SesClient = struct {
         if (core.ipc.Client.connect(socket_path)) |client| {
             self.conn = client.toConnection();
             self.just_started_daemon = false;
+            try self.register();
             return;
         } else |err| {
             if (err != error.ConnectionRefused and err != error.FileNotFound) {
@@ -50,6 +59,71 @@ pub const SesClient = struct {
         // Retry connection
         const client = try core.ipc.Client.connect(socket_path);
         self.conn = client.toConnection();
+        try self.register();
+    }
+
+    /// Register with ses - send session_id, session_name, and keepalive preference
+    fn register(self: *SesClient) !void {
+        const conn = &(self.conn orelse return error.NotConnected);
+
+        var buf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"register\",\"session_id\":\"{s}\",\"session_name\":\"{s}\",\"keepalive\":{}}}", .{
+            self.session_id,
+            self.session_name,
+            self.keepalive,
+        });
+        try conn.sendLine(msg);
+
+        // Wait for response
+        var resp_buf: [128]u8 = undefined;
+        const line = try conn.recvLine(&resp_buf);
+        if (line == null) return error.ConnectionClosed;
+
+        // Verify it's a successful registration
+        if (std.mem.indexOf(u8, line.?, "registered") == null) {
+            return error.RegistrationFailed;
+        }
+    }
+
+    /// Update session info and re-register with ses (used after reattach)
+    pub fn updateSession(self: *SesClient, session_id: [32]u8, session_name: []const u8) !void {
+        self.session_id = session_id;
+        self.session_name = session_name;
+        try self.register();
+    }
+
+    /// Sync current mux state to ses (for crash recovery)
+    pub fn syncState(self: *SesClient, mux_state_json: []const u8) !void {
+        const conn = &(self.conn orelse return error.NotConnected);
+
+        // Build message with mux state as escaped JSON string
+        const msg_size = 64 + mux_state_json.len * 2;
+        const msg_buf = self.allocator.alloc(u8, msg_size) catch return error.OutOfMemory;
+        defer self.allocator.free(msg_buf);
+
+        var stream = std.io.fixedBufferStream(msg_buf);
+        var writer = stream.writer();
+        writer.writeAll("{\"type\":\"sync_state\",\"mux_state\":\"") catch return error.WriteError;
+
+        // Escape the JSON string
+        for (mux_state_json) |c| {
+            switch (c) {
+                '"' => writer.writeAll("\\\"") catch return error.WriteError,
+                '\\' => writer.writeAll("\\\\") catch return error.WriteError,
+                '\n' => writer.writeAll("\\n") catch return error.WriteError,
+                '\r' => writer.writeAll("\\r") catch return error.WriteError,
+                '\t' => writer.writeAll("\\t") catch return error.WriteError,
+                else => writer.writeByte(c) catch return error.WriteError,
+            }
+        }
+        writer.writeAll("\"}") catch return error.WriteError;
+
+        try conn.sendLine(stream.getWritten());
+
+        // Wait for response
+        var resp_buf: [128]u8 = undefined;
+        const line = try conn.recvLine(&resp_buf);
+        if (line == null) return error.ConnectionClosed;
     }
 
     /// Start the ses daemon
@@ -471,6 +545,16 @@ pub const SesClient = struct {
             @memcpy(&info.session_id, sid_str[0..32]);
             info.pane_count = @intCast((sess.get("pane_count") orelse continue).integer);
 
+            // Get session name
+            if (sess.get("session_name")) |name_val| {
+                const name = name_val.string;
+                const name_len = @min(name.len, 32);
+                @memcpy(info.session_name[0..name_len], name[0..name_len]);
+                info.session_name_len = name_len;
+            } else {
+                info.session_name_len = 0;
+            }
+
             out_buf[count] = info;
             count += 1;
         }
@@ -486,5 +570,7 @@ pub const OrphanedPaneInfo = struct {
 
 pub const DetachedSessionInfo = struct {
     session_id: [32]u8,
+    session_name: [32]u8,
+    session_name_len: usize,
     pane_count: usize,
 };

@@ -58,6 +58,8 @@ const State = struct {
     ses_client: SesClient,
     notifications: NotificationManager,
     uuid: [32]u8,
+    session_name: []const u8,
+    session_name_owned: ?[]const u8, // If set, points to owned memory that must be freed
     ipc_server: ?core.ipc.Server,
     socket_path: ?[]const u8,
 
@@ -66,9 +68,9 @@ const State = struct {
         const status_h: u16 = if (cfg.panes.status.enabled) 1 else 0;
         const layout_h = height - status_h;
 
-        // Generate UUID for this mux instance
+        // Generate UUID and session name for this mux instance
         const uuid = core.ipc.generateUuid();
-        debugLog("State.init generated new UUID: {s}\n", .{uuid});
+        const session_name = core.ipc.generateSessionName();
 
         // Create IPC server socket
         const socket_path = core.ipc.getMuxSocketPath(allocator, &uuid) catch null;
@@ -94,9 +96,11 @@ const State = struct {
             .layout_width = width,
             .layout_height = layout_h,
             .renderer = try Renderer.init(allocator, width, height),
-            .ses_client = SesClient.init(allocator),
+            .ses_client = SesClient.init(allocator, uuid, session_name, true), // keepalive=true by default
             .notifications = NotificationManager.initWithConfig(allocator, cfg.notifications),
             .uuid = uuid,
+            .session_name = session_name,
+            .session_name_owned = null,
             .ipc_server = ipc_server,
             .socket_path = socket_path,
         };
@@ -106,9 +110,10 @@ const State = struct {
         // Deinit floating panes
         for (self.floating_panes.items) |pane| {
             // In detach mode, panes are already handled by ses - don't kill
-            // Otherwise: sticky floats get orphaned, non-sticky get killed
+            // Otherwise: sticky floats become sticky in ses, non-sticky get killed
             if (!self.detach_mode and self.ses_client.isConnected()) {
                 if (pane.sticky) {
+                    // Sticky floats persist as sticky panes in ses
                     self.ses_client.orphanPane(pane.uuid) catch {};
                 } else {
                     self.ses_client.killPane(pane.uuid) catch {};
@@ -139,6 +144,9 @@ const State = struct {
         }
         if (self.socket_path) |path| {
             self.allocator.free(path);
+        }
+        if (self.session_name_owned) |owned| {
+            self.allocator.free(owned);
         }
     }
 
@@ -171,6 +179,7 @@ const State = struct {
         self.active_tab = self.tabs.items.len - 1;
         self.renderer.invalidate();
         self.force_full_render = true;
+        self.syncStateToSes();
     }
 
     /// Close the current tab
@@ -183,6 +192,7 @@ const State = struct {
         }
         self.renderer.invalidate();
         self.force_full_render = true;
+        self.syncStateToSes();
         return true;
     }
 
@@ -240,8 +250,9 @@ const State = struct {
 
         try writer.writeAll("{");
 
-        // Mux UUID (persistent identity)
+        // Mux UUID and session name (persistent identity)
         try writer.print("\"uuid\":\"{s}\",", .{self.uuid});
+        try writer.print("\"session_name\":\"{s}\",", .{self.session_name});
 
         // Active tab/float
         try writer.print("\"active_tab\":{d},", .{self.active_tab});
@@ -361,11 +372,23 @@ const State = struct {
             const uuid_str = uuid_val.string;
             if (uuid_str.len == 32) {
                 @memcpy(&self.uuid, uuid_str[0..32]);
-                debugLog("Restored UUID from saved state: {s}\n", .{self.uuid});
             }
-        } else {
-            debugLog("No UUID found in saved state!\n", .{});
         }
+
+        // Restore session name (must dupe since parsed JSON will be freed)
+        if (root.get("session_name")) |name_val| {
+            // Free previous owned name if any
+            if (self.session_name_owned) |old| {
+                self.allocator.free(old);
+            }
+            // Dupe the name from JSON
+            const duped = self.allocator.dupe(u8, name_val.string) catch return false;
+            self.session_name = duped;
+            self.session_name_owned = duped;
+        }
+
+        // Re-register with ses using restored UUID and session_name
+        self.ses_client.updateSession(self.uuid, self.session_name) catch {};
 
         // Restore active tab/floating
         if (root.get("active_tab")) |at| {
@@ -379,20 +402,14 @@ const State = struct {
         var uuid_fd_map = std.AutoHashMap([32]u8, struct { fd: std.posix.fd_t, pid: std.posix.pid_t }).init(self.allocator);
         defer uuid_fd_map.deinit();
 
-        debugLog("Reattach: adopting {d} panes\n", .{reattach_result.pane_uuids.len});
         for (reattach_result.pane_uuids) |uuid| {
             // Adopt each pane to get its fd
-            const adopt_result = self.ses_client.adoptPane(uuid) catch |err| {
-                debugLog("Failed to adopt pane {s}: {}\n", .{ std.fmt.bytesToHex(uuid[0..8], .lower), err });
-                continue;
-            };
+            const adopt_result = self.ses_client.adoptPane(uuid) catch continue;
             uuid_fd_map.put(uuid, .{ .fd = adopt_result.fd, .pid = adopt_result.pid }) catch continue;
-            debugLog("Adopted pane {s}, fd={d}\n", .{ std.fmt.bytesToHex(uuid[0..8], .lower), adopt_result.fd });
         }
 
         // Restore tabs
         if (root.get("tabs")) |tabs_arr| {
-            debugLog("Reattach: restoring {d} tabs\n", .{tabs_arr.array.items.len});
             for (tabs_arr.array.items) |tab_val| {
                 const tab_obj = tab_val.object;
                 const name_json = (tab_obj.get("name") orelse continue).string;
@@ -502,7 +519,6 @@ const State = struct {
 
         self.renderer.invalidate();
         self.force_full_render = true;
-        debugLog("Reattach complete: {d} tabs, {d} floats restored\n", .{ self.tabs.items.len, self.floating_panes.items.len });
         return self.tabs.items.len > 0;
     }
 
@@ -591,6 +607,16 @@ const State = struct {
         }
         return false;
     }
+
+    /// Sync current state to ses for crash recovery
+    fn syncStateToSes(self: *State) void {
+        if (!self.ses_client.isConnected()) return;
+
+        const mux_state_json = self.serializeState() catch return;
+        defer self.allocator.free(mux_state_json);
+
+        self.ses_client.syncState(mux_state_json) catch {};
+    }
 };
 
 pub fn main() !void {
@@ -625,7 +651,10 @@ pub fn main() !void {
 
     // Handle --list: show detached sessions and orphaned panes
     if (list_orphaned) {
-        var ses = SesClient.init(allocator);
+        // Temporary connection for listing - generate a dummy UUID and name
+        const tmp_uuid = core.ipc.generateUuid();
+        const tmp_name = core.ipc.generateSessionName();
+        var ses = SesClient.init(allocator, tmp_uuid, tmp_name, false); // keepalive=false for temp connection
         defer ses.deinit();
         ses.connect() catch {
             std.debug.print("Could not connect to ses daemon\n", .{});
@@ -638,7 +667,8 @@ pub fn main() !void {
         if (sess_count > 0) {
             std.debug.print("Detached sessions:\n", .{});
             for (sessions[0..sess_count]) |s| {
-                std.debug.print("  [{s}] {d} panes - attach with: hexa-mux -a {s}\n", .{ s.session_id[0..8], s.pane_count, s.session_id[0..8] });
+                const name = s.session_name[0..s.session_name_len];
+                std.debug.print("  {s} [{s}] {d} panes - attach with: hexa-mux -a {s}\n", .{ name, s.session_id[0..8], s.pane_count, name });
             }
         }
 
@@ -658,10 +688,10 @@ pub fn main() !void {
         return;
     }
 
-    // Handle --attach: attach to orphaned pane
+    // Handle --attach: attach to detached session by name or UUID prefix
     if (attach_uuid) |uuid_arg| {
-        if (uuid_arg.len < 8) {
-            std.debug.print("UUID too short (need at least 8 chars)\n", .{});
+        if (uuid_arg.len < 3) {
+            std.debug.print("Session name/UUID too short (need at least 3 chars)\n", .{});
             return;
         }
         // Will be handled after state init
@@ -795,6 +825,7 @@ pub fn main() !void {
                     pane.deinit();
                     state.allocator.destroy(pane);
                     state.needs_render = true;
+                    state.syncStateToSes();
 
                     // Clear focus if this was the active float
                     if (was_active) {
@@ -831,6 +862,7 @@ pub fn main() !void {
                     // Multiple panes in tab - just close this one
                     _ = state.currentLayout().closeFocused();
                     state.needs_render = true;
+                    state.syncStateToSes();
                 } else if (state.tabs.items.len > 1) {
                     // Only 1 pane but multiple tabs - close this tab
                     _ = state.closeCurrentTab();
@@ -1387,6 +1419,7 @@ fn handleAltKey(state: *State, key: u8) bool {
         const cwd = if (state.currentLayout().getFocusedPane()) |p| p.getRealCwd() else null;
         _ = state.currentLayout().splitFocused(.horizontal, cwd) catch null;
         state.needs_render = true;
+        state.syncStateToSes();
         return true;
     }
 
@@ -1394,6 +1427,7 @@ fn handleAltKey(state: *State, key: u8) bool {
         const cwd = if (state.currentLayout().getFocusedPane()) |p| p.getRealCwd() else null;
         _ = state.currentLayout().splitFocused(.vertical, cwd) catch null;
         state.needs_render = true;
+        state.syncStateToSes();
         return true;
     }
 
@@ -1452,14 +1486,11 @@ fn handleAltKey(state: *State, key: u8) bool {
         defer state.allocator.free(mux_state_json);
 
         // Detach session with our UUID - panes stay grouped with full state
-        debugLog("Detaching with UUID: {s}\n", .{state.uuid});
-        state.ses_client.detachSession(state.uuid, mux_state_json) catch |err| {
-            debugLog("Detach FAILED: {}\n", .{err});
+        state.ses_client.detachSession(state.uuid, mux_state_json) catch {
             std.debug.print("\nDetach failed - panes orphaned\n", .{});
             state.running = false;
             return true;
         };
-        debugLog("Detach succeeded!\n", .{});
         // Print session_id (our UUID) so user can reattach
         std.debug.print("\nSession detached: {s}\nReattach with: hexa-mux --attach {s}\n", .{ state.uuid, state.uuid[0..8] });
         state.running = false;
@@ -1676,6 +1707,7 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
 
     try state.floating_panes.append(state.allocator, pane);
     state.active_floating = state.floating_panes.items.len - 1;
+    state.syncStateToSes();
 }
 
 fn renderTo(state: *State, stdout: std.fs.File) !void {
@@ -2189,7 +2221,7 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
     }
     ctx.pane_names = tab_names[0..tab_count];
     ctx.active_pane = state.active_tab;
-    ctx.session_name = "hexa";
+    ctx.session_name = state.session_name;
 
     // === DRAW LEFT SECTION ===
     var left_x: u16 = 0;

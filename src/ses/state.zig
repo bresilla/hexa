@@ -48,39 +48,67 @@ pub const Client = struct {
     pane_uuids: std.ArrayList([32]u8),
     allocator: std.mem.Allocator,
 
+    // Keepalive settings
+    keepalive: bool,
+    session_id: ?[16]u8, // mux's UUID for this client
+    session_name: ?[]const u8, // Pokemon name for this session
+    last_mux_state: ?[]const u8, // most recent synced state for crash recovery
+
     pub fn init(allocator: std.mem.Allocator, id: usize, fd: posix.fd_t) Client {
         return .{
             .id = id,
             .fd = fd,
             .pane_uuids = .empty,
             .allocator = allocator,
+            .keepalive = true, // default to keepalive
+            .session_id = null,
+            .session_name = null,
+            .last_mux_state = null,
         };
     }
 
     pub fn deinit(self: *Client) void {
         self.pane_uuids.deinit(self.allocator);
+        if (self.session_name) |name| {
+            self.allocator.free(name);
+        }
+        if (self.last_mux_state) |state| {
+            self.allocator.free(state);
+        }
     }
 
     pub fn appendUuid(self: *Client, uuid: [32]u8) !void {
         try self.pane_uuids.append(self.allocator, uuid);
+    }
+
+    pub fn updateMuxState(self: *Client, mux_state: []const u8) !void {
+        // Free old state if exists
+        if (self.last_mux_state) |old| {
+            self.allocator.free(old);
+        }
+        // Store new state
+        self.last_mux_state = try self.allocator.dupe(u8, mux_state);
     }
 };
 
 /// Detached session info (for listing)
 pub const DetachedSession = struct {
     session_id: [16]u8,
+    session_name: []const u8,
     pane_count: usize,
 };
 
 /// Full detached mux state - stores the entire layout for reattachment
 pub const DetachedMuxState = struct {
     session_id: [16]u8,
+    session_name: []const u8, // Pokemon name
     mux_state_json: []const u8, // Full serialized mux state
     pane_uuids: [][32]u8, // List of pane UUIDs in this session
     detached_at: i64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *DetachedMuxState) void {
+        self.allocator.free(self.session_name);
         self.allocator.free(self.mux_state_json);
         self.allocator.free(self.pane_uuids);
     }
@@ -141,16 +169,30 @@ pub const SesState = struct {
         return id;
     }
 
-    /// Remove a client and orphan its panes
+    /// Remove a client - behavior depends on keepalive setting
+    /// keepalive=true: auto-detach session (preserve for reattach)
+    /// keepalive=false: kill all panes
     pub fn removeClient(self: *SesState, client_id: usize) void {
         // Find and remove client
         var client_index: ?usize = null;
         for (self.clients.items, 0..) |*client, i| {
             if (client.id == client_id) {
-                // Orphan all panes owned by this client
-                for (client.pane_uuids.items) |uuid| {
-                    if (self.panes.getPtr(uuid)) |pane| {
-                        self.orphanPane(pane);
+                if (client.keepalive) {
+                    // Auto-detach: preserve session with last known state
+                    if (client.session_id) |session_id| {
+                        const mux_state = client.last_mux_state orelse "{}";
+                        // Use detachSessionDirect to avoid removing client twice
+                        self.detachSessionDirect(client, session_id, mux_state);
+                    } else {
+                        // No session_id yet, just kill panes
+                        for (client.pane_uuids.items) |uuid| {
+                            self.killPane(uuid) catch {};
+                        }
+                    }
+                } else {
+                    // No keepalive: kill all panes
+                    for (client.pane_uuids.items) |uuid| {
+                        self.killPane(uuid) catch {};
                     }
                 }
                 client.deinit();
@@ -164,14 +206,87 @@ pub const SesState = struct {
         }
     }
 
+    /// Remove a client gracefully - mux already handled cleanup, no auto-detach
+    /// Used when mux sends explicit disconnect message
+    pub fn removeClientGraceful(self: *SesState, client_id: usize) void {
+        var client_index: ?usize = null;
+        for (self.clients.items, 0..) |*client, i| {
+            if (client.id == client_id) {
+                client.deinit();
+                client_index = i;
+                break;
+            }
+        }
+
+        if (client_index) |idx| {
+            _ = self.clients.orderedRemove(idx);
+        }
+    }
+
+    /// Internal: detach session without removing client (used by removeClient)
+    fn detachSessionDirect(self: *SesState, client: *Client, session_id: [16]u8, mux_state_json: []const u8) void {
+        var pane_uuids_list: std.ArrayList([32]u8) = .empty;
+
+        // Mark all panes as detached and collect UUIDs
+        for (client.pane_uuids.items) |uuid| {
+            if (self.panes.getPtr(uuid)) |pane| {
+                pane.state = .detached;
+                pane.session_id = session_id;
+                pane.attached_to = null;
+                pane_uuids_list.append(self.allocator, uuid) catch continue;
+            }
+        }
+
+        // If session already exists (re-detach), remove old state first
+        if (self.detached_sessions.fetchRemove(session_id)) |old| {
+            var old_state = old.value;
+            old_state.deinit();
+        }
+
+        // Store the full mux state
+        const owned_name = self.allocator.dupe(u8, client.session_name orelse "unknown") catch {
+            pane_uuids_list.deinit(self.allocator);
+            return;
+        };
+        const owned_json = self.allocator.dupe(u8, mux_state_json) catch {
+            self.allocator.free(owned_name);
+            pane_uuids_list.deinit(self.allocator);
+            return;
+        };
+        const owned_uuids = pane_uuids_list.toOwnedSlice(self.allocator) catch {
+            self.allocator.free(owned_name);
+            self.allocator.free(owned_json);
+            return;
+        };
+
+        const detached_state = DetachedMuxState{
+            .session_id = session_id,
+            .session_name = owned_name,
+            .mux_state_json = owned_json,
+            .pane_uuids = owned_uuids,
+            .detached_at = std.time.timestamp(),
+            .allocator = self.allocator,
+        };
+
+        self.detached_sessions.put(session_id, detached_state) catch {
+            self.allocator.free(owned_name);
+            self.allocator.free(owned_json);
+            self.allocator.free(owned_uuids);
+        };
+    }
+
     /// Detach a client's session with a specific session ID (mux's UUID)
     /// Stores the full mux state for later restoration
     /// If the session already exists (re-detach), it updates the existing state
     /// Returns true on success, false if client not found
-    pub fn detachSession(self: *SesState, client_id: usize, session_id: [16]u8, mux_state_json: []const u8) bool {
+    pub fn detachSession(self: *SesState, client_id: usize, session_id: [16]u8, session_name: []const u8, mux_state_json: []const u8) bool {
         // Find client
         var client_index: ?usize = null;
         var pane_uuids_list: std.ArrayList([32]u8) = .empty;
+
+        // Dupe session_name BEFORE client.deinit() frees the original
+        const owned_name = self.allocator.dupe(u8, session_name) catch return false;
+        errdefer self.allocator.free(owned_name);
 
         for (self.clients.items, 0..) |*client, i| {
             if (client.id == client_id) {
@@ -199,15 +314,20 @@ pub const SesState = struct {
                 old_state.deinit();
             }
 
-            // Store the full mux state
-            const owned_json = self.allocator.dupe(u8, mux_state_json) catch return true;
+            // Store the full mux state (owned_name already duped above)
+            const owned_json = self.allocator.dupe(u8, mux_state_json) catch {
+                self.allocator.free(owned_name);
+                return true;
+            };
             const owned_uuids = pane_uuids_list.toOwnedSlice(self.allocator) catch {
+                self.allocator.free(owned_name);
                 self.allocator.free(owned_json);
                 return true;
             };
 
             const detached_state = DetachedMuxState{
                 .session_id = session_id,
+                .session_name = owned_name,
                 .mux_state_json = owned_json,
                 .pane_uuids = owned_uuids,
                 .detached_at = std.time.timestamp(),
@@ -215,6 +335,7 @@ pub const SesState = struct {
             };
 
             self.detached_sessions.put(session_id, detached_state) catch {
+                self.allocator.free(owned_name);
                 self.allocator.free(owned_json);
                 self.allocator.free(owned_uuids);
             };
@@ -222,6 +343,7 @@ pub const SesState = struct {
             return true;
         } else {
             pane_uuids_list.deinit(self.allocator);
+            self.allocator.free(owned_name);
         }
         return false;
     }
@@ -265,6 +387,7 @@ pub const SesState = struct {
         while (iter.next()) |detached| {
             try result.append(allocator, .{
                 .session_id = detached.session_id,
+                .session_name = detached.session_name,
                 .pane_count = detached.pane_uuids.len,
             });
         }
