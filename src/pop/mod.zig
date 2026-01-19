@@ -79,12 +79,19 @@ pub const PopupManager = struct {
     allocator: std.mem.Allocator,
     notifications: NotificationManager,
     active: ?Popup,
+    // Store last result for retrieval after popup is dismissed
+    last_confirm_result: ?bool,
+    last_picker_result: ?usize,
+    last_picker_cancelled: bool,
 
     pub fn init(allocator: std.mem.Allocator) PopupManager {
         return .{
             .allocator = allocator,
             .notifications = NotificationManager.init(allocator),
             .active = null,
+            .last_confirm_result = null,
+            .last_picker_result = null,
+            .last_picker_cancelled = false,
         };
     }
 
@@ -93,6 +100,9 @@ pub const PopupManager = struct {
             .allocator = allocator,
             .notifications = NotificationManager.initWithConfig(allocator, cfg),
             .active = null,
+            .last_confirm_result = null,
+            .last_picker_result = null,
+            .last_picker_cancelled = false,
         };
     }
 
@@ -182,6 +192,19 @@ pub const PopupManager = struct {
         if (self.active) |popup| {
             const result = popup.handleInput(key);
             if (result == .dismissed) {
+                // Store result before cleanup
+                switch (popup) {
+                    .confirm => |c| {
+                        self.last_confirm_result = c.getResult();
+                        self.last_picker_result = null;
+                        self.last_picker_cancelled = false;
+                    },
+                    .picker => |p| {
+                        self.last_picker_result = p.getResult();
+                        self.last_picker_cancelled = p.wasCancelled();
+                        self.last_confirm_result = null;
+                    },
+                }
                 // Popup is done, clean up
                 popup.deinit(self.allocator);
                 self.active = null;
@@ -220,25 +243,27 @@ pub const PopupManager = struct {
     }
 
     /// Get result from the last confirm dialog (if any)
+    /// Returns the stored result from the last dismissed confirm popup
     pub fn getConfirmResult(self: *PopupManager) ?bool {
-        if (self.active) |popup| {
-            switch (popup) {
-                .confirm => |c| return c.getResult(),
-                else => return null,
-            }
-        }
-        return null;
+        return self.last_confirm_result;
     }
 
     /// Get result from the last picker dialog (if any)
+    /// Returns the stored result from the last dismissed picker popup
     pub fn getPickerResult(self: *PopupManager) ?usize {
-        if (self.active) |popup| {
-            switch (popup) {
-                .picker => |p| return p.getResult(),
-                else => return null,
-            }
-        }
-        return null;
+        return self.last_picker_result;
+    }
+
+    /// Check if last picker was cancelled
+    pub fn wasPickerCancelled(self: *PopupManager) bool {
+        return self.last_picker_cancelled;
+    }
+
+    /// Clear stored results
+    pub fn clearResults(self: *PopupManager) void {
+        self.last_confirm_result = null;
+        self.last_picker_result = null;
+        self.last_picker_cancelled = false;
     }
 
     /// Dismiss the active popup without waiting for user input

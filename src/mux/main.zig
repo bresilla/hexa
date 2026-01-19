@@ -66,6 +66,8 @@ const State = struct {
     renderer: Renderer,
     ses_client: SesClient,
     notifications: NotificationManager,
+    popups: pop.PopupManager, // For blocking popups (confirm, choose)
+    pending_pop_response: bool, // True if waiting to send pop response
     uuid: [32]u8,
     session_name: []const u8,
     session_name_owned: ?[]const u8, // If set, points to owned memory that must be freed
@@ -109,6 +111,8 @@ const State = struct {
             .renderer = try Renderer.init(allocator, width, height),
             .ses_client = SesClient.init(allocator, uuid, session_name, true), // keepalive=true by default
             .notifications = NotificationManager.initWithPopConfig(allocator, pop_cfg.carrier.notification),
+            .popups = pop.PopupManager.init(allocator),
+            .pending_pop_response = false,
             .uuid = uuid,
             .session_name = session_name,
             .session_name_owned = null,
@@ -150,6 +154,7 @@ const State = struct {
         self.renderer.deinit();
         self.ses_client.deinit();
         self.notifications.deinit();
+        self.popups.deinit();
         if (self.ipc_server) |*srv| {
             srv.deinit();
         }
@@ -1291,6 +1296,32 @@ fn runMainLoop(state: *State) !void {
 }
 
 fn handleInput(state: *State, input: []const u8) void {
+    // Check if popup is blocking input
+    if (state.popups.isBlocked()) {
+        if (input.len == 0) return;
+
+        // Convert arrow key escape sequences to simple keys
+        // Arrow keys: ESC [ A (up), ESC [ B (down), ESC [ C (right), ESC [ D (left)
+        var key: u8 = input[0];
+        if (input.len >= 3 and input[0] == 0x1b and input[1] == '[') {
+            key = switch (input[2]) {
+                'C' => 'l', // Right arrow -> 'l' (select yes / next)
+                'D' => 'h', // Left arrow -> 'h' (select no / prev)
+                'A' => 'k', // Up arrow -> 'k' (for picker)
+                'B' => 'j', // Down arrow -> 'j' (for picker)
+                else => input[0],
+            };
+        }
+
+        const result = state.popups.handleInput(key);
+        if (result == .dismissed) {
+            // Popup was dismissed, send response to ses
+            sendPopResponse(state);
+        }
+        state.needs_render = true;
+        return;
+    }
+
     var i: usize = 0;
     while (i < input.len) {
         // Check for Alt+key (ESC followed by key)
@@ -1466,6 +1497,89 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
         }
         state.needs_render = true;
     }
+    // Handle pop_confirm - show confirm dialog
+    else if (std.mem.eql(u8, msg_type, "pop_confirm")) {
+        const msg = (root.get("message") orelse return).string;
+
+        // Show confirm dialog at MUX level (blocks everything)
+        state.popups.showConfirmOwned(msg, .{}) catch return;
+        state.pending_pop_response = true;
+        state.needs_render = true;
+    }
+    // Handle pop_choose - show picker dialog
+    else if (std.mem.eql(u8, msg_type, "pop_choose")) {
+        const msg = (root.get("message") orelse return).string;
+        const items_val = root.get("items") orelse return;
+        if (items_val != .array) return;
+
+        // Convert JSON array to string slice
+        var items_list: std.ArrayList([]const u8) = .empty;
+        defer items_list.deinit(state.allocator);
+
+        for (items_val.array.items) |item| {
+            if (item == .string) {
+                const duped = state.allocator.dupe(u8, item.string) catch continue;
+                items_list.append(state.allocator, duped) catch {
+                    state.allocator.free(duped);
+                    continue;
+                };
+            }
+        }
+
+        if (items_list.items.len > 0) {
+            state.popups.showPickerOwned(items_list.items, .{ .title = msg }) catch {
+                // Free items on failure
+                for (items_list.items) |item| {
+                    state.allocator.free(item);
+                }
+                return;
+            };
+            state.pending_pop_response = true;
+            state.needs_render = true;
+        }
+    }
+}
+
+/// Send popup response back to ses (for CLI-triggered popups)
+fn sendPopResponse(state: *State) void {
+    if (!state.pending_pop_response) return;
+    state.pending_pop_response = false;
+
+    // Get the connection to ses
+    const conn = &(state.ses_client.conn orelse return);
+
+    // Check what kind of response we need to send
+    var buf: [256]u8 = undefined;
+
+    // Try to get confirm result
+    if (state.popups.getConfirmResult()) |confirmed| {
+        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pop_response\",\"confirmed\":{}}}", .{confirmed}) catch return;
+        conn.sendLine(msg) catch {};
+        state.popups.clearResults();
+        return;
+    }
+
+    // Try to get picker result
+    if (state.popups.getPickerResult()) |selected| {
+        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pop_response\",\"selected\":{d}}}", .{selected}) catch return;
+        conn.sendLine(msg) catch {};
+        state.popups.clearResults();
+        return;
+    }
+
+    // Picker was cancelled (result is null but wasPickerCancelled is true)
+    if (state.popups.wasPickerCancelled()) {
+        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pop_response\",\"cancelled\":true}}", .{}) catch return;
+        conn.sendLine(msg) catch {};
+        state.popups.clearResults();
+        return;
+    }
+
+    // Confirm was cancelled (result is false - but we should have caught it above)
+    // This handles edge cases
+    const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pop_response\",\"cancelled\":true}}", .{}) catch return;
+    conn.sendLine(msg) catch {};
+    state.popups.clearResults();
 }
 
 fn sendNotifyToParentMux(_: std.mem.Allocator, message: []const u8) void {
@@ -2256,6 +2370,11 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     // Draw MUX realm notifications overlay (top of screen)
     state.notifications.render(renderer, state.term_width, state.term_height);
 
+    // Draw blocking popup overlay (on top of everything)
+    if (state.popups.getActivePopup()) |popup| {
+        drawPopup(state, renderer, popup);
+    }
+
     // End frame with differential render
     const output = try renderer.endFrame(state.force_full_render);
 
@@ -2306,6 +2425,233 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         .{ .base = &cursor_buf, .len = cursor_len },
     };
     try stdout.writevAll(iovecs[0..]);
+}
+
+/// Draw a blocking popup (confirm or picker) centered on screen
+fn drawPopup(state: *State, renderer: *Renderer, popup: pop.Popup) void {
+    const cfg = &state.pop_config.carrier;
+
+    switch (popup) {
+        .confirm => |confirm| drawConfirmPopup(state, renderer, confirm, cfg.confirm),
+        .picker => |picker| drawPickerPopup(state, renderer, picker, cfg.choose),
+    }
+}
+
+fn drawConfirmPopup(state: *State, renderer: *Renderer, confirm: *pop.Confirm, cfg: pop.ConfirmStyle) void {
+    const dims = confirm.getBoxDimensions();
+
+    // Ensure minimum width for the box
+    const min_width: u16 = 30;
+    const box_width = @max(dims.width, min_width);
+    const box_height = dims.height;
+
+    // Center on screen
+    const center_x = state.term_width / 2;
+    const center_y = state.term_height / 2;
+    const box_x = center_x -| (box_width / 2);
+    const box_y = center_y -| (box_height / 2);
+
+    const fg: render.Color = .{ .palette = cfg.fg };
+    const bg: render.Color = .{ .palette = cfg.bg };
+    const padding_x = cfg.padding_x;
+    const padding_y = cfg.padding_y;
+
+    // Inner content area (excluding border)
+    const inner_width = box_width - 2;
+    const inner_x = box_x + 1;
+
+    // Draw box background (fill entire box including border area)
+    var y: u16 = box_y;
+    while (y < box_y + box_height) : (y += 1) {
+        var x: u16 = box_x;
+        while (x < box_x + box_width) : (x += 1) {
+            renderer.setCell(x, y, .{ .char = ' ', .fg = fg, .bg = bg });
+        }
+    }
+
+    // Draw border on top of background
+    // Top border
+    renderer.setCell(box_x, box_y, .{ .char = '┌', .fg = fg, .bg = bg });
+    var x: u16 = box_x + 1;
+    while (x < box_x + box_width - 1) : (x += 1) {
+        renderer.setCell(x, box_y, .{ .char = '─', .fg = fg, .bg = bg });
+    }
+    renderer.setCell(box_x + box_width - 1, box_y, .{ .char = '┐', .fg = fg, .bg = bg });
+
+    // Bottom border
+    renderer.setCell(box_x, box_y + box_height - 1, .{ .char = '└', .fg = fg, .bg = bg });
+    x = box_x + 1;
+    while (x < box_x + box_width - 1) : (x += 1) {
+        renderer.setCell(x, box_y + box_height - 1, .{ .char = '─', .fg = fg, .bg = bg });
+    }
+    renderer.setCell(box_x + box_width - 1, box_y + box_height - 1, .{ .char = '┘', .fg = fg, .bg = bg });
+
+    // Side borders
+    y = box_y + 1;
+    while (y < box_y + box_height - 1) : (y += 1) {
+        renderer.setCell(box_x, y, .{ .char = '│', .fg = fg, .bg = bg });
+        renderer.setCell(box_x + box_width - 1, y, .{ .char = '│', .fg = fg, .bg = bg });
+    }
+
+    // Draw message (centered in inner area)
+    const msg_y = box_y + 1 + padding_y;
+    const msg = confirm.message;
+    const msg_len: u16 = @intCast(@min(msg.len, inner_width - padding_x * 2));
+    const msg_x = inner_x + padding_x + (inner_width - padding_x * 2 -| msg_len) / 2;
+    for (msg[0..msg_len], 0..) |char, i| {
+        const cx = msg_x + @as(u16, @intCast(i));
+        if (cx < box_x + box_width - 1) {
+            renderer.setCell(cx, msg_y, .{ .char = char, .fg = fg, .bg = bg, .bold = cfg.bold });
+        }
+    }
+
+    // Draw buttons (centered, 2 lines below message)
+    const buttons_y = msg_y + 2;
+    const yes_label = confirm.yes_label;
+    const no_label = confirm.no_label;
+
+    // Button format: "[ Yes ]    [ No ]"
+    const yes_text_len: u16 = @intCast(yes_label.len + 4); // "[ Yes ]"
+    const no_text_len: u16 = @intCast(no_label.len + 4); // "[ No ]"
+    const total_buttons_width = yes_text_len + 4 + no_text_len; // 4 spaces between
+    const buttons_start_x = inner_x + (inner_width -| total_buttons_width) / 2;
+
+    // Draw Yes button
+    const yes_selected = confirm.selected == .yes;
+    const yes_fg: render.Color = if (yes_selected) bg else fg;
+    const yes_bg: render.Color = if (yes_selected) fg else bg;
+    var bx = buttons_start_x;
+    renderer.setCell(bx, buttons_y, .{ .char = '[', .fg = yes_fg, .bg = yes_bg });
+    bx += 1;
+    renderer.setCell(bx, buttons_y, .{ .char = ' ', .fg = yes_fg, .bg = yes_bg });
+    bx += 1;
+    for (yes_label) |char| {
+        renderer.setCell(bx, buttons_y, .{ .char = char, .fg = yes_fg, .bg = yes_bg, .bold = yes_selected });
+        bx += 1;
+    }
+    renderer.setCell(bx, buttons_y, .{ .char = ' ', .fg = yes_fg, .bg = yes_bg });
+    bx += 1;
+    renderer.setCell(bx, buttons_y, .{ .char = ']', .fg = yes_fg, .bg = yes_bg });
+    bx += 1;
+
+    // Spacing between buttons
+    bx += 4;
+
+    // Draw No button
+    const no_selected = confirm.selected == .no;
+    const no_fg: render.Color = if (no_selected) bg else fg;
+    const no_bg: render.Color = if (no_selected) fg else bg;
+    renderer.setCell(bx, buttons_y, .{ .char = '[', .fg = no_fg, .bg = no_bg });
+    bx += 1;
+    renderer.setCell(bx, buttons_y, .{ .char = ' ', .fg = no_fg, .bg = no_bg });
+    bx += 1;
+    for (no_label) |char| {
+        renderer.setCell(bx, buttons_y, .{ .char = char, .fg = no_fg, .bg = no_bg, .bold = no_selected });
+        bx += 1;
+    }
+    renderer.setCell(bx, buttons_y, .{ .char = ' ', .fg = no_fg, .bg = no_bg });
+    bx += 1;
+    renderer.setCell(bx, buttons_y, .{ .char = ']', .fg = no_fg, .bg = no_bg });
+}
+
+fn drawPickerPopup(state: *State, renderer: *Renderer, picker: *pop.Picker, cfg: pop.ChooseStyle) void {
+    const dims = picker.getBoxDimensions();
+
+    // Ensure minimum width
+    const min_width: u16 = 20;
+    const box_width = @max(dims.width, min_width);
+    const box_height = dims.height + 2; // +2 for border
+
+    // Center on screen
+    const center_x = state.term_width / 2;
+    const center_y = state.term_height / 2;
+    const box_x = center_x -| (box_width / 2);
+    const box_y = center_y -| (box_height / 2);
+
+    const fg: render.Color = .{ .palette = cfg.fg };
+    const bg: render.Color = .{ .palette = cfg.bg };
+    const highlight_fg: render.Color = .{ .palette = cfg.highlight_fg };
+    const highlight_bg: render.Color = .{ .palette = cfg.highlight_bg };
+
+    // Draw box background
+    var y: u16 = box_y;
+    while (y < box_y + box_height) : (y += 1) {
+        var x: u16 = box_x;
+        while (x < box_x + box_width) : (x += 1) {
+            renderer.setCell(x, y, .{ .char = ' ', .fg = fg, .bg = bg });
+        }
+    }
+
+    // Draw border with optional title
+    // Top border
+    renderer.setCell(box_x, box_y, .{ .char = '┌', .fg = fg, .bg = bg });
+    var x: u16 = box_x + 1;
+    if (picker.title) |title| {
+        // Draw title in border
+        renderer.setCell(x, box_y, .{ .char = '─', .fg = fg, .bg = bg });
+        x += 1;
+        renderer.setCell(x, box_y, .{ .char = ' ', .fg = fg, .bg = bg });
+        x += 1;
+        for (title) |char| {
+            if (x < box_x + box_width - 2) {
+                renderer.setCell(x, box_y, .{ .char = char, .fg = fg, .bg = bg, .bold = true });
+                x += 1;
+            }
+        }
+        renderer.setCell(x, box_y, .{ .char = ' ', .fg = fg, .bg = bg });
+        x += 1;
+    }
+    while (x < box_x + box_width - 1) : (x += 1) {
+        renderer.setCell(x, box_y, .{ .char = '─', .fg = fg, .bg = bg });
+    }
+    renderer.setCell(box_x + box_width - 1, box_y, .{ .char = '┐', .fg = fg, .bg = bg });
+
+    // Bottom border
+    renderer.setCell(box_x, box_y + box_height - 1, .{ .char = '└', .fg = fg, .bg = bg });
+    x = box_x + 1;
+    while (x < box_x + box_width - 1) : (x += 1) {
+        renderer.setCell(x, box_y + box_height - 1, .{ .char = '─', .fg = fg, .bg = bg });
+    }
+    renderer.setCell(box_x + box_width - 1, box_y + box_height - 1, .{ .char = '┘', .fg = fg, .bg = bg });
+
+    // Side borders
+    y = box_y + 1;
+    while (y < box_y + box_height - 1) : (y += 1) {
+        renderer.setCell(box_x, y, .{ .char = '│', .fg = fg, .bg = bg });
+        renderer.setCell(box_x + box_width - 1, y, .{ .char = '│', .fg = fg, .bg = bg });
+    }
+
+    // Draw items
+    const content_x = box_x + 2;
+    var content_y = box_y + 1;
+    const visible_end = @min(picker.scroll_offset + picker.visible_count, picker.items.len);
+
+    var i = picker.scroll_offset;
+    while (i < visible_end) : (i += 1) {
+        const item = picker.items[i];
+        const is_selected = i == picker.selected;
+        const item_fg: render.Color = if (is_selected) highlight_fg else fg;
+        const item_bg: render.Color = if (is_selected) highlight_bg else bg;
+
+        // Draw selection indicator
+        renderer.setCell(content_x, content_y, .{ .char = if (is_selected) '>' else ' ', .fg = item_fg, .bg = item_bg });
+        renderer.setCell(content_x + 1, content_y, .{ .char = ' ', .fg = item_fg, .bg = item_bg });
+
+        // Draw item text
+        var ix: u16 = content_x + 2;
+        for (item) |char| {
+            if (ix < box_x + box_width - 2) {
+                renderer.setCell(ix, content_y, .{ .char = char, .fg = item_fg, .bg = item_bg, .bold = is_selected });
+                ix += 1;
+            }
+        }
+        // Fill rest of line with background
+        while (ix < box_x + box_width - 1) : (ix += 1) {
+            renderer.setCell(ix, content_y, .{ .char = ' ', .fg = item_fg, .bg = item_bg });
+        }
+
+        content_y += 1;
+    }
 }
 
 fn drawSplitBorders(state: *State, renderer: *Renderer) void {

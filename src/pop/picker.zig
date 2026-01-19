@@ -78,34 +78,27 @@ pub const Picker = struct {
     }
 
     /// Handle keyboard input
+    /// Up/Down arrows (mapped to k/j), Enter to select, ESC to cancel
     pub fn handleInput(self: *Picker, key: u8) InputResult {
         switch (key) {
-            'j', 'J' => {
+            'j', 'J' => { // Down
                 self.moveDown();
                 return .consumed;
             },
-            'k', 'K' => {
+            'k', 'K' => { // Up
                 self.moveUp();
                 return .consumed;
             },
-            'g' => {
-                self.moveToTop();
-                return .consumed;
-            },
-            'G' => {
-                self.moveToBottom();
-                return .consumed;
-            },
-            '\r' => { // Enter selects
+            '\r', ' ' => { // Enter or Space selects
                 self.result = self.selected;
                 return .dismissed;
             },
-            27, 'q' => { // ESC or q cancels
+            27 => { // ESC cancels
                 self.cancelled = true;
                 self.result = null;
                 return .dismissed;
             },
-            else => return .pass_through,
+            else => return .consumed, // Consume all other input when popup is active
         }
     }
 

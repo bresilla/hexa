@@ -59,27 +59,30 @@ pub const Confirm = struct {
     }
 
     /// Handle keyboard input
+    /// Left/Right arrows, Enter to confirm, ESC to cancel
     pub fn handleInput(self: *Confirm, key: u8) InputResult {
         switch (key) {
-            'y', 'Y' => {
-                self.selected = .yes;
-                self.result = true;
-                return .dismissed;
-            },
-            'n', 'N', 27 => { // 27 = ESC
+            27 => { // ESC - cancel
                 self.selected = .no;
                 self.result = false;
                 return .dismissed;
-            },
-            'h', 'l', '\t' => {
-                self.toggle();
-                return .consumed;
             },
             '\r' => { // Enter confirms current selection
                 self.result = self.selected == .yes;
                 return .dismissed;
             },
-            else => return .pass_through,
+            // For arrow keys, we receive escape sequences like \x1b[D (left) \x1b[C (right)
+            // But since we only get one byte at a time, we need to handle this differently
+            // Use simple h/l for now, or we can check for specific bytes
+            'h', 'H' => { // Left - select No
+                self.selected = .no;
+                return .consumed;
+            },
+            'l', 'L' => { // Right - select Yes
+                self.selected = .yes;
+                return .consumed;
+            },
+            else => return .consumed, // Consume all other input when popup is active
         }
     }
 
@@ -98,16 +101,16 @@ pub const Confirm = struct {
         return true;
     }
 
-    /// Calculate required box dimensions
+    /// Calculate required box dimensions (including border)
     pub fn getBoxDimensions(self: *Confirm) struct { width: u16, height: u16 } {
         const s = self.style;
-        // Box width: max of message width and buttons width + padding
+        // Box width: max of message width and buttons width + padding + border
         const msg_width: u16 = @intCast(self.message.len);
-        // Buttons: [ Yes ]    [*No*]
-        const buttons_width: u16 = @intCast(self.yes_label.len + self.no_label.len + 14); // brackets, spaces, stars
+        // Buttons: [ Yes ]    [ No ] with 4 spaces between
+        const buttons_width: u16 = @intCast(self.yes_label.len + self.no_label.len + 14); // "[ " + " ]" x2 + 4 spaces
         const content_width = @max(msg_width, buttons_width);
-        const box_width = content_width + s.padding_x * 2;
-        const box_height: u16 = 3 + s.padding_y * 2; // message line + blank + buttons line
+        const box_width = content_width + s.padding_x * 2 + 2; // +2 for left/right border
+        const box_height: u16 = 3 + s.padding_y * 2 + 2; // message + blank + buttons + padding + top/bottom border
         return .{ .width = box_width, .height = box_height };
     }
 };
