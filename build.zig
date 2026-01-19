@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     })) |ghostty_dep| ghostty_dep.module("ghostty-vt") else null;
 
+    // Get argonaut module from dependency
+    const argonaut_mod = if (b.lazyDependency("argonaut", .{
+        .target = target,
+        .optimize = optimize,
+    })) |argonaut_dep| argonaut_dep.module("argonaut") else null;
+
     // Create core module
     const core_module = b.createModule(.{
         .root_source_file = b.path("src/core/mod.zig"),
@@ -97,4 +103,30 @@ pub fn build(b: *std.Build) void {
     }
     const run_ses_step = b.step("ses", "Run hexa-ses");
     run_ses_step.dependOn(&run_ses.step);
+
+    // Build unified hexa CLI executable
+    const cli_root = b.createModule(.{
+        .root_source_file = b.path("src/cli/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cli_root.addImport("core", core_module);
+    if (argonaut_mod) |arg| {
+        cli_root.addImport("argonaut", arg);
+    }
+    const cli_exe = b.addExecutable(.{
+        .name = "hexa",
+        .root_module = cli_root,
+    });
+    b.installArtifact(cli_exe);
+
+    // Run hexa step
+    const run_cli = b.addRunArtifact(cli_exe);
+    run_cli.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cli.addArgs(args);
+    }
+    const run_cli_step = b.step("cli", "Run hexa CLI");
+    run_cli_step.dependOn(&run_cli.step);
 }
