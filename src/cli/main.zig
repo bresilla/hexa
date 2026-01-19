@@ -552,17 +552,18 @@ fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []const 
         for (tabs.items, 0..) |tab_val, ti| {
             const tab = tab_val.object;
             const name = if (tab.get("name")) |n| n.string else "tab";
+            const tab_uuid = if (tab.get("uuid")) |u| u.string else "?";
             const marker = if (ti == active) "*" else " ";
-            print("{s}{s} Tab: {s}\n", .{ indent, marker, name });
+            print("{s}{s} Tab: {s} [{s}]\n", .{ indent, marker, name, tab_uuid[0..@min(8, tab_uuid.len)] });
 
-            if (tab.get("panes")) |panes_val| {
-                for (panes_val.array.items) |pane_val| {
-                    const pane = pane_val.object;
-                    const uuid = if (pane.get("uuid")) |u| u.string else "?";
-                    const pid = if (pane.get("id")) |id| @as(i64, id.integer) else 0;
-                    const focused = if (pane.get("focused")) |f| f.bool else false;
+            if (tab.get("splits")) |splits_val| {
+                for (splits_val.array.items) |split_val| {
+                    const split = split_val.object;
+                    const uuid = if (split.get("uuid")) |u| u.string else "?";
+                    const pid = if (split.get("id")) |id| @as(i64, id.integer) else 0;
+                    const focused = if (split.get("focused")) |f| f.bool else false;
                     const fm = if (focused) ">" else " ";
-                    print("{s}  {s} Pane {d} [{s}]\n", .{ indent, fm, pid, uuid[0..@min(8, uuid.len)] });
+                    print("{s}  {s} Split {d} [{s}]\n", .{ indent, fm, pid, uuid[0..@min(8, uuid.len)] });
                 }
             }
 

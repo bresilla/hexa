@@ -21,15 +21,17 @@ const c = @cImport({
     @cInclude("stdlib.h");
 });
 
-/// A tab contains a layout with panes
+/// A tab contains a layout with splits (splits)
 const Tab = struct {
     layout: Layout,
     name: []const u8,
+    uuid: [32]u8,
 
     fn init(allocator: std.mem.Allocator, width: u16, height: u16, name: []const u8) Tab {
         return .{
             .layout = Layout.init(allocator, width, height),
             .name = name,
+            .uuid = core.ipc.generateUuid(),
         };
     }
 
@@ -43,7 +45,7 @@ const State = struct {
     config: core.Config,
     tabs: std.ArrayList(Tab),
     active_tab: usize,
-    floating_panes: std.ArrayList(*Pane),
+    floats: std.ArrayList(*Pane),
     active_floating: ?usize,
     running: bool,
     detach_mode: bool,
@@ -65,7 +67,7 @@ const State = struct {
 
     fn init(allocator: std.mem.Allocator, width: u16, height: u16) !State {
         const cfg = core.Config.load(allocator);
-        const status_h: u16 = if (cfg.panes.status.enabled) 1 else 0;
+        const status_h: u16 = if (cfg.tabs.status.enabled) 1 else 0;
         const layout_h = height - status_h;
 
         // Generate UUID and session name for this mux instance
@@ -84,7 +86,7 @@ const State = struct {
             .config = cfg,
             .tabs = .empty,
             .active_tab = 0,
-            .floating_panes = .empty,
+            .floats = .empty,
             .active_floating = null,
             .running = true,
             .detach_mode = false,
@@ -107,8 +109,8 @@ const State = struct {
     }
 
     fn deinit(self: *State) void {
-        // Deinit floating panes
-        for (self.floating_panes.items) |pane| {
+        // Deinit floats
+        for (self.floats.items) |pane| {
             // In detach mode, panes are already handled by ses - don't kill
             // Otherwise: sticky floats become sticky in ses, non-sticky get killed
             if (!self.detach_mode and self.ses_client.isConnected()) {
@@ -122,12 +124,12 @@ const State = struct {
             pane.deinit();
             self.allocator.destroy(pane);
         }
-        self.floating_panes.deinit(self.allocator);
+        self.floats.deinit(self.allocator);
 
         // Deinit all tabs - kill panes in ses if not detaching
         for (self.tabs.items) |*tab| {
             if (!self.detach_mode and self.ses_client.isConnected()) {
-                var pane_it = tab.layout.panes.valueIterator();
+                var pane_it = tab.layout.splits.valueIterator();
                 while (pane_it.next()) |pane_ptr| {
                     self.ses_client.killPane(pane_ptr.*.uuid) catch {};
                 }
@@ -193,15 +195,15 @@ const State = struct {
 
         // Handle tab-bound floats belonging to this tab
         var i: usize = 0;
-        while (i < self.floating_panes.items.len) {
-            const fp = self.floating_panes.items[i];
+        while (i < self.floats.items.len) {
+            const fp = self.floats.items[i];
             if (fp.parent_tab) |parent| {
                 if (parent == closing_tab) {
                     // Kill this tab-bound float
                     self.ses_client.killPane(fp.uuid) catch {};
                     fp.deinit();
                     self.allocator.destroy(fp);
-                    _ = self.floating_panes.orderedRemove(i);
+                    _ = self.floats.orderedRemove(i);
                     // Clear active_floating if it was this float
                     if (self.active_floating) |afi| {
                         if (afi == i) {
@@ -262,7 +264,7 @@ const State = struct {
 
         // Get the current focused pane and replace it
         if (self.active_floating) |idx| {
-            const old_pane = self.floating_panes.items[idx];
+            const old_pane = self.floats.items[idx];
             // Replace with adopted pane
             old_pane.replaceWithFd(result.fd, result.pid, result.uuid) catch return false;
         } else if (self.currentLayout().getFocusedPane()) |pane| {
@@ -301,9 +303,10 @@ const State = struct {
         for (self.tabs.items, 0..) |*tab, ti| {
             if (ti > 0) try writer.writeAll(",");
             try writer.writeAll("{");
+            try writer.print("\"uuid\":\"{s}\",", .{tab.uuid});
             try writer.print("\"name\":\"{s}\",", .{tab.name});
-            try writer.print("\"focused_pane_id\":{d},", .{tab.layout.focused_pane_id});
-            try writer.print("\"next_pane_id\":{d},", .{tab.layout.next_pane_id});
+            try writer.print("\"focused_split_id\":{d},", .{tab.layout.focused_split_id});
+            try writer.print("\"next_split_id\":{d},", .{tab.layout.next_split_id});
 
             // Layout tree
             try writer.writeAll("\"tree\":");
@@ -313,14 +316,14 @@ const State = struct {
                 try writer.writeAll("null");
             }
 
-            // Panes in this tab
-            try writer.writeAll(",\"panes\":[");
-            var first_pane = true;
-            var pit = tab.layout.panes.iterator();
+            // Splits in this tab
+            try writer.writeAll(",\"splits\":[");
+            var first_split = true;
+            var pit = tab.layout.splits.iterator();
             while (pit.next()) |entry| {
                 const pane = entry.value_ptr.*;
-                if (!first_pane) try writer.writeAll(",");
-                first_pane = false;
+                if (!first_split) try writer.writeAll(",");
+                first_split = false;
                 try self.serializePane(writer, pane);
             }
             try writer.writeAll("]");
@@ -329,9 +332,9 @@ const State = struct {
         }
         try writer.writeAll("],");
 
-        // Floating panes
+        // Floats
         try writer.writeAll("\"floats\":[");
-        for (self.floating_panes.items, 0..) |pane, fi| {
+        for (self.floats.items, 0..) |pane, fi| {
             if (fi > 0) try writer.writeAll(",");
             try self.serializePane(writer, pane);
         }
@@ -450,22 +453,31 @@ const State = struct {
             for (tabs_arr.array.items) |tab_val| {
                 const tab_obj = tab_val.object;
                 const name_json = (tab_obj.get("name") orelse continue).string;
-                const focused_pane_id: u16 = @intCast((tab_obj.get("focused_pane_id") orelse continue).integer);
-                const next_pane_id: u16 = @intCast((tab_obj.get("next_pane_id") orelse continue).integer);
+                const focused_split_id: u16 = @intCast((tab_obj.get("focused_split_id") orelse continue).integer);
+                const next_split_id: u16 = @intCast((tab_obj.get("next_split_id") orelse continue).integer);
 
                 // Dupe the name since parsed JSON will be freed
                 const name = self.allocator.dupe(u8, name_json) catch continue;
                 var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, name);
+
+                // Restore tab UUID if present
+                if (tab_obj.get("uuid")) |uuid_val| {
+                    const uuid_str = uuid_val.string;
+                    if (uuid_str.len == 32) {
+                        @memcpy(&tab.uuid, uuid_str[0..32]);
+                    }
+                }
+
                 if (self.ses_client.isConnected()) {
                     tab.layout.setSesClient(&self.ses_client);
                 }
                 tab.layout.setPaneNotificationConfig(&self.config.notifications.pane);
-                tab.layout.focused_pane_id = focused_pane_id;
-                tab.layout.next_pane_id = next_pane_id;
+                tab.layout.focused_split_id = focused_split_id;
+                tab.layout.next_split_id = next_split_id;
 
-                // Restore panes
-                if (tab_obj.get("panes")) |panes_arr| {
-                    for (panes_arr.array.items) |pane_val| {
+                // Restore splits
+                if (tab_obj.get("splits")) |splits_arr| {
+                    for (splits_arr.array.items) |pane_val| {
                         const pane_obj = pane_val.object;
                         const pane_id: u16 = @intCast((pane_obj.get("id") orelse continue).integer);
                         const uuid_str = (pane_obj.get("uuid") orelse continue).string;
@@ -487,7 +499,7 @@ const State = struct {
                             // Restore pane properties
                             pane.focused = if (pane_obj.get("focused")) |f| (f == .bool and f.bool) else false;
 
-                            tab.layout.panes.put(pane_id, pane) catch {
+                            tab.layout.splits.put(pane_id, pane) catch {
                                 pane.deinit();
                                 self.allocator.destroy(pane);
                                 continue;
@@ -507,7 +519,7 @@ const State = struct {
             }
         }
 
-        // Restore floating panes
+        // Restore floats
         if (root.get("floats")) |floats_arr| {
             for (floats_arr.array.items) |pane_val| {
                 const pane_obj = pane_val.object;
@@ -545,7 +557,7 @@ const State = struct {
                     // Configure pane notifications
                     pane.configureNotifications(&self.config.notifications.pane);
 
-                    self.floating_panes.append(self.allocator, pane) catch {
+                    self.floats.append(self.allocator, pane) catch {
                         pane.deinit();
                         self.allocator.destroy(pane);
                         continue;
@@ -610,10 +622,10 @@ const State = struct {
         if (!self.ses_client.isConnected()) return false;
 
         // Get list of orphaned panes and find matching UUID
-        var panes: [32]OrphanedPaneInfo = undefined;
-        const count = self.ses_client.listOrphanedPanes(&panes) catch return false;
+        var tabs: [32]OrphanedPaneInfo = undefined;
+        const count = self.ses_client.listOrphanedPanes(&tabs) catch return false;
 
-        for (panes[0..count]) |p| {
+        for (tabs[0..count]) |p| {
             if (std.mem.startsWith(u8, &p.uuid, uuid_prefix)) {
                 // Found matching pane, adopt it
                 const result = self.ses_client.adoptPane(p.uuid) catch return false;
@@ -635,7 +647,7 @@ const State = struct {
                 pane.configureNotifications(&self.config.notifications.pane);
 
                 // Add pane to layout manually
-                tab.layout.panes.put(0, pane) catch {
+                tab.layout.splits.put(0, pane) catch {
                     pane.deinit();
                     self.allocator.destroy(pane);
                     return false;
@@ -643,7 +655,7 @@ const State = struct {
                 const node = self.allocator.create(LayoutNode) catch return false;
                 node.* = .{ .pane = 0 };
                 tab.layout.root = node;
-                tab.layout.next_pane_id = 1;
+                tab.layout.next_split_id = 1;
 
                 self.tabs.append(self.allocator, tab) catch return false;
                 self.active_tab = self.tabs.items.len - 1;
@@ -668,8 +680,8 @@ const State = struct {
     /// Get UUID of currently focused pane (in layout or floating)
     fn getCurrentFocusedUuid(self: *State) ?[32]u8 {
         if (self.active_floating) |idx| {
-            if (idx < self.floating_panes.items.len) {
-                return self.floating_panes.items[idx].uuid;
+            if (idx < self.floats.items.len) {
+                return self.floats.items[idx].uuid;
             }
         }
         // Guard against no tabs existing yet
@@ -709,9 +721,9 @@ const State = struct {
     fn unfocusAllPanes(self: *State) void {
         if (!self.ses_client.isConnected()) return;
 
-        // Unfocus all tiled panes in all tabs
+        // Unfocus all splits in all tabs
         for (self.tabs.items) |*tab| {
-            var pane_it = tab.layout.paneIterator();
+            var pane_it = tab.layout.splitIterator();
             while (pane_it.next()) |p| {
                 if (p.*.uuid[0] != 0) {
                     p.*.focused = false;
@@ -721,8 +733,8 @@ const State = struct {
             }
         }
 
-        // Unfocus all floating panes
-        for (self.floating_panes.items) |fp| {
+        // Unfocus all floats
+        for (self.floats.items) |fp| {
             if (fp.uuid[0] != 0) {
                 fp.focused = false;
                 self.ses_client.updatePaneAux(fp.uuid, fp.floating, false, .float, null, null) catch {};
@@ -811,16 +823,16 @@ pub fn run(mux_args: MuxArgs) !void {
             std.debug.print("Detached sessions:\n", .{});
             for (sessions[0..sess_count]) |s| {
                 const name = s.session_name[0..s.session_name_len];
-                std.debug.print("  {s} [{s}] {d} panes - attach with: hexa mux attach {s}\n", .{ name, s.session_id[0..8], s.pane_count, name });
+                std.debug.print("  {s} [{s}] {d} tabs - attach with: hexa mux attach {s}\n", .{ name, s.session_id[0..8], s.pane_count, name });
             }
         }
 
         // List orphaned panes
-        var panes: [32]OrphanedPaneInfo = undefined;
-        const count = ses.listOrphanedPanes(&panes) catch 0;
+        var tabs: [32]OrphanedPaneInfo = undefined;
+        const count = ses.listOrphanedPanes(&tabs) catch 0;
         if (count > 0) {
-            std.debug.print("Orphaned panes (disowned):\n", .{});
-            for (panes[0..count]) |p| {
+            std.debug.print("Orphaned tabs (disowned):\n", .{});
+            for (tabs[0..count]) |p| {
                 std.debug.print("  [{s}] pid={d}\n", .{ p.uuid[0..8], p.pid });
             }
         }
@@ -973,7 +985,7 @@ fn runMainLoop(state: *State) !void {
             if (new_size.cols != state.term_width or new_size.rows != state.term_height) {
                 state.term_width = new_size.cols;
                 state.term_height = new_size.rows;
-                const status_h: u16 = if (state.config.panes.status.enabled) 1 else 0;
+                const status_h: u16 = if (state.config.tabs.status.enabled) 1 else 0;
                 state.status_height = status_h;
                 state.layout_width = new_size.cols;
                 state.layout_height = new_size.rows - status_h;
@@ -983,7 +995,7 @@ fn runMainLoop(state: *State) !void {
                     tab.layout.resize(state.layout_width, state.layout_height);
                 }
 
-                // Resize floating panes based on their stored percentages
+                // Resize floats based on their stored percentages
                 resizeFloatingPanes(state);
 
                 // Resize renderer and force full redraw
@@ -994,15 +1006,15 @@ fn runMainLoop(state: *State) !void {
             }
         }
 
-        // Proactively check for dead floating panes before polling
+        // Proactively check for dead floats before polling
         {
             var fi: usize = 0;
-            while (fi < state.floating_panes.items.len) {
-                if (!state.floating_panes.items[fi].isAlive()) {
+            while (fi < state.floats.items.len) {
+                if (!state.floats.items[fi].isAlive()) {
                     // Check if this was the active float
                     const was_active = if (state.active_floating) |af| af == fi else false;
 
-                    const pane = state.floating_panes.orderedRemove(fi);
+                    const pane = state.floats.orderedRemove(fi);
 
                     // Kill in ses (dead panes don't need to be orphaned)
                     if (state.ses_client.isConnected()) {
@@ -1025,19 +1037,19 @@ fn runMainLoop(state: *State) !void {
             }
             // Ensure active_floating is valid
             if (state.active_floating) |af| {
-                if (af >= state.floating_panes.items.len) {
-                    state.active_floating = if (state.floating_panes.items.len > 0)
-                        state.floating_panes.items.len - 1
+                if (af >= state.floats.items.len) {
+                    state.active_floating = if (state.floats.items.len > 0)
+                        state.floats.items.len - 1
                     else
                         null;
                 }
             }
         }
 
-        // Check for dead tiled panes in current tab
+        // Check for dead splits in current tab
         {
             var any_dead = false;
-            var pane_it = state.currentLayout().paneIterator();
+            var pane_it = state.currentLayout().splitIterator();
             while (pane_it.next()) |pane| {
                 if (!pane.*.isAlive()) {
                     any_dead = true;
@@ -1045,8 +1057,8 @@ fn runMainLoop(state: *State) !void {
                 }
             }
             if (any_dead) {
-                if (state.currentLayout().paneCount() > 1) {
-                    // Multiple panes in tab - just close this one
+                if (state.currentLayout().splitCount() > 1) {
+                    // Multiple splits in tab - just close this one
                     _ = state.currentLayout().closeFocused();
                     state.needs_render = true;
                     state.syncStateToSes();
@@ -1071,7 +1083,7 @@ fn runMainLoop(state: *State) !void {
         var fd_count: usize = 1;
         poll_fds[0] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 };
 
-        var pane_it = state.currentLayout().paneIterator();
+        var pane_it = state.currentLayout().splitIterator();
         while (pane_it.next()) |pane| {
             if (fd_count < poll_fds.len) {
                 poll_fds[fd_count] = .{ .fd = pane.*.getFd(), .events = posix.POLL.IN, .revents = 0 };
@@ -1079,8 +1091,8 @@ fn runMainLoop(state: *State) !void {
             }
         }
 
-        // Add floating panes
-        for (state.floating_panes.items) |pane| {
+        // Add floats
+        for (state.floats.items) |pane| {
             if (fd_count < poll_fds.len) {
                 poll_fds[fd_count] = .{ .fd = pane.getFd(), .events = posix.POLL.IN, .revents = 0 };
                 fd_count += 1;
@@ -1146,10 +1158,10 @@ fn runMainLoop(state: *State) !void {
 
         // Handle PTY output
         var idx: usize = 1;
-        var dead_panes: std.ArrayList(u16) = .empty;
-        defer dead_panes.deinit(allocator);
+        var dead_splits: std.ArrayList(u16) = .empty;
+        defer dead_splits.deinit(allocator);
 
-        pane_it = state.currentLayout().paneIterator();
+        pane_it = state.currentLayout().splitIterator();
         while (pane_it.next()) |pane| {
             if (idx < fd_count) {
                 if (poll_fds[idx].revents & posix.POLL.IN != 0) {
@@ -1162,7 +1174,7 @@ fn runMainLoop(state: *State) !void {
                     } else |_| {}
                 }
                 if (poll_fds[idx].revents & posix.POLL.HUP != 0) {
-                    dead_panes.append(allocator, pane.*.id) catch {};
+                    dead_splits.append(allocator, pane.*.id) catch {};
                 }
                 idx += 1;
             }
@@ -1172,7 +1184,7 @@ fn runMainLoop(state: *State) !void {
         var dead_floating: std.ArrayList(usize) = .empty;
         defer dead_floating.deinit(allocator);
 
-        for (state.floating_panes.items, 0..) |pane, fi| {
+        for (state.floats.items, 0..) |pane, fi| {
             if (idx < fd_count) {
                 if (poll_fds[idx].revents & posix.POLL.IN != 0) {
                     if (pane.poll(&buffer)) |had_data| {
@@ -1190,7 +1202,7 @@ fn runMainLoop(state: *State) !void {
             }
         }
 
-        // Remove dead floating panes (in reverse order to preserve indices)
+        // Remove dead floats (in reverse order to preserve indices)
         var df_idx: usize = dead_floating.items.len;
         while (df_idx > 0) {
             df_idx -= 1;
@@ -1198,7 +1210,7 @@ fn runMainLoop(state: *State) !void {
             // Check if this was the active float before removing
             const was_active = if (state.active_floating) |af| af == fi else false;
 
-            const pane = state.floating_panes.orderedRemove(fi);
+            const pane = state.floats.orderedRemove(fi);
             pane.deinit();
             state.allocator.destroy(pane);
             state.needs_render = true;
@@ -1210,15 +1222,15 @@ fn runMainLoop(state: *State) !void {
         }
         // Ensure active_floating is still valid
         if (state.active_floating) |af| {
-            if (af >= state.floating_panes.items.len) {
+            if (af >= state.floats.items.len) {
                 state.active_floating = null;
             }
         }
 
-        // Remove dead panes
-        for (dead_panes.items) |_| {
-            if (state.currentLayout().paneCount() > 1) {
-                // Multiple panes in tab - just close this one
+        // Remove dead splits
+        for (dead_splits.items) |_| {
+            if (state.currentLayout().splitCount() > 1) {
+                // Multiple splits in tab - just close this one
                 _ = state.currentLayout().closeFocused();
                 state.needs_render = true;
             } else if (state.tabs.items.len > 1) {
@@ -1236,16 +1248,16 @@ fn runMainLoop(state: *State) !void {
             state.needs_render = true;
         }
 
-        // Update PANE realm notifications (tiled panes)
-        var notif_pane_it = state.currentLayout().paneIterator();
+        // Update PANE realm notifications (splits)
+        var notif_pane_it = state.currentLayout().splitIterator();
         while (notif_pane_it.next()) |pane| {
             if (pane.*.updateNotifications()) {
                 state.needs_render = true;
             }
         }
 
-        // Update PANE realm notifications (floating panes)
-        for (state.floating_panes.items) |pane| {
+        // Update PANE realm notifications (floats)
+        for (state.floats.items) |pane| {
             if (pane.updateNotifications()) {
                 state.needs_render = true;
             }
@@ -1295,7 +1307,7 @@ fn handleInput(state: *State, input: []const u8) void {
 
         // If pane is scrolled and user types, scroll to bottom first
         if (state.active_floating) |idx| {
-            const fpane = state.floating_panes.items[idx];
+            const fpane = state.floats.items[idx];
             // Check tab ownership for tab-bound floats
             const can_interact = if (fpane.parent_tab) |parent|
                 parent == state.active_tab
@@ -1372,9 +1384,9 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
         // Find the pane and show notification on it
         var found = false;
 
-        // Check tiled panes in all tabs
+        // Check splits in all tabs
         for (state.tabs.items) |*tab| {
-            var pane_it = tab.layout.paneIterator();
+            var pane_it = tab.layout.splitIterator();
             while (pane_it.next()) |pane| {
                 if (std.mem.eql(u8, &pane.*.uuid, &target_uuid)) {
                     pane.*.notifications.showWithOptions(
@@ -1390,9 +1402,9 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
             if (found) break;
         }
 
-        // Check floating panes if not found
+        // Check floats if not found
         if (!found) {
-            for (state.floating_panes.items) |pane| {
+            for (state.floats.items) |pane| {
                 if (std.mem.eql(u8, &pane.uuid, &target_uuid)) {
                     pane.notifications.showWithOptions(
                         msg_copy,
@@ -1480,7 +1492,7 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
 
     // Get the focused pane
     const pane = if (state.active_floating) |idx|
-        state.floating_panes.items[idx]
+        state.floats.items[idx]
     else
         state.currentLayout().getFocusedPane() orelse return null;
 
@@ -1530,9 +1542,9 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
 
         // Left click (btn 0) on release - focus pane at position
         if (btn == 0 and is_release) {
-            // Check floating panes first (they're on top)
+            // Check floats first (they're on top)
             var clicked_float: ?usize = null;
-            for (state.floating_panes.items, 0..) |fp, fi| {
+            for (state.floats.items, 0..) |fp, fi| {
                 // Skip tab-bound floats on wrong tab
                 if (fp.parent_tab) |parent| {
                     if (parent != state.active_tab) continue;
@@ -1548,18 +1560,18 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
             if (clicked_float) |fi| {
                 const old_uuid = state.getCurrentFocusedUuid();
                 state.active_floating = fi;
-                state.syncPaneFocus(state.floating_panes.items[fi], old_uuid);
+                state.syncPaneFocus(state.floats.items[fi], old_uuid);
                 state.needs_render = true;
             } else {
-                // Check tiled panes in current tab
+                // Check splits in current tab
                 const old_uuid = state.getCurrentFocusedUuid();
                 state.active_floating = null;
-                var pane_it = state.currentLayout().paneIterator();
+                var pane_it = state.currentLayout().splitIterator();
                 while (pane_it.next()) |p| {
                     if (mouse_x >= p.*.x and mouse_x < p.*.x + p.*.width and
                         mouse_y >= p.*.y and mouse_y < p.*.y + p.*.height)
                     {
-                        state.currentLayout().focused_pane_id = p.*.id;
+                        state.currentLayout().focused_split_id = p.*.id;
                         state.syncPaneFocus(p.*, old_uuid);
                         state.needs_render = true;
                         break;
@@ -1653,15 +1665,15 @@ fn handleAltKey(state: *State, key: u8) bool {
     // Disown pane - orphans current pane in ses, adopt with Alt+a
     if (key == cfg.key_disown) {
         if (state.active_floating) |idx| {
-            const pane = state.floating_panes.items[idx];
+            const pane = state.floats.items[idx];
             if (pane.pty.external_process) {
                 state.ses_client.orphanPane(pane.uuid) catch {};
                 state.notifications.show("Pane disowned (adopt with Alt+a)");
             }
-            _ = state.floating_panes.orderedRemove(idx);
+            _ = state.floats.orderedRemove(idx);
             pane.deinit();
             state.allocator.destroy(pane);
-            state.active_floating = if (state.floating_panes.items.len > 0) 0 else null;
+            state.active_floating = if (state.floats.items.len > 0) 0 else null;
         } else if (state.currentLayout().getFocusedPane()) |pane| {
             if (pane.pty.external_process) {
                 state.ses_client.orphanPane(pane.uuid) catch {};
@@ -1715,7 +1727,7 @@ fn handleAltKey(state: *State, key: u8) bool {
     }
 
     // Alt+t = new tab
-    if (key == cfg.panes.key_new) {
+    if (key == cfg.tabs.key_new) {
         state.active_floating = null;
         state.createTab() catch {};
         state.needs_render = true;
@@ -1723,11 +1735,11 @@ fn handleAltKey(state: *State, key: u8) bool {
     }
 
     // Alt+n = next tab
-    if (key == cfg.panes.key_next) {
+    if (key == cfg.tabs.key_next) {
         const old_uuid = state.getCurrentFocusedUuid();
         if (state.active_floating) |idx| {
-            if (idx < state.floating_panes.items.len) {
-                const fp = state.floating_panes.items[idx];
+            if (idx < state.floats.items.len) {
+                const fp = state.floats.items[idx];
                 // Tab-bound floats lose focus when switching tabs
                 if (fp.parent_tab != null) {
                     state.syncPaneUnfocus(fp);
@@ -1748,11 +1760,11 @@ fn handleAltKey(state: *State, key: u8) bool {
     }
 
     // Alt+p = previous tab
-    if (key == cfg.panes.key_prev) {
+    if (key == cfg.tabs.key_prev) {
         const old_uuid = state.getCurrentFocusedUuid();
         if (state.active_floating) |idx| {
-            if (idx < state.floating_panes.items.len) {
-                const fp = state.floating_panes.items[idx];
+            if (idx < state.floats.items.len) {
+                const fp = state.floats.items[idx];
                 // Tab-bound floats lose focus when switching tabs
                 if (fp.parent_tab != null) {
                     state.syncPaneUnfocus(fp);
@@ -1773,17 +1785,17 @@ fn handleAltKey(state: *State, key: u8) bool {
     }
 
     // Alt+x or Alt+w = close current tab (or quit if last tab)
-    if (key == cfg.panes.key_close or key == 'w') {
+    if (key == cfg.tabs.key_close or key == 'w') {
         if (state.active_floating) |idx| {
             const old_uuid = state.getCurrentFocusedUuid();
-            const pane = state.floating_panes.orderedRemove(idx);
+            const pane = state.floats.orderedRemove(idx);
             state.syncPaneUnfocus(pane);
             pane.deinit();
             state.allocator.destroy(pane);
             // Focus another float or fall back to tiled pane
-            if (state.floating_panes.items.len > 0) {
+            if (state.floats.items.len > 0) {
                 state.active_floating = 0;
-                state.syncPaneFocus(state.floating_panes.items[0], old_uuid);
+                state.syncPaneFocus(state.floats.items[0], old_uuid);
             } else {
                 state.active_floating = null;
                 if (state.currentLayout().getFocusedPane()) |tiled| {
@@ -1801,7 +1813,7 @@ fn handleAltKey(state: *State, key: u8) bool {
     }
 
     // Alt+d = detach whole mux - keeps all panes alive in ses for --attach
-    if (key == cfg.panes.key_detach) {
+    if (key == cfg.tabs.key_detach) {
         // Always set detach_mode to prevent killing panes on exit
         state.detach_mode = true;
 
@@ -1827,11 +1839,11 @@ fn handleAltKey(state: *State, key: u8) bool {
 
     // Alt+space - toggle floating focus (always space)
     if (key == ' ') {
-        if (state.floating_panes.items.len > 0) {
+        if (state.floats.items.len > 0) {
             const old_uuid = state.getCurrentFocusedUuid();
             if (state.active_floating) |idx| {
-                if (idx < state.floating_panes.items.len) {
-                    state.syncPaneUnfocus(state.floating_panes.items[idx]);
+                if (idx < state.floats.items.len) {
+                    state.syncPaneUnfocus(state.floats.items[idx]);
                 }
                 state.active_floating = null;
                 if (state.currentLayout().getFocusedPane()) |new_pane| {
@@ -1840,7 +1852,7 @@ fn handleAltKey(state: *State, key: u8) bool {
             } else {
                 // Find first float valid for current tab
                 var first_valid: ?usize = null;
-                for (state.floating_panes.items, 0..) |fp, fi| {
+                for (state.floats.items, 0..) |fp, fi| {
                     // Skip tab-bound floats on wrong tab
                     if (fp.parent_tab) |parent| {
                         if (parent != state.active_tab) continue;
@@ -1854,7 +1866,7 @@ fn handleAltKey(state: *State, key: u8) bool {
                         state.syncPaneUnfocus(old_pane);
                     }
                     state.active_floating = valid_idx;
-                    state.syncPaneFocus(state.floating_panes.items[valid_idx], old_uuid);
+                    state.syncPaneFocus(state.floats.items[valid_idx], old_uuid);
                 }
             }
             state.needs_render = true;
@@ -1881,7 +1893,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
     }
 
     // Find existing float by key (and directory if pwd)
-    for (state.floating_panes.items, 0..) |pane, i| {
+    for (state.floats.items, 0..) |pane, i| {
         if (pane.float_key == float_def.key) {
             // Tab-bound: skip if on wrong tab
             if (pane.parent_tab) |parent| {
@@ -1907,8 +1919,8 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
             if (pane.visible) {
                 // Unfocus current pane (tiled or another float)
                 if (state.active_floating) |afi| {
-                    if (afi < state.floating_panes.items.len) {
-                        state.syncPaneUnfocus(state.floating_panes.items[afi]);
+                    if (afi < state.floats.items.len) {
+                        state.syncPaneUnfocus(state.floats.items[afi]);
                     }
                 } else if (state.currentLayout().getFocusedPane()) |tiled| {
                     state.syncPaneUnfocus(tiled);
@@ -1917,7 +1929,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                 state.syncPaneFocus(pane, old_uuid);
                 // If alone mode, hide all other floats
                 if (float_def.alone) {
-                    for (state.floating_panes.items) |other| {
+                    for (state.floats.items) |other| {
                         if (other.float_key != float_def.key) {
                             other.visible = false;
                         }
@@ -1925,7 +1937,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                 }
                 // For pwd floats, hide other instances of same float (different dirs)
                 if (float_def.pwd) {
-                    for (state.floating_panes.items, 0..) |other, j| {
+                    for (state.floats.items, 0..) |other, j| {
                         if (j != i and other.float_key == float_def.key) {
                             other.visible = false;
                         }
@@ -1947,21 +1959,21 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
     // First unfocus current pane
     const old_uuid = state.getCurrentFocusedUuid();
     if (state.active_floating) |afi| {
-        if (afi < state.floating_panes.items.len) {
-            state.syncPaneUnfocus(state.floating_panes.items[afi]);
+        if (afi < state.floats.items.len) {
+            state.syncPaneUnfocus(state.floats.items[afi]);
         }
     } else if (state.currentLayout().getFocusedPane()) |tiled| {
         state.syncPaneUnfocus(tiled);
     }
     createNamedFloat(state, float_def, current_dir) catch {};
     // Focus the new float
-    if (state.floating_panes.items.len > 0) {
-        state.syncPaneFocus(state.floating_panes.items[state.floating_panes.items.len - 1], old_uuid);
+    if (state.floats.items.len > 0) {
+        state.syncPaneFocus(state.floats.items[state.floats.items.len - 1], old_uuid);
     }
 
     // If alone mode, hide all other floats after creation
     if (float_def.alone) {
-        for (state.floating_panes.items) |pane| {
+        for (state.floats.items) |pane| {
             if (pane.float_key != float_def.key) {
                 pane.visible = false;
             }
@@ -1969,8 +1981,8 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
     }
     // For pwd floats, hide other instances of same float (different dirs)
     if (float_def.pwd) {
-        const new_idx = state.floating_panes.items.len - 1;
-        for (state.floating_panes.items, 0..) |pane, i| {
+        const new_idx = state.floats.items.len - 1;
+        for (state.floats.items, 0..) |pane, i| {
             if (i != new_idx and pane.float_key == float_def.key) {
                 pane.visible = false;
             }
@@ -1981,7 +1993,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
 fn resizeFloatingPanes(state: *State) void {
     const avail_h = state.term_height - state.status_height;
 
-    for (state.floating_panes.items) |pane| {
+    for (state.floats.items) |pane| {
         // Recalculate outer frame size based on stored percentages
         const outer_w: u16 = state.term_width * pane.float_width_pct / 100;
         const outer_h: u16 = avail_h * pane.float_height_pct / 100;
@@ -2047,7 +2059,7 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     const content_w = outer_w -| (pad_x * 2);
     const content_h = outer_h -| (pad_y * 2);
 
-    const id: u16 = @intCast(100 + state.floating_panes.items.len);
+    const id: u16 = @intCast(100 + state.floats.items.len);
 
     // Try to create pane via ses if available
     if (state.ses_client.isConnected()) {
@@ -2100,8 +2112,8 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     // Configure pane notifications
     pane.configureNotifications(&state.config.notifications.pane);
 
-    try state.floating_panes.append(state.allocator, pane);
-    state.active_floating = state.floating_panes.items.len - 1;
+    try state.floats.append(state.allocator, pane);
+    state.active_floating = state.floats.items.len - 1;
     state.syncPaneAux(pane, parent_uuid);
     state.syncStateToSes();
 }
@@ -2112,8 +2124,8 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     // Begin a new frame
     renderer.beginFrame();
 
-    // Draw tiled panes into the cell buffer
-    var pane_it = state.currentLayout().paneIterator();
+    // Draw splits into the cell buffer
+    var pane_it = state.currentLayout().splitIterator();
     while (pane_it.next()) |pane| {
         const render_state = pane.*.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.*.x, pane.*.y, pane.*.width, pane.*.height);
@@ -2131,14 +2143,14 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         }
     }
 
-    // Draw split borders when there are multiple panes
-    if (state.currentLayout().paneCount() > 1) {
+    // Draw split borders when there are multiple splits
+    if (state.currentLayout().splitCount() > 1) {
         drawSplitBorders(state, renderer);
     }
 
-    // Draw visible floating panes (on top of tiled panes)
+    // Draw visible floats (on top of splits)
     // Draw inactive floats first, then active one last so it's on top
-    for (state.floating_panes.items, 0..) |pane, i| {
+    for (state.floats.items, 0..) |pane, i| {
         if (!pane.visible) continue;
         if (state.active_floating == i) continue; // Skip active, draw it last
         // Skip tab-bound floats on wrong tab
@@ -2163,7 +2175,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
     // Draw active float last so it's on top
     if (state.active_floating) |idx| {
-        const pane = state.floating_panes.items[idx];
+        const pane = state.floats.items[idx];
         // Check tab ownership for tab-bound floats
         const can_render = if (pane.parent_tab) |parent|
             parent == state.active_tab
@@ -2188,7 +2200,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     }
 
     // Draw status bar if enabled
-    if (state.config.panes.status.enabled) {
+    if (state.config.tabs.status.enabled) {
         drawStatusBar(state, renderer);
     }
 
@@ -2205,7 +2217,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     var cursor_visible: bool = true;
 
     if (state.active_floating) |idx| {
-        const pane = state.floating_panes.items[idx];
+        const pane = state.floats.items[idx];
         const pos = pane.getCursorPos();
         cursor_x = pos.x + 1;
         cursor_y = pos.y + 1;
@@ -2269,7 +2281,7 @@ fn drawSplitBorders(state: *State, renderer: *Renderer) void {
     var h_lines: [64]u16 = undefined;
     var h_line_count: usize = 0;
 
-    var pane_it = state.currentLayout().paneIterator();
+    var pane_it = state.currentLayout().splitIterator();
     while (pane_it.next()) |pane| {
         const right_edge = pane.*.x + pane.*.width;
         const bottom_edge = pane.*.y + pane.*.height;
@@ -2612,7 +2624,7 @@ fn runStatusModule(module: *const core.StatusModule, buf: []u8) ![]const u8 {
 fn drawStatusBar(state: *State, renderer: *Renderer) void {
     const y = state.term_height - 1;
     const width = state.term_width;
-    const cfg = &state.config.panes.status;
+    const cfg = &state.config.tabs.status;
 
     // Clear status bar
     for (0..width) |xi| {
@@ -2624,10 +2636,10 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
     defer ctx.deinit();
     ctx.terminal_width = width;
 
-    // Find the panes module to check tab_title setting
+    // Find the tabs module to check tab_title setting
     var use_basename = true; // default to basename
     for (cfg.center) |mod| {
-        if (std.mem.eql(u8, mod.name, "panes")) {
+        if (std.mem.eql(u8, mod.name, "tabs")) {
             use_basename = std.mem.eql(u8, mod.tab_title, "basename");
             break;
         }
@@ -2653,8 +2665,8 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
             tab_count += 1;
         }
     }
-    ctx.pane_names = tab_names[0..tab_count];
-    ctx.active_pane = state.active_tab;
+    ctx.tab_names = tab_names[0..tab_count];
+    ctx.active_tab = state.active_tab;
     ctx.session_name = state.session_name;
 
     // === DRAW LEFT SECTION ===
@@ -2679,10 +2691,10 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
     // === CALCULATE CENTER WIDTH ===
     var center_width: u16 = 0;
     for (cfg.center) |mod| {
-        if (std.mem.eql(u8, mod.name, "panes")) {
-            for (ctx.pane_names, 0..) |pane_name, i| {
+        if (std.mem.eql(u8, mod.name, "tabs")) {
+            for (ctx.tab_names, 0..) |tab_name, i| {
                 if (i > 0) center_width += @as(u16, @intCast(mod.separator.len));
-                center_width += 2 + @as(u16, @intCast(pane_name.len)) + 2; // arrows + space + name + space
+                center_width += 2 + @as(u16, @intCast(tab_name.len)) + 2; // arrows + space + name + space
             }
         }
     }
@@ -2692,23 +2704,23 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
     if (center_start > left_x + 2 and center_start + center_width < right_start -| 2) {
         var cx: u16 = center_start;
         for (cfg.center) |mod| {
-            if (std.mem.eql(u8, mod.name, "panes")) {
+            if (std.mem.eql(u8, mod.name, "tabs")) {
                 const active_style = pop.Style.parse(mod.active_style);
                 const inactive_style = pop.Style.parse(mod.inactive_style);
                 const sep_style = pop.Style.parse(mod.separator_style);
 
-                for (ctx.pane_names, 0..) |pane_name, i| {
+                for (ctx.tab_names, 0..) |tab_name, i| {
                     if (i > 0) {
                         cx = drawStyledText(renderer, cx, y, mod.separator, sep_style);
                     }
-                    const is_active = i == ctx.active_pane;
+                    const is_active = i == ctx.active_tab;
                     const style = if (is_active) active_style else inactive_style;
                     const arrow_fg = if (is_active) active_style.bg else inactive_style.bg;
                     const arrow_style = pop.Style{ .fg = arrow_fg };
 
                     cx = drawStyledText(renderer, cx, y, "", arrow_style);
                     cx = drawStyledText(renderer, cx, y, " ", style);
-                    cx = drawStyledText(renderer, cx, y, pane_name, style);
+                    cx = drawStyledText(renderer, cx, y, tab_name, style);
                     cx = drawStyledText(renderer, cx, y, " ", style);
                     cx = drawStyledText(renderer, cx, y, "", arrow_style);
                 }

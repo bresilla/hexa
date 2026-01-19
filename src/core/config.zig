@@ -105,8 +105,8 @@ pub const SplitsConfig = struct {
     style: ?SplitStyle = null,
 };
 
-/// Panes configuration (includes status bar)
-pub const PanesConfig = struct {
+/// Tabs configuration (includes status bar)
+pub const TabsConfig = struct {
     // Keys
     key_new: u8 = 't',
     key_next: u8 = 'n',
@@ -160,8 +160,8 @@ pub const Config = struct {
     // Splits
     splits: SplitsConfig = .{},
 
-    // Panes (includes status)
-    panes: PanesConfig = .{},
+    // Tabs (includes status)
+    tabs: TabsConfig = .{},
 
     // Notifications
     notifications: NotificationConfig = .{},
@@ -201,38 +201,38 @@ pub const Config = struct {
         }
 
         // Parse panes config
-        if (json.panes) |p| {
+        if (json.tabs) |p| {
             // Keys
             if (p.keys) |keys| {
                 if (keys.new) |k| if (k.len > 0) {
-                    config.panes.key_new = k[0];
+                    config.tabs.key_new = k[0];
                 };
                 if (keys.next) |k| if (k.len > 0) {
-                    config.panes.key_next = k[0];
+                    config.tabs.key_next = k[0];
                 };
                 if (keys.prev) |k| if (k.len > 0) {
-                    config.panes.key_prev = k[0];
+                    config.tabs.key_prev = k[0];
                 };
                 if (keys.close) |k| if (k.len > 0) {
-                    config.panes.key_close = k[0];
+                    config.tabs.key_close = k[0];
                 };
                 if (keys.detach) |k| if (k.len > 0) {
-                    config.panes.key_detach = k[0];
+                    config.tabs.key_detach = k[0];
                 };
             }
             // Status bar
             if (p.status) |s| {
                 if (s.enabled) |e| {
-                    config.panes.status.enabled = e;
+                    config.tabs.status.enabled = e;
                 }
                 if (s.left) |left_mods| {
-                    config.panes.status.left = parseStatusModules(allocator, left_mods);
+                    config.tabs.status.left = parseStatusModules(allocator, left_mods);
                 }
                 if (s.center) |center_mods| {
-                    config.panes.status.center = parseStatusModules(allocator, center_mods);
+                    config.tabs.status.center = parseStatusModules(allocator, center_mods);
                 }
                 if (s.right) |right_mods| {
-                    config.panes.status.right = parseStatusModules(allocator, right_mods);
+                    config.tabs.status.right = parseStatusModules(allocator, right_mods);
                 }
             }
         }
@@ -561,7 +561,7 @@ const JsonSplitsConfig = struct {
     style: ?JsonSplitStyle = null,
 };
 
-const JsonPanesConfig = struct {
+const JsonTabsConfig = struct {
     keys: ?struct {
         new: ?[]const u8 = null,
         next: ?[]const u8 = null,
@@ -601,7 +601,7 @@ const JsonConfig = struct {
     } = null,
     floats: ?[]const JsonFloatPane = null,
     splits: ?JsonSplitsConfig = null,
-    panes: ?JsonPanesConfig = null,
+    tabs: ?JsonTabsConfig = null,
     notifications: ?JsonNotificationConfig = null,
 };
 

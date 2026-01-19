@@ -23,13 +23,13 @@ pub const LayoutNode = union(enum) {
     };
 };
 
-/// Layout manager - handles pane arrangement via binary tree
+/// Layout manager - handles split arrangement via binary tree
 pub const Layout = struct {
     allocator: std.mem.Allocator,
     root: ?*LayoutNode,
-    panes: std.AutoHashMap(u16, *Pane),
-    next_pane_id: u16,
-    focused_pane_id: u16,
+    splits: std.AutoHashMap(u16, *Pane),
+    next_split_id: u16,
+    focused_split_id: u16,
     // Usable area (excluding status bar)
     x: u16,
     y: u16,
@@ -44,9 +44,9 @@ pub const Layout = struct {
         return .{
             .allocator = allocator,
             .root = null,
-            .panes = std.AutoHashMap(u16, *Pane).init(allocator),
-            .next_pane_id = 0,
-            .focused_pane_id = 0,
+            .splits = std.AutoHashMap(u16, *Pane).init(allocator),
+            .next_split_id = 0,
+            .focused_split_id = 0,
             .x = 0,
             .y = 0,
             .width = width,
@@ -75,12 +75,12 @@ pub const Layout = struct {
 
     pub fn deinit(self: *Layout) void {
         // Deinit all panes (don't kill in ses - caller handles that)
-        var it = self.panes.valueIterator();
+        var it = self.splits.valueIterator();
         while (it.next()) |pane_ptr| {
             pane_ptr.*.deinit();
             self.allocator.destroy(pane_ptr.*);
         }
-        self.panes.deinit();
+        self.splits.deinit();
 
         // Free layout nodes
         if (self.root) |root| {
@@ -101,8 +101,8 @@ pub const Layout = struct {
 
     /// Create the first pane
     pub fn createFirstPane(self: *Layout, cwd: ?[]const u8) !*Pane {
-        const id = self.next_pane_id;
-        self.next_pane_id += 1;
+        const id = self.next_split_id;
+        self.next_split_id += 1;
 
         const pane = try self.allocator.create(Pane);
         errdefer self.allocator.destroy(pane);
@@ -114,8 +114,8 @@ pub const Layout = struct {
                     // Fall back to local spawn
                     try pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
                     pane.focused = true;
-                    self.focused_pane_id = id;
-                    try self.panes.put(id, pane);
+                    self.focused_split_id = id;
+                    try self.splits.put(id, pane);
                     self.configurePaneNotifications(pane);
                     const node = try self.allocator.create(LayoutNode);
                     node.* = .{ .pane = id };
@@ -126,8 +126,8 @@ pub const Layout = struct {
                 // Use fd from ses
                 try pane.initWithFd(self.allocator, id, self.x, self.y, self.width, self.height, result.fd, result.pid, result.uuid);
                 pane.focused = true;
-                self.focused_pane_id = id;
-                try self.panes.put(id, pane);
+                self.focused_split_id = id;
+                try self.splits.put(id, pane);
                 self.configurePaneNotifications(pane);
                 const node = try self.allocator.create(LayoutNode);
                 node.* = .{ .pane = id };
@@ -140,9 +140,9 @@ pub const Layout = struct {
         try pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
 
         pane.focused = true;
-        self.focused_pane_id = id;
+        self.focused_split_id = id;
 
-        try self.panes.put(id, pane);
+        try self.splits.put(id, pane);
         self.configurePaneNotifications(pane);
 
         const node = try self.allocator.create(LayoutNode);
@@ -160,8 +160,8 @@ pub const Layout = struct {
         const old_id = focused.id;
 
         // Create new pane
-        const new_id = self.next_pane_id;
-        self.next_pane_id += 1;
+        const new_id = self.next_split_id;
+        self.next_split_id += 1;
 
         const new_pane = try self.allocator.create(Pane);
         errdefer self.allocator.destroy(new_pane);
@@ -189,7 +189,7 @@ pub const Layout = struct {
         }
         errdefer new_pane.deinit();
 
-        try self.panes.put(new_id, new_pane);
+        try self.splits.put(new_id, new_pane);
         self.configurePaneNotifications(new_pane);
 
         // Find and replace the node containing the focused pane
@@ -217,7 +217,7 @@ pub const Layout = struct {
         // Focus the new pane (like tmux behavior)
         focused.focused = false;
         new_pane.focused = true;
-        self.focused_pane_id = new_id;
+        self.focused_split_id = new_id;
 
         return new_pane;
     }
@@ -246,7 +246,7 @@ pub const Layout = struct {
     fn layoutNode(self: *Layout, node: *LayoutNode, x: u16, y: u16, w: u16, h: u16) void {
         switch (node.*) {
             .pane => |id| {
-                if (self.panes.get(id)) |pane| {
+                if (self.splits.get(id)) |pane| {
                     pane.resize(x, y, w, h) catch {};
                 }
             },
@@ -278,12 +278,12 @@ pub const Layout = struct {
 
     /// Get focused pane
     pub fn getFocusedPane(self: *Layout) ?*Pane {
-        return self.panes.get(self.focused_pane_id);
+        return self.splits.get(self.focused_split_id);
     }
 
     /// Focus next pane
     pub fn focusNext(self: *Layout) void {
-        if (self.panes.count() <= 1) return;
+        if (self.splits.count() <= 1) return;
 
         if (self.getFocusedPane()) |current| {
             current.focused = false;
@@ -293,7 +293,7 @@ pub const Layout = struct {
         var ids: std.ArrayList(u16) = .empty;
         defer ids.deinit(self.allocator);
 
-        var it = self.panes.keyIterator();
+        var it = self.splits.keyIterator();
         while (it.next()) |id| {
             ids.append(self.allocator, id.*) catch continue;
         }
@@ -301,9 +301,9 @@ pub const Layout = struct {
         std.mem.sort(u16, ids.items, {}, std.sort.asc(u16));
 
         for (ids.items, 0..) |id, i| {
-            if (id == self.focused_pane_id) {
+            if (id == self.focused_split_id) {
                 const next_idx = (i + 1) % ids.items.len;
-                self.focused_pane_id = ids.items[next_idx];
+                self.focused_split_id = ids.items[next_idx];
                 break;
             }
         }
@@ -315,7 +315,7 @@ pub const Layout = struct {
 
     /// Focus previous pane
     pub fn focusPrev(self: *Layout) void {
-        if (self.panes.count() <= 1) return;
+        if (self.splits.count() <= 1) return;
 
         if (self.getFocusedPane()) |current| {
             current.focused = false;
@@ -324,7 +324,7 @@ pub const Layout = struct {
         var ids: std.ArrayList(u16) = .empty;
         defer ids.deinit(self.allocator);
 
-        var it = self.panes.keyIterator();
+        var it = self.splits.keyIterator();
         while (it.next()) |id| {
             ids.append(self.allocator, id.*) catch continue;
         }
@@ -332,9 +332,9 @@ pub const Layout = struct {
         std.mem.sort(u16, ids.items, {}, std.sort.asc(u16));
 
         for (ids.items, 0..) |id, i| {
-            if (id == self.focused_pane_id) {
+            if (id == self.focused_split_id) {
                 const prev_idx = if (i == 0) ids.items.len - 1 else i - 1;
-                self.focused_pane_id = ids.items[prev_idx];
+                self.focused_split_id = ids.items[prev_idx];
                 break;
             }
         }
@@ -346,15 +346,15 @@ pub const Layout = struct {
 
     /// Close the focused pane
     pub fn closeFocused(self: *Layout) bool {
-        if (self.panes.count() <= 1) return false;
+        if (self.splits.count() <= 1) return false;
 
-        const id_to_close = self.focused_pane_id;
+        const id_to_close = self.focused_split_id;
 
         // Focus next before removing
         self.focusNext();
 
         // Remove pane
-        if (self.panes.fetchRemove(id_to_close)) |kv| {
+        if (self.splits.fetchRemove(id_to_close)) |kv| {
             // Tell ses to kill the pane
             if (self.ses_client) |ses| {
                 ses.killPane(kv.value.uuid) catch {};
@@ -415,13 +415,13 @@ pub const Layout = struct {
     }
 
     /// Get iterator over all panes
-    pub fn paneIterator(self: *Layout) std.AutoHashMap(u16, *Pane).ValueIterator {
-        return self.panes.valueIterator();
+    pub fn splitIterator(self: *Layout) std.AutoHashMap(u16, *Pane).ValueIterator {
+        return self.splits.valueIterator();
     }
 
     /// Get pane count
-    pub fn paneCount(self: *Layout) usize {
-        return self.panes.count();
+    pub fn splitCount(self: *Layout) usize {
+        return self.splits.count();
     }
 
     /// Get index of focused pane in iteration order
@@ -429,7 +429,7 @@ pub const Layout = struct {
         var ids: [16]u16 = undefined;
         var count: usize = 0;
 
-        var it = self.panes.keyIterator();
+        var it = self.splits.keyIterator();
         while (it.next()) |id| {
             if (count < 16) {
                 ids[count] = id.*;
@@ -441,7 +441,7 @@ pub const Layout = struct {
         std.mem.sort(u16, ids[0..count], {}, std.sort.asc(u16));
 
         for (ids[0..count], 0..) |id, i| {
-            if (id == self.focused_pane_id) return i;
+            if (id == self.focused_split_id) return i;
         }
 
         return 0;

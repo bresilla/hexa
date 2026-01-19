@@ -26,8 +26,8 @@ pub const Context = struct {
 
     // Mux state (for status bar mode)
     session_name: []const u8 = "",
-    pane_names: []const []const u8 = &.{},
-    active_pane: usize = 0,
+    tab_names: []const []const u8 = &.{},
+    active_tab: usize = 0,
 
     // Segment output storage
     segment_buffer: std.ArrayList(Segment) = .empty,
@@ -94,8 +94,8 @@ pub const Context = struct {
         }
 
         // Check for mux-specific segments
-        if (std.mem.eql(u8, name, "panes")) {
-            return self.renderPanes();
+        if (std.mem.eql(u8, name, "tabs")) {
+            return self.renderTabs();
         }
         if (std.mem.eql(u8, name, "session")) {
             return self.renderSession();
@@ -104,16 +104,16 @@ pub const Context = struct {
         return null;
     }
 
-    /// Render pane names for mux status bar
-    fn renderPanes(self: *Context) ?[]const Segment {
-        if (self.pane_names.len == 0) return null;
+    /// Render tab names for mux status bar
+    fn renderTabs(self: *Context) ?[]const Segment {
+        if (self.tab_names.len == 0) return null;
 
         self.segment_buffer.clearRetainingCapacity();
 
-        for (self.pane_names, 0..) |pane_name, i| {
-            const is_active = i == self.active_pane;
+        for (self.tab_names, 0..) |tab_name, i| {
+            const is_active = i == self.active_tab;
 
-            // Add separator between panes
+            // Add separator between tabs
             if (i > 0) {
                 self.segment_buffer.append(self.allocator, .{
                     .text = " | ",
@@ -121,14 +121,14 @@ pub const Context = struct {
                 }) catch return null;
             }
 
-            // Add pane name with active/inactive styling
+            // Add tab name with active/inactive styling
             const style = if (is_active)
                 Style.parse("bg:1 fg:0")
             else
                 Style.parse("bg:237 fg:250");
 
             self.segment_buffer.append(self.allocator, .{
-                .text = pane_name,
+                .text = tab_name,
                 .style = style,
             }) catch return null;
         }
