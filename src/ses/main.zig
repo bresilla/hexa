@@ -17,6 +17,7 @@ pub fn main() !void {
     var list_mode = false;
     var full_mode = false;
     var notify_message: ?[]const u8 = null;
+    var notify_uuid: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -35,15 +36,24 @@ pub fn main() !void {
                 print("Error: --notify requires a message argument\n", .{});
                 return;
             }
+        } else if (std.mem.eql(u8, arg, "--uuid") or std.mem.eql(u8, arg, "-u")) {
+            // Next arg is the UUID (mux or pane)
+            if (i + 1 < args.len) {
+                i += 1;
+                notify_uuid = args[i];
+            } else {
+                print("Error: --uuid requires a UUID argument\n", .{});
+                return;
+            }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printUsage();
             return;
         }
     }
 
-    // Notify mode - send notification to all connected muxes (use page_alloc, no fork)
+    // Notify mode - send notification to muxes/panes (use page_alloc, no fork)
     if (notify_message) |msg| {
-        try sendNotify(page_alloc, msg);
+        try sendNotify(page_alloc, msg, notify_uuid);
         return;
     }
 
@@ -112,7 +122,13 @@ fn printUsage() !void {
         \\  -l, --list         List connected muxes and their panes
         \\  -f, --full         Show full tree (use with --list)
         \\  -n, --notify MSG   Send notification to all connected muxes
+        \\  -u, --uuid UUID    Target specific mux or pane (use with --notify)
         \\  -h, --help         Show this help message
+        \\
+        \\Notification targeting:
+        \\  --notify "msg"                   Broadcast to all muxes (MUX realm)
+        \\  --notify "msg" --uuid <mux_uuid> Send to specific mux (MUX realm)
+        \\  --notify "msg" --uuid <pane_uuid> Send to specific pane (PANE realm)
         \\
         \\The ses server holds PTY file descriptors to keep processes alive
         \\when mux clients disconnect. It is automatically started by mux
@@ -121,7 +137,7 @@ fn printUsage() !void {
     , .{});
 }
 
-fn sendNotify(allocator: std.mem.Allocator, message: []const u8) !void {
+fn sendNotify(allocator: std.mem.Allocator, message: []const u8, target_uuid: ?[]const u8) !void {
     // Connect to running daemon
     const socket_path = try ipc.getSesSocketPath(allocator);
     defer allocator.free(socket_path);
@@ -137,12 +153,18 @@ fn sendNotify(allocator: std.mem.Allocator, message: []const u8) !void {
 
     var conn = client.toConnection();
 
-    // Send broadcast_notify request
+    // Send notify request (broadcast or targeted)
     var buf: [4096]u8 = undefined;
-    const request = std.fmt.bufPrint(&buf, "{{\"type\":\"broadcast_notify\",\"message\":\"{s}\"}}", .{message}) catch {
-        print("Message too long\n", .{});
-        return;
-    };
+    const request = if (target_uuid) |uuid|
+        std.fmt.bufPrint(&buf, "{{\"type\":\"targeted_notify\",\"message\":\"{s}\",\"uuid\":\"{s}\"}}", .{ message, uuid }) catch {
+            print("Message too long\n", .{});
+            return;
+        }
+    else
+        std.fmt.bufPrint(&buf, "{{\"type\":\"broadcast_notify\",\"message\":\"{s}\"}}", .{message}) catch {
+            print("Message too long\n", .{});
+            return;
+        };
     try conn.sendLine(request);
 
     // Receive response
@@ -151,6 +173,8 @@ fn sendNotify(allocator: std.mem.Allocator, message: []const u8) !void {
     if (line) |resp| {
         if (std.mem.indexOf(u8, resp, "\"ok\"") != null) {
             print("Notification sent\n", .{});
+        } else if (std.mem.indexOf(u8, resp, "\"not_found\"") != null) {
+            print("Target UUID not found\n", .{});
         } else {
             print("Failed to send notification\n", .{});
         }

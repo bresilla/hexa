@@ -97,7 +97,7 @@ const State = struct {
             .layout_height = layout_h,
             .renderer = try Renderer.init(allocator, width, height),
             .ses_client = SesClient.init(allocator, uuid, session_name, true), // keepalive=true by default
-            .notifications = NotificationManager.initWithConfig(allocator, cfg.notifications),
+            .notifications = NotificationManager.initWithConfig(allocator, cfg.notifications.mux),
             .uuid = uuid,
             .session_name = session_name,
             .session_name_owned = null,
@@ -174,6 +174,8 @@ const State = struct {
         if (self.ses_client.isConnected()) {
             tab.layout.setSesClient(&self.ses_client);
         }
+        // Set pane notification config
+        tab.layout.setPaneNotificationConfig(&self.config.notifications.pane);
         _ = try tab.layout.createFirstPane(cwd);
         try self.tabs.append(self.allocator, tab);
         self.active_tab = self.tabs.items.len - 1;
@@ -422,6 +424,7 @@ const State = struct {
                 if (self.ses_client.isConnected()) {
                     tab.layout.setSesClient(&self.ses_client);
                 }
+                tab.layout.setPaneNotificationConfig(&self.config.notifications.pane);
                 tab.layout.focused_pane_id = focused_pane_id;
                 tab.layout.next_pane_id = next_pane_id;
 
@@ -499,6 +502,9 @@ const State = struct {
                     pane.float_pad_y = if (pane_obj.get("float_pad_y")) |py| @intCast(py.integer) else 0;
                     pane.is_pwd = if (pane_obj.get("is_pwd")) |ip| (ip == .bool and ip.bool) else false;
                     pane.sticky = if (pane_obj.get("sticky")) |s| (s == .bool and s.bool) else false;
+
+                    // Configure pane notifications
+                    pane.configureNotifications(&self.config.notifications.pane);
 
                     self.floating_panes.append(self.allocator, pane) catch {
                         pane.deinit();
@@ -578,6 +584,7 @@ const State = struct {
                 if (self.ses_client.isConnected()) {
                     tab.layout.setSesClient(&self.ses_client);
                 }
+                tab.layout.setPaneNotificationConfig(&self.config.notifications.pane);
 
                 // Create pane with adopted fd
                 const pane = self.allocator.create(Pane) catch return false;
@@ -586,6 +593,7 @@ const State = struct {
                     return false;
                 };
                 pane.focused = true;
+                pane.configureNotifications(&self.config.notifications.pane);
 
                 // Add pane to layout manually
                 tab.layout.panes.put(0, pane) catch {
@@ -1044,9 +1052,24 @@ pub fn main() !void {
             }
         }
 
-        // Update notifications
+        // Update MUX realm notifications
         if (state.notifications.update()) {
             state.needs_render = true;
+        }
+
+        // Update PANE realm notifications (tiled panes)
+        var notif_pane_it = state.currentLayout().paneIterator();
+        while (notif_pane_it.next()) |pane| {
+            if (pane.*.updateNotifications()) {
+                state.needs_render = true;
+            }
+        }
+
+        // Update PANE realm notifications (floating panes)
+        for (state.floating_panes.items) |pane| {
+            if (pane.updateNotifications()) {
+                state.needs_render = true;
+            }
         }
 
         // Render with frame rate limiting (max 60fps)
@@ -1126,8 +1149,8 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
     const root = parsed.value.object;
     const msg_type = (root.get("type") orelse return).string;
 
-    if (std.mem.eql(u8, msg_type, "notify")) {
-        // Handle notification from ses
+    // Handle MUX realm notification (broadcast or targeted to this mux)
+    if (std.mem.eql(u8, msg_type, "notify") or std.mem.eql(u8, msg_type, "notification")) {
         if (root.get("message")) |msg_val| {
             const msg = msg_val.string;
             // Duplicate message since we'll free parsed
@@ -1135,12 +1158,65 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
             state.notifications.showWithOptions(
                 msg_copy,
                 state.notifications.default_duration_ms,
-                state.notifications.default_position,
                 state.notifications.default_style,
                 true,
             );
             state.needs_render = true;
         }
+    }
+    // Handle PANE realm notification (targeted to specific pane)
+    else if (std.mem.eql(u8, msg_type, "pane_notification")) {
+        const uuid_str = (root.get("uuid") orelse return).string;
+        if (uuid_str.len != 32) return;
+
+        var target_uuid: [32]u8 = undefined;
+        @memcpy(&target_uuid, uuid_str[0..32]);
+
+        const msg = (root.get("message") orelse return).string;
+        const msg_copy = state.allocator.dupe(u8, msg) catch return;
+
+        // Find the pane and show notification on it
+        var found = false;
+
+        // Check tiled panes in all tabs
+        for (state.tabs.items) |*tab| {
+            var pane_it = tab.layout.paneIterator();
+            while (pane_it.next()) |pane| {
+                if (std.mem.eql(u8, &pane.*.uuid, &target_uuid)) {
+                    pane.*.notifications.showWithOptions(
+                        msg_copy,
+                        pane.*.notifications.default_duration_ms,
+                        pane.*.notifications.default_style,
+                        true,
+                    );
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+
+        // Check floating panes if not found
+        if (!found) {
+            for (state.floating_panes.items) |pane| {
+                if (std.mem.eql(u8, &pane.uuid, &target_uuid)) {
+                    pane.notifications.showWithOptions(
+                        msg_copy,
+                        pane.notifications.default_duration_ms,
+                        pane.notifications.default_style,
+                        true,
+                    );
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if (!found) {
+            // Pane not found, free the copy
+            state.allocator.free(msg_copy);
+        }
+        state.needs_render = true;
     }
 }
 
@@ -1194,7 +1270,6 @@ fn handleIpcConnection(state: *State, buffer: []u8) void {
             state.notifications.showWithOptions(
                 msg_copy,
                 state.notifications.default_duration_ms,
-                state.notifications.default_position,
                 state.notifications.default_style,
                 true,
             );
@@ -1705,6 +1780,9 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
         pane.float_style = style;
     }
 
+    // Configure pane notifications
+    pane.configureNotifications(&state.config.notifications.pane);
+
     try state.floating_panes.append(state.allocator, pane);
     state.active_floating = state.floating_panes.items.len - 1;
     state.syncStateToSes();
@@ -1728,6 +1806,11 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         if (is_scrolled) {
             drawScrollIndicator(renderer, pane.*.x, pane.*.y, pane.*.width);
         }
+
+        // Draw pane-local notification (PANE realm - bottom of pane)
+        if (pane.*.hasActiveNotification()) {
+            pane.*.notifications.renderInBounds(renderer, pane.*.x, pane.*.y, pane.*.width, pane.*.height, false);
+        }
     }
 
     // Draw split borders when there are multiple panes
@@ -1749,6 +1832,11 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         if (pane.isScrolled()) {
             drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
         }
+
+        // Draw pane-local notification (PANE realm - bottom of pane)
+        if (pane.hasActiveNotification()) {
+            pane.notifications.renderInBounds(renderer, pane.x, pane.y, pane.width, pane.height, false);
+        }
     }
 
     // Draw active float last so it's on top
@@ -1763,6 +1851,11 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
             if (pane.isScrolled()) {
                 drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
+            }
+
+            // Draw pane-local notification (PANE realm - bottom of pane)
+            if (pane.hasActiveNotification()) {
+                pane.notifications.renderInBounds(renderer, pane.x, pane.y, pane.width, pane.height, false);
             }
         }
     }

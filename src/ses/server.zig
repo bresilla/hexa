@@ -218,6 +218,8 @@ pub const Server = struct {
             try self.handleKillPane(conn, root);
         } else if (std.mem.eql(u8, type_str, "broadcast_notify")) {
             try self.handleBroadcastNotify(conn, root);
+        } else if (std.mem.eql(u8, type_str, "targeted_notify")) {
+            try self.handleTargetedNotify(conn, root);
         } else if (std.mem.eql(u8, type_str, "detach_session")) {
             try self.handleDetachSession(conn, cid, root);
         } else if (std.mem.eql(u8, type_str, "reattach")) {
@@ -469,6 +471,77 @@ pub const Server = struct {
         var resp_buf: [64]u8 = undefined;
         const resp = std.fmt.bufPrint(&resp_buf, "{{\"type\":\"ok\",\"sent_to\":{d}}}\n", .{sent_count}) catch return;
         try conn.send(resp);
+    }
+
+    fn handleTargetedNotify(self: *Server, conn: *ipc.Connection, root: std.json.ObjectMap) !void {
+        const message = (root.get("message") orelse return self.sendError(conn, "missing_message")).string;
+        const uuid_str = (root.get("uuid") orelse return self.sendError(conn, "missing_uuid")).string;
+
+        // Try to find mux by session_id first (32 char hex)
+        var found_mux: ?*state.Client = null;
+        if (uuid_str.len == 32) {
+            var session_id: [16]u8 = undefined;
+            if (std.fmt.hexToBytes(&session_id, uuid_str)) |_| {
+                // Look for matching mux
+                for (self.ses_state.clients.items) |*client| {
+                    if (client.session_id) |sid| {
+                        if (std.mem.eql(u8, &sid, &session_id)) {
+                            found_mux = client;
+                            break;
+                        }
+                    }
+                }
+            } else |_| {}
+        }
+
+        if (found_mux) |client| {
+            // MUX realm - send notification to this mux (shows at top)
+            var msg_buf: [4096]u8 = undefined;
+            const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"notification\",\"message\":\"{s}\"}}\n", .{message}) catch {
+                return self.sendError(conn, "message_too_long");
+            };
+            var client_conn = ipc.Connection{ .fd = client.fd };
+            client_conn.send(notify_msg) catch {
+                return self.sendError(conn, "send_failed");
+            };
+            try conn.sendLine("{\"type\":\"ok\",\"realm\":\"mux\"}");
+            return;
+        }
+
+        // Not a mux UUID - check if it's a pane UUID (32 char)
+        if (uuid_str.len == 32) {
+            var pane_uuid: [32]u8 = undefined;
+            @memcpy(&pane_uuid, uuid_str[0..32]);
+
+            // Check if this pane exists
+            if (self.ses_state.panes.get(pane_uuid)) |pane| {
+                // Find the client that owns this pane
+                for (self.ses_state.clients.items) |*client| {
+                    for (client.pane_uuids.items) |client_pane_uuid| {
+                        if (std.mem.eql(u8, &client_pane_uuid, &pane_uuid)) {
+                            // PANE realm - send pane notification
+                            var msg_buf: [4096]u8 = undefined;
+                            const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ pane_uuid, message }) catch {
+                                return self.sendError(conn, "message_too_long");
+                            };
+                            var client_conn = ipc.Connection{ .fd = client.fd };
+                            client_conn.send(notify_msg) catch {
+                                return self.sendError(conn, "send_failed");
+                            };
+                            try conn.sendLine("{\"type\":\"ok\",\"realm\":\"pane\"}");
+                            return;
+                        }
+                    }
+                }
+
+                // Pane exists but not attached to any client
+                _ = pane;
+                return self.sendError(conn, "pane_not_attached");
+            }
+        }
+
+        // UUID not found
+        try conn.sendLine("{\"type\":\"not_found\"}");
     }
 
     fn handleStatus(self: *Server, conn: *ipc.Connection, root: std.json.ObjectMap) !void {

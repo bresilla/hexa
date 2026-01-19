@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const core = @import("core");
 const Pane = @import("pane.zig").Pane;
 const SesClient = @import("ses_client.zig").SesClient;
 
@@ -36,6 +37,8 @@ pub const Layout = struct {
     height: u16,
     // Optional ses client for pane creation
     ses_client: ?*SesClient,
+    // Optional pane notification config
+    pane_notification_cfg: ?*const core.NotificationStyleConfig,
 
     pub fn init(allocator: std.mem.Allocator, width: u16, height: u16) Layout {
         return .{
@@ -49,12 +52,25 @@ pub const Layout = struct {
             .width = width,
             .height = height,
             .ses_client = null,
+            .pane_notification_cfg = null,
         };
     }
 
     /// Set the ses client for pane creation
     pub fn setSesClient(self: *Layout, client: *SesClient) void {
         self.ses_client = client;
+    }
+
+    /// Set the pane notification config
+    pub fn setPaneNotificationConfig(self: *Layout, cfg: *const core.NotificationStyleConfig) void {
+        self.pane_notification_cfg = cfg;
+    }
+
+    /// Apply notification config to a pane
+    fn configurePaneNotifications(self: *Layout, pane: *Pane) void {
+        if (self.pane_notification_cfg) |cfg| {
+            pane.configureNotifications(cfg);
+        }
     }
 
     pub fn deinit(self: *Layout) void {
@@ -100,6 +116,7 @@ pub const Layout = struct {
                     pane.focused = true;
                     self.focused_pane_id = id;
                     try self.panes.put(id, pane);
+                    self.configurePaneNotifications(pane);
                     const node = try self.allocator.create(LayoutNode);
                     node.* = .{ .pane = id };
                     self.root = node;
@@ -111,6 +128,7 @@ pub const Layout = struct {
                 pane.focused = true;
                 self.focused_pane_id = id;
                 try self.panes.put(id, pane);
+                self.configurePaneNotifications(pane);
                 const node = try self.allocator.create(LayoutNode);
                 node.* = .{ .pane = id };
                 self.root = node;
@@ -125,6 +143,7 @@ pub const Layout = struct {
         self.focused_pane_id = id;
 
         try self.panes.put(id, pane);
+        self.configurePaneNotifications(pane);
 
         const node = try self.allocator.create(LayoutNode);
         node.* = .{ .pane = id };
@@ -171,6 +190,7 @@ pub const Layout = struct {
         errdefer new_pane.deinit();
 
         try self.panes.put(new_id, new_pane);
+        self.configurePaneNotifications(new_pane);
 
         // Find and replace the node containing the focused pane
         const node_to_split = self.findNode(self.root.?, old_id) orelse return null;

@@ -114,17 +114,28 @@ pub const PanesConfig = struct {
     status: StatusConfig = .{},
 };
 
-/// Notification configuration
-pub const NotificationConfig = struct {
+/// Single notification style configuration
+pub const NotificationStyleConfig = struct {
     fg: u8 = 0, // foreground color (palette index)
     bg: u8 = 3, // background color (palette index)
     bold: bool = true,
-    padding_x: u8 = 1,
-    padding_y: u8 = 0,
-    margin_x: u8 = 2,
-    margin_y: u8 = 1,
+    padding_x: u8 = 1, // horizontal padding inside box
+    padding_y: u8 = 0, // vertical padding inside box
+    offset: u8 = 1, // vertical offset (MUX: down from top, PANE: up from bottom)
+    alignment: []const u8 = "center", // horizontal alignment: left, center, right
     duration_ms: u32 = 3000,
-    position: []const u8 = "bottom_center",
+};
+
+/// Dual-realm notification configuration
+pub const NotificationConfig = struct {
+    // MUX realm - always at TOP of screen
+    mux: NotificationStyleConfig = .{
+        .offset = 1,
+    },
+    // PANE realm - always at BOTTOM of each pane
+    pane: NotificationStyleConfig = .{
+        .offset = 0,
+    },
 };
 
 pub const Config = struct {
@@ -395,17 +406,30 @@ pub const Config = struct {
             }
         }
 
-        // Parse notifications config
+        // Parse notifications config (dual-realm: mux and pane)
         if (json.notifications) |n| {
-            if (n.fg) |v| config.notifications.fg = @intCast(@min(255, @max(0, v)));
-            if (n.bg) |v| config.notifications.bg = @intCast(@min(255, @max(0, v)));
-            if (n.bold) |v| config.notifications.bold = v;
-            if (n.padding_x) |v| config.notifications.padding_x = @intCast(@min(10, @max(0, v)));
-            if (n.padding_y) |v| config.notifications.padding_y = @intCast(@min(10, @max(0, v)));
-            if (n.margin_x) |v| config.notifications.margin_x = @intCast(@min(10, @max(0, v)));
-            if (n.margin_y) |v| config.notifications.margin_y = @intCast(@min(10, @max(0, v)));
-            if (n.duration_ms) |v| config.notifications.duration_ms = @intCast(@min(60000, @max(100, v)));
-            if (n.position) |v| config.notifications.position = allocator.dupe(u8, v) catch "bottom_center";
+            // Parse mux realm config
+            if (n.mux) |m| {
+                if (m.fg) |v| config.notifications.mux.fg = @intCast(@min(255, @max(0, v)));
+                if (m.bg) |v| config.notifications.mux.bg = @intCast(@min(255, @max(0, v)));
+                if (m.bold) |v| config.notifications.mux.bold = v;
+                if (m.padding_x) |v| config.notifications.mux.padding_x = @intCast(@min(10, @max(0, v)));
+                if (m.padding_y) |v| config.notifications.mux.padding_y = @intCast(@min(10, @max(0, v)));
+                if (m.offset) |v| config.notifications.mux.offset = @intCast(@min(20, @max(0, v)));
+                if (m.duration_ms) |v| config.notifications.mux.duration_ms = @intCast(@min(60000, @max(100, v)));
+                if (m.alignment) |v| config.notifications.mux.alignment = allocator.dupe(u8, v) catch "center";
+            }
+            // Parse pane realm config
+            if (n.pane) |p| {
+                if (p.fg) |v| config.notifications.pane.fg = @intCast(@min(255, @max(0, v)));
+                if (p.bg) |v| config.notifications.pane.bg = @intCast(@min(255, @max(0, v)));
+                if (p.bold) |v| config.notifications.pane.bold = v;
+                if (p.padding_x) |v| config.notifications.pane.padding_x = @intCast(@min(10, @max(0, v)));
+                if (p.padding_y) |v| config.notifications.pane.padding_y = @intCast(@min(10, @max(0, v)));
+                if (p.offset) |v| config.notifications.pane.offset = @intCast(@min(20, @max(0, v)));
+                if (p.duration_ms) |v| config.notifications.pane.duration_ms = @intCast(@min(60000, @max(100, v)));
+                if (p.alignment) |v| config.notifications.pane.alignment = allocator.dupe(u8, v) catch "center";
+            }
         }
 
         return config;
@@ -547,16 +571,20 @@ const JsonPanesConfig = struct {
     } = null,
 };
 
-const JsonNotificationConfig = struct {
+const JsonNotificationStyleConfig = struct {
     fg: ?i64 = null,
     bg: ?i64 = null,
     bold: ?bool = null,
     padding_x: ?i64 = null,
     padding_y: ?i64 = null,
-    margin_x: ?i64 = null,
-    margin_y: ?i64 = null,
+    offset: ?i64 = null,
+    alignment: ?[]const u8 = null,
     duration_ms: ?i64 = null,
-    position: ?[]const u8 = null,
+};
+
+const JsonNotificationConfig = struct {
+    mux: ?JsonNotificationStyleConfig = null,
+    pane: ?JsonNotificationStyleConfig = null,
 };
 
 const JsonConfig = struct {

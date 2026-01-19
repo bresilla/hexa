@@ -3,15 +3,11 @@ const render = @import("render.zig");
 const Renderer = render.Renderer;
 const Color = render.Color;
 
-/// Position of the notification overlay
-pub const Position = enum {
-    top_left,
-    top_center,
-    top_right,
+/// Horizontal alignment of the notification
+pub const Align = enum {
+    left,
     center,
-    bottom_left,
-    bottom_center,
-    bottom_right,
+    right,
 };
 
 /// Style configuration for notifications
@@ -21,21 +17,22 @@ pub const Style = struct {
     bold: bool = true,
     padding_x: u16 = 1, // horizontal padding inside box
     padding_y: u16 = 0, // vertical padding inside box
-    margin_x: u16 = 2, // margin from screen edge
-    margin_y: u16 = 1, // margin from screen edge
-    border: bool = true,
-    border_char: u8 = ' ', // border character (space = solid bg)
+    offset: u16 = 1, // MUX: cells down from top, PANE: cells up from bottom
+    alignment: Align = .center, // horizontal alignment
 
     /// Create style from config
     pub fn fromConfig(cfg: anytype) Style {
+        // Parse align from string
+        const align_val: Align = if (std.mem.eql(u8, cfg.alignment, "left")) .left else if (std.mem.eql(u8, cfg.alignment, "right")) .right else .center;
+
         return .{
             .fg = .{ .palette = cfg.fg },
             .bg = .{ .palette = cfg.bg },
             .bold = cfg.bold,
             .padding_x = cfg.padding_x,
             .padding_y = cfg.padding_y,
-            .margin_x = cfg.margin_x,
-            .margin_y = cfg.margin_y,
+            .offset = cfg.offset,
+            .alignment = align_val,
         };
     }
 };
@@ -45,7 +42,6 @@ pub const Notification = struct {
     message: []const u8,
     expires_at: i64,
     owned: bool, // true if message needs to be freed
-    position: Position,
     style: Style,
 
     pub fn isExpired(self: Notification) bool {
@@ -58,7 +54,6 @@ pub const NotificationManager = struct {
     allocator: std.mem.Allocator,
     current: ?Notification,
     queue: std.ArrayList(Notification),
-    default_position: Position,
     default_style: Style,
     default_duration_ms: i64,
 
@@ -67,7 +62,6 @@ pub const NotificationManager = struct {
             .allocator = allocator,
             .current = null,
             .queue = .empty,
-            .default_position = .bottom_center,
             .default_style = .{},
             .default_duration_ms = 3000,
         };
@@ -75,20 +69,10 @@ pub const NotificationManager = struct {
 
     /// Initialize with config
     pub fn initWithConfig(allocator: std.mem.Allocator, cfg: anytype) NotificationManager {
-        // Parse position from string
-        const pos: Position = if (std.mem.eql(u8, cfg.position, "top_left")) .top_left
-            else if (std.mem.eql(u8, cfg.position, "top_center")) .top_center
-            else if (std.mem.eql(u8, cfg.position, "top_right")) .top_right
-            else if (std.mem.eql(u8, cfg.position, "center")) .center
-            else if (std.mem.eql(u8, cfg.position, "bottom_left")) .bottom_left
-            else if (std.mem.eql(u8, cfg.position, "bottom_right")) .bottom_right
-            else .bottom_center;
-
         return .{
             .allocator = allocator,
             .current = null,
             .queue = .empty,
-            .default_position = pos,
             .default_style = Style.fromConfig(cfg),
             .default_duration_ms = @intCast(cfg.duration_ms),
         };
@@ -112,12 +96,12 @@ pub const NotificationManager = struct {
 
     /// Show a notification with default settings
     pub fn show(self: *NotificationManager, message: []const u8) void {
-        self.showWithOptions(message, self.default_duration_ms, self.default_position, self.default_style, false);
+        self.showWithOptions(message, self.default_duration_ms, self.default_style, false);
     }
 
     /// Show a notification for a specific duration
     pub fn showFor(self: *NotificationManager, message: []const u8, duration_ms: i64) void {
-        self.showWithOptions(message, duration_ms, self.default_position, self.default_style, false);
+        self.showWithOptions(message, duration_ms, self.default_style, false);
     }
 
     /// Show a notification with full options
@@ -125,7 +109,6 @@ pub const NotificationManager = struct {
         self: *NotificationManager,
         message: []const u8,
         duration_ms: i64,
-        position: Position,
         style: Style,
         owned: bool,
     ) void {
@@ -133,7 +116,6 @@ pub const NotificationManager = struct {
             .message = message,
             .expires_at = std.time.milliTimestamp() + duration_ms,
             .owned = owned,
-            .position = position,
             .style = style,
         };
 
@@ -172,18 +154,46 @@ pub const NotificationManager = struct {
         return self.current != null;
     }
 
-    /// Render the notification overlay
+    /// Render the notification overlay (full screen - for MUX realm)
     pub fn render(self: *NotificationManager, renderer: *Renderer, screen_width: u16, screen_height: u16) void {
+        self.renderInBounds(renderer, 0, 0, screen_width, screen_height, true);
+    }
+
+    /// Render notification within a bounded area (for PANE realm)
+    /// bounds_x, bounds_y: top-left corner of the render area
+    /// bounds_width, bounds_height: dimensions of the render area
+    /// is_mux_realm: true for MUX (top), false for PANE (bottom)
+    pub fn renderInBounds(
+        self: *NotificationManager,
+        renderer: *Renderer,
+        bounds_x: u16,
+        bounds_y: u16,
+        bounds_width: u16,
+        bounds_height: u16,
+        is_mux_realm: bool,
+    ) void {
         const notif = self.current orelse return;
         const style = notif.style;
 
-        // Calculate box dimensions
-        const msg_len: u16 = @intCast(@min(notif.message.len, screen_width -| style.margin_x * 2 -| style.padding_x * 2));
+        // Calculate box dimensions (constrained to bounds)
+        const max_msg_len = bounds_width -| style.padding_x * 2;
+        const msg_len: u16 = @intCast(@min(notif.message.len, max_msg_len));
+        if (msg_len == 0) return;
+
         const box_width = msg_len + style.padding_x * 2;
         const box_height: u16 = 1 + style.padding_y * 2;
 
-        // Calculate position
-        const pos = self.calculatePosition(notif.position, box_width, box_height, screen_width, screen_height, style);
+        // Calculate position within bounds
+        const pos = self.calculatePositionInBounds(
+            box_width,
+            box_height,
+            bounds_x,
+            bounds_y,
+            bounds_width,
+            bounds_height,
+            style,
+            is_mux_realm,
+        );
 
         // Draw background/border box
         var yi: u16 = 0;
@@ -211,27 +221,33 @@ pub const NotificationManager = struct {
         }
     }
 
-    fn calculatePosition(
+    fn calculatePositionInBounds(
         self: *NotificationManager,
-        position: Position,
         box_width: u16,
         box_height: u16,
-        screen_width: u16,
-        screen_height: u16,
+        bounds_x: u16,
+        bounds_y: u16,
+        bounds_width: u16,
+        bounds_height: u16,
         style: Style,
+        is_mux_realm: bool,
     ) struct { x: u16, y: u16 } {
         _ = self;
-        const x: u16 = switch (position) {
-            .top_left, .bottom_left => style.margin_x,
-            .top_center, .center, .bottom_center => (screen_width -| box_width) / 2,
-            .top_right, .bottom_right => screen_width -| box_width -| style.margin_x,
+
+        // Horizontal alignment (relative to bounds) using style.alignment
+        const x: u16 = switch (style.alignment) {
+            .left => bounds_x,
+            .center => bounds_x + (bounds_width -| box_width) / 2,
+            .right => bounds_x + bounds_width -| box_width,
         };
 
-        const y: u16 = switch (position) {
-            .top_left, .top_center, .top_right => style.margin_y,
-            .center => (screen_height -| box_height) / 2,
-            .bottom_left, .bottom_center, .bottom_right => screen_height -| box_height -| style.margin_y -| 1, // -1 for status bar
-        };
+        // Vertical position using style.offset
+        // MUX realm: offset = cells DOWN from top
+        // PANE realm: offset = cells UP from bottom
+        const y: u16 = if (is_mux_realm)
+            bounds_y + style.offset
+        else
+            bounds_y + bounds_height -| box_height -| style.offset;
 
         return .{ .x = x, .y = y };
     }

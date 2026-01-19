@@ -2,6 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
 const ghostty = @import("ghostty-vt");
+const notification = @import("notification.zig");
+const NotificationManager = notification.NotificationManager;
 
 /// A Pane is a ghostty VT + PTY that can be rendered to a region of the screen
 pub const Pane = struct {
@@ -54,6 +56,10 @@ pub const Pane = struct {
     esc_tail: [3]u8 = .{ 0, 0, 0 },
     esc_tail_len: u8 = 0,
 
+    // Pane-local notifications (PANE realm - renders at bottom of pane)
+    notifications: NotificationManager = undefined,
+    notifications_initialized: bool = false,
+
     pub fn init(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16) !void {
         return self.initWithCommand(allocator, id, x, y, width, height, null);
     }
@@ -68,6 +74,10 @@ pub const Pane = struct {
 
         try self.vt.init(allocator, width, height);
         errdefer self.vt.deinit();
+
+        // Initialize pane-local notifications
+        self.notifications = NotificationManager.init(allocator);
+        self.notifications_initialized = true;
     }
 
     /// Initialize a pane with an fd received from ses daemon
@@ -94,6 +104,10 @@ pub const Pane = struct {
 
         try self.vt.init(allocator, width, height);
         errdefer self.vt.deinit();
+
+        // Initialize pane-local notifications
+        self.notifications = NotificationManager.init(allocator);
+        self.notifications_initialized = true;
     }
 
     pub fn deinit(self: *Pane) void {
@@ -102,6 +116,10 @@ pub const Pane = struct {
         // Free pwd_dir if allocated
         if (self.pwd_dir) |dir| {
             self.allocator.free(dir);
+        }
+        // Deinit pane-local notifications
+        if (self.notifications_initialized) {
+            self.notifications.deinit();
         }
     }
 
@@ -277,5 +295,43 @@ pub const Pane = struct {
     /// Check if we're scrolled (not at bottom)
     pub fn isScrolled(self: *Pane) bool {
         return !self.vt.terminal.screens.active.viewportIsBottom();
+    }
+
+    /// Show a notification on this pane
+    pub fn showNotification(self: *Pane, message: []const u8) void {
+        if (self.notifications_initialized) {
+            self.notifications.show(message);
+        }
+    }
+
+    /// Show a notification with custom duration
+    pub fn showNotificationFor(self: *Pane, message: []const u8, duration_ms: i64) void {
+        if (self.notifications_initialized) {
+            self.notifications.showFor(message, duration_ms);
+        }
+    }
+
+    /// Update notifications (call each frame)
+    pub fn updateNotifications(self: *Pane) bool {
+        if (self.notifications_initialized) {
+            return self.notifications.update();
+        }
+        return false;
+    }
+
+    /// Check if pane has active notification
+    pub fn hasActiveNotification(self: *Pane) bool {
+        if (self.notifications_initialized) {
+            return self.notifications.hasActive();
+        }
+        return false;
+    }
+
+    /// Configure notifications from config
+    pub fn configureNotifications(self: *Pane, cfg: anytype) void {
+        if (self.notifications_initialized) {
+            self.notifications.default_style = notification.Style.fromConfig(cfg);
+            self.notifications.default_duration_ms = @intCast(cfg.duration_ms);
+        }
     }
 };
