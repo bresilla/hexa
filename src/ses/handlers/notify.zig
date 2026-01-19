@@ -42,6 +42,10 @@ pub fn handleTargetedNotify(
 ) !void {
     const message = (root.get("message") orelse return sendError(conn, "missing_message")).string;
     const uuid_str = (root.get("uuid") orelse return sendError(conn, "missing_uuid")).string;
+    const timeout_ms: ?i64 = if (root.get("timeout_ms")) |v| switch (v) {
+        .integer => |i| i,
+        else => null,
+    } else null;
 
     // Try to find mux by session_id first
     var found_mux: ?*state.Client = null;
@@ -77,9 +81,14 @@ pub fn handleTargetedNotify(
     if (found_mux) |client| {
         // MUX realm - send notification to this mux (shows at top)
         var msg_buf: [4096]u8 = undefined;
-        const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"notification\",\"message\":\"{s}\"}}\n", .{message}) catch {
-            return sendError(conn, "message_too_long");
-        };
+        const notify_msg = if (timeout_ms) |t|
+            std.fmt.bufPrint(&msg_buf, "{{\"type\":\"notification\",\"message\":\"{s}\",\"timeout_ms\":{d}}}\n", .{ message, t }) catch {
+                return sendError(conn, "message_too_long");
+            }
+        else
+            std.fmt.bufPrint(&msg_buf, "{{\"type\":\"notification\",\"message\":\"{s}\"}}\n", .{message}) catch {
+                return sendError(conn, "message_too_long");
+            };
         var client_conn = ipc.Connection{ .fd = client.fd };
         client_conn.send(notify_msg) catch {
             return sendError(conn, "send_failed");
@@ -98,9 +107,14 @@ pub fn handleTargetedNotify(
                 for (client.pane_uuids.items) |client_pane_uuid| {
                     if (std.mem.eql(u8, &client_pane_uuid, &pane_uuid)) {
                         var msg_buf: [4096]u8 = undefined;
-                        const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ pane_uuid, message }) catch {
-                            return sendError(conn, "message_too_long");
-                        };
+                        const notify_msg = if (timeout_ms) |t|
+                            std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}\n", .{ pane_uuid, message, t }) catch {
+                                return sendError(conn, "message_too_long");
+                            }
+                        else
+                            std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ pane_uuid, message }) catch {
+                                return sendError(conn, "message_too_long");
+                            };
                         var client_conn = ipc.Connection{ .fd = client.fd };
                         client_conn.send(notify_msg) catch {
                             return sendError(conn, "send_failed");
@@ -121,9 +135,14 @@ pub fn handleTargetedNotify(
             for (client.pane_uuids.items) |pane_uuid| {
                 if (std.mem.startsWith(u8, &pane_uuid, uuid_str)) {
                     var msg_buf: [4096]u8 = undefined;
-                    const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ pane_uuid, message }) catch {
-                        return sendError(conn, "message_too_long");
-                    };
+                    const notify_msg = if (timeout_ms) |t|
+                        std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}\n", .{ pane_uuid, message, t }) catch {
+                            return sendError(conn, "message_too_long");
+                        }
+                    else
+                        std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ pane_uuid, message }) catch {
+                            return sendError(conn, "message_too_long");
+                        };
                     var client_conn = ipc.Connection{ .fd = client.fd };
                     client_conn.send(notify_msg) catch {
                         return sendError(conn, "send_failed");
@@ -139,9 +158,14 @@ pub fn handleTargetedNotify(
     // Tab UUIDs are typically 8-char prefixes in output
     if (uuid_str.len >= 4) {
         var msg_buf: [4096]u8 = undefined;
-        const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"tab_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ uuid_str, message }) catch {
-            return sendError(conn, "message_too_long");
-        };
+        const notify_msg = if (timeout_ms) |t|
+            std.fmt.bufPrint(&msg_buf, "{{\"type\":\"tab_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}\n", .{ uuid_str, message, t }) catch {
+                return sendError(conn, "message_too_long");
+            }
+        else
+            std.fmt.bufPrint(&msg_buf, "{{\"type\":\"tab_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ uuid_str, message }) catch {
+                return sendError(conn, "message_too_long");
+            };
 
         var sent = false;
         for (ses_state.clients.items) |*client| {

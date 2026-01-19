@@ -71,14 +71,17 @@ pub fn main() !void {
     // POP subcommands
     const pop_notify = try pop_cmd.newCommand("notify", "Show notification");
     const pop_notify_uuid = try pop_notify.string("u", "uuid", null);
+    const pop_notify_timeout = try pop_notify.int("t", "timeout", null);
     const pop_notify_msg = try pop_notify.stringPositional(null);
 
     const pop_confirm = try pop_cmd.newCommand("confirm", "Yes/No dialog");
     const pop_confirm_uuid = try pop_confirm.string("u", "uuid", null);
+    const pop_confirm_timeout = try pop_confirm.int("t", "timeout", null);
     const pop_confirm_msg = try pop_confirm.stringPositional(null);
 
     const pop_choose = try pop_cmd.newCommand("choose", "Select from options");
     const pop_choose_uuid = try pop_choose.string("u", "uuid", null);
+    const pop_choose_timeout = try pop_choose.int("t", "timeout", null);
     const pop_choose_items = try pop_choose.string("i", "items", null);
     const pop_choose_msg = try pop_choose.stringPositional(null);
 
@@ -141,11 +144,11 @@ pub fn main() !void {
         } else if (found_shp and found_init) {
             print("Usage: hexa shp init <shell>\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n", .{});
         } else if (found_pop and found_notify) {
-            print("Usage: hexa pop notify [OPTIONS] <message>\n\nShow notification\n\nOptions:\n  -u, --uuid <UUID>  Target mux/tab/pane UUID\n", .{});
+            print("Usage: hexa pop notify [OPTIONS] <message>\n\nShow notification\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Duration in milliseconds (default: 3000)\n", .{});
         } else if (found_pop and found_confirm) {
-            print("Usage: hexa pop confirm [OPTIONS] <message>\n\nYes/No dialog (blocking)\n\nOptions:\n  -u, --uuid <UUID>  Target mux/tab/pane UUID\n\nExit codes: 0=confirmed, 1=cancelled\n", .{});
+            print("Usage: hexa pop confirm [OPTIONS] <message>\n\nYes/No dialog (blocking)\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Auto-cancel after milliseconds (returns false)\n\nExit codes: 0=confirmed, 1=cancelled/timeout\n", .{});
         } else if (found_pop and found_choose) {
-            print("Usage: hexa pop choose [OPTIONS] <message>\n\nSelect from options (blocking)\n\nOptions:\n  -u, --uuid <UUID>      Target mux/tab/pane UUID\n  -i, --items <ITEMS>    Comma-separated list of options\n\nExit codes: 0=selected (index on stdout), 1=cancelled\n", .{});
+            print("Usage: hexa pop choose [OPTIONS] <message>\n\nSelect from options (blocking)\n\nOptions:\n  -u, --uuid <UUID>      Target mux/tab/pane UUID\n  -t, --timeout <MS>     Auto-cancel after milliseconds\n  -i, --items <ITEMS>    Comma-separated list of options\n\nExit codes: 0=selected (index on stdout), 1=cancelled/timeout\n", .{});
         } else if (found_pop) {
             print("Usage: hexa pop <command>\n\nPopup overlays\n\nCommands:\n  notify   Show notification\n  confirm  Yes/No dialog\n  choose   Select from options\n", .{});
         } else if (found_com) {
@@ -226,11 +229,11 @@ pub fn main() !void {
         }
     } else if (pop_cmd.happened) {
         if (pop_notify.happened) {
-            try runPopNotify(allocator, pop_notify_uuid.*, pop_notify_msg.*);
+            try runPopNotify(allocator, pop_notify_uuid.*, pop_notify_timeout.*, pop_notify_msg.*);
         } else if (pop_confirm.happened) {
-            try runPopConfirm(allocator, pop_confirm_uuid.*, pop_confirm_msg.*);
+            try runPopConfirm(allocator, pop_confirm_uuid.*, pop_confirm_timeout.*, pop_confirm_msg.*);
         } else if (pop_choose.happened) {
-            try runPopChoose(allocator, pop_choose_uuid.*, pop_choose_items.*, pop_choose_msg.*);
+            try runPopChoose(allocator, pop_choose_uuid.*, pop_choose_timeout.*, pop_choose_items.*, pop_choose_msg.*);
         }
     }
 }
@@ -309,7 +312,7 @@ fn runShpInit(shell: []const u8) !void {
 // POP handlers
 // ============================================================================
 
-fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, message: []const u8) !void {
+fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, message: []const u8) !void {
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
@@ -339,7 +342,8 @@ fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, message: []const
     }
 
     if (target_uuid) |t| {
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
+        const timeout_ms = if (timeout > 0) timeout else 3000; // Default 3 seconds
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}", .{ t, message, timeout_ms });
         try conn.sendLine(msg);
     } else {
         print("Error: --uuid required (or run inside hexa mux)\n", .{});
@@ -361,7 +365,7 @@ fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, message: []const
     }
 }
 
-fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, message: []const u8) !void {
+fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, message: []const u8) !void {
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
@@ -391,8 +395,13 @@ fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, message: []cons
     }
 
     if (target_uuid) |t| {
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_confirm\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
-        try conn.sendLine(msg);
+        if (timeout > 0) {
+            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_confirm\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}", .{ t, message, timeout });
+            try conn.sendLine(msg);
+        } else {
+            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_confirm\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
+            try conn.sendLine(msg);
+        }
     } else {
         print("Error: --uuid required (or run inside hexa mux)\n", .{});
         return;
@@ -418,14 +427,14 @@ fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, message: []cons
                         std.process.exit(0); // Confirmed
                     }
                 }
-                std.process.exit(1); // Cancelled or not confirmed
+                std.process.exit(1); // Cancelled, timeout, or not confirmed
             }
         }
     }
     std.process.exit(1);
 }
 
-fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, items: []const u8, message: []const u8) !void {
+fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, items: []const u8, message: []const u8) !void {
     if (items.len == 0) {
         print("Error: --items is required\n", .{});
         return;
@@ -475,8 +484,13 @@ fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, items: []const u
         try items_json.appendSlice(allocator, "]");
 
         const title = if (message.len > 0) message else "Select option";
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_choose\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"items\":{s}}}", .{ t, title, items_json.items });
-        try conn.sendLine(msg);
+        if (timeout > 0) {
+            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_choose\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"items\":{s},\"timeout_ms\":{d}}}", .{ t, title, items_json.items, timeout });
+            try conn.sendLine(msg);
+        } else {
+            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_choose\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"items\":{s}}}", .{ t, title, items_json.items });
+            try conn.sendLine(msg);
+        }
     } else {
         print("Error: --uuid required (or run inside hexa mux)\n", .{});
         return;
@@ -503,7 +517,7 @@ fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, items: []const u
                         std.process.exit(0);
                     }
                 }
-                std.process.exit(1); // Cancelled
+                std.process.exit(1); // Cancelled or timeout
             }
         }
     }

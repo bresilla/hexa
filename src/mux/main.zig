@@ -1323,9 +1323,28 @@ fn runMainLoop(state: *State) !void {
             state.needs_render = true;
         }
 
+        // Update MUX realm popups (check for timeout)
+        const mux_popup_changed = state.popups.update();
+        if (mux_popup_changed) {
+            state.needs_render = true;
+            // Check if a popup timed out and we need to send response
+            if (state.pending_pop_response and state.pending_pop_scope == .mux and !state.popups.isBlocked()) {
+                sendPopResponse(state);
+            }
+        }
+
         // Update TAB realm notifications (current tab only)
         if (state.tabs.items[state.active_tab].notifications.update()) {
             state.needs_render = true;
+        }
+
+        // Update TAB realm popups (check for timeout)
+        if (state.tabs.items[state.active_tab].popups.update()) {
+            state.needs_render = true;
+            // Check if a popup timed out and we need to send response
+            if (state.pending_pop_response and state.pending_pop_scope == .tab and !state.tabs.items[state.active_tab].popups.isBlocked()) {
+                sendPopResponse(state);
+            }
         }
 
         // Update PANE realm notifications (splits)
@@ -1334,12 +1353,36 @@ fn runMainLoop(state: *State) !void {
             if (pane.*.updateNotifications()) {
                 state.needs_render = true;
             }
+            // Update PANE realm popups (check for timeout)
+            if (pane.*.updatePopups()) {
+                state.needs_render = true;
+                // Check if a popup timed out and we need to send response
+                if (state.pending_pop_response and state.pending_pop_scope == .pane) {
+                    if (state.pending_pop_pane) |pending_pane| {
+                        if (pending_pane == pane.* and !pane.*.popups.isBlocked()) {
+                            sendPopResponse(state);
+                        }
+                    }
+                }
+            }
         }
 
         // Update PANE realm notifications (floats)
         for (state.floats.items) |pane| {
             if (pane.updateNotifications()) {
                 state.needs_render = true;
+            }
+            // Update PANE realm popups (check for timeout)
+            if (pane.updatePopups()) {
+                state.needs_render = true;
+                // Check if a popup timed out and we need to send response
+                if (state.pending_pop_response and state.pending_pop_scope == .pane) {
+                    if (state.pending_pop_pane) |pending_pane| {
+                        if (pending_pane == pane and !pane.popups.isBlocked()) {
+                            sendPopResponse(state);
+                        }
+                    }
+                }
             }
         }
 
@@ -1533,9 +1576,13 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
             const msg = msg_val.string;
             // Duplicate message since we'll free parsed
             const msg_copy = state.allocator.dupe(u8, msg) catch return;
+            const duration_ms = if (root.get("timeout_ms")) |v| switch (v) {
+                .integer => |i| i,
+                else => state.notifications.default_duration_ms,
+            } else state.notifications.default_duration_ms;
             state.notifications.showWithOptions(
                 msg_copy,
-                state.notifications.default_duration_ms,
+                duration_ms,
                 state.notifications.default_style,
                 true,
             );
@@ -1552,6 +1599,10 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
 
         const msg = (root.get("message") orelse return).string;
         const msg_copy = state.allocator.dupe(u8, msg) catch return;
+        const timeout_ms: ?i64 = if (root.get("timeout_ms")) |v| switch (v) {
+            .integer => |i| i,
+            else => null,
+        } else null;
 
         // Find the pane and show notification on it
         var found = false;
@@ -1561,9 +1612,10 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
             var pane_it = tab.layout.splitIterator();
             while (pane_it.next()) |pane| {
                 if (std.mem.eql(u8, &pane.*.uuid, &target_uuid)) {
+                    const duration_ms = timeout_ms orelse pane.*.notifications.default_duration_ms;
                     pane.*.notifications.showWithOptions(
                         msg_copy,
-                        pane.*.notifications.default_duration_ms,
+                        duration_ms,
                         pane.*.notifications.default_style,
                         true,
                     );
@@ -1578,9 +1630,10 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
         if (!found) {
             for (state.floats.items) |pane| {
                 if (std.mem.eql(u8, &pane.uuid, &target_uuid)) {
+                    const duration_ms = timeout_ms orelse pane.notifications.default_duration_ms;
                     pane.notifications.showWithOptions(
                         msg_copy,
-                        pane.notifications.default_duration_ms,
+                        duration_ms,
                         pane.notifications.default_style,
                         true,
                     );
@@ -1603,14 +1656,19 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
 
         const msg = (root.get("message") orelse return).string;
         const msg_copy = state.allocator.dupe(u8, msg) catch return;
+        const timeout_ms: ?i64 = if (root.get("timeout_ms")) |v| switch (v) {
+            .integer => |i| i,
+            else => null,
+        } else null;
 
         // Find the tab by UUID prefix
         var found = false;
         for (state.tabs.items) |*tab| {
             if (std.mem.startsWith(u8, &tab.uuid, uuid_str)) {
+                const duration_ms = timeout_ms orelse tab.notifications.default_duration_ms;
                 tab.notifications.showWithOptions(
                     msg_copy,
-                    tab.notifications.default_duration_ms,
+                    duration_ms,
                     tab.notifications.default_style,
                     true,
                 );
@@ -1628,13 +1686,18 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
     else if (std.mem.eql(u8, msg_type, "pop_confirm")) {
         const msg = (root.get("message") orelse return).string;
         const target_uuid = if (root.get("target_uuid")) |v| v.string else null;
+        const timeout_ms: ?i64 = if (root.get("timeout_ms")) |v| switch (v) {
+            .integer => |i| i,
+            else => null,
+        } else null;
+        const opts: pop.ConfirmOptions = .{ .timeout_ms = timeout_ms };
 
         // Determine scope based on target_uuid
         if (target_uuid) |uuid| {
             // Check if it matches a tab UUID
             for (state.tabs.items, 0..) |*tab, tab_idx| {
                 if (std.mem.startsWith(u8, &tab.uuid, uuid)) {
-                    tab.popups.showConfirmOwned(msg, .{}) catch return;
+                    tab.popups.showConfirmOwned(msg, opts) catch return;
                     state.pending_pop_response = true;
                     state.pending_pop_scope = .tab;
                     state.pending_pop_tab = tab_idx;
@@ -1647,7 +1710,7 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
                 var iter = tab.layout.splits.valueIterator();
                 while (iter.next()) |pane| {
                     if (std.mem.startsWith(u8, &pane.*.uuid, uuid)) {
-                        pane.*.popups.showConfirmOwned(msg, .{}) catch return;
+                        pane.*.popups.showConfirmOwned(msg, opts) catch return;
                         state.pending_pop_response = true;
                         state.pending_pop_scope = .pane;
                         state.pending_pop_pane = pane.*;
@@ -1659,7 +1722,7 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
             // Check if it matches a float pane UUID
             for (state.floats.items) |pane| {
                 if (std.mem.startsWith(u8, &pane.uuid, uuid)) {
-                    pane.popups.showConfirmOwned(msg, .{}) catch return;
+                    pane.popups.showConfirmOwned(msg, opts) catch return;
                     state.pending_pop_response = true;
                     state.pending_pop_scope = .pane;
                     state.pending_pop_pane = pane;
@@ -1669,7 +1732,7 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
             }
         }
         // Default: MUX level (blocks everything)
-        state.popups.showConfirmOwned(msg, .{}) catch return;
+        state.popups.showConfirmOwned(msg, opts) catch return;
         state.pending_pop_response = true;
         state.pending_pop_scope = .mux;
         state.needs_render = true;
@@ -1679,6 +1742,10 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
         const msg = (root.get("message") orelse return).string;
         const items_val = root.get("items") orelse return;
         if (items_val != .array) return;
+        const timeout_ms: ?i64 = if (root.get("timeout_ms")) |v| switch (v) {
+            .integer => |i| i,
+            else => null,
+        } else null;
 
         // Convert JSON array to string slice
         var items_list: std.ArrayList([]const u8) = .empty;
@@ -1695,7 +1762,7 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
         }
 
         if (items_list.items.len > 0) {
-            state.popups.showPickerOwned(items_list.items, .{ .title = msg }) catch {
+            state.popups.showPickerOwned(items_list.items, .{ .title = msg, .timeout_ms = timeout_ms }) catch {
                 // Free items on failure
                 for (items_list.items) |item| {
                     state.allocator.free(item);

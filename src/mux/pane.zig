@@ -379,6 +379,14 @@ pub const Pane = struct {
         return false;
     }
 
+    /// Update popups (call each frame) - checks for timeout
+    pub fn updatePopups(self: *Pane) bool {
+        if (self.popups_initialized) {
+            return self.popups.update();
+        }
+        return false;
+    }
+
     /// Check if pane has active notification
     pub fn hasActiveNotification(self: *Pane) bool {
         if (self.notifications_initialized) {

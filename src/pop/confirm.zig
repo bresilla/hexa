@@ -18,6 +18,7 @@ pub const ConfirmOptions = struct {
     default: Selection = .no,
     yes_label: []const u8 = "Yes",
     no_label: []const u8 = "No",
+    timeout_ms: ?i64 = null, // Auto-cancel after this many milliseconds (null = no timeout)
 };
 
 /// Confirm dialog - Yes/No blocking popup
@@ -30,6 +31,8 @@ pub const Confirm = struct {
     yes_label: []const u8,
     no_label: []const u8,
     result: ?bool, // Set when dismissed
+    timeout_ms: ?i64, // Auto-cancel timeout (null = no timeout)
+    created_at: i64, // Timestamp when created (milliseconds)
 
     pub fn init(allocator: std.mem.Allocator, message: []const u8, opts: ConfirmOptions) Confirm {
         return .{
@@ -41,6 +44,8 @@ pub const Confirm = struct {
             .yes_label = opts.yes_label,
             .no_label = opts.no_label,
             .result = null,
+            .timeout_ms = opts.timeout_ms,
+            .created_at = std.time.milliTimestamp(),
         };
     }
 
@@ -93,6 +98,21 @@ pub const Confirm = struct {
     /// Check if this is a blocking popup
     pub fn isBlocking(_: *Confirm) bool {
         return true;
+    }
+
+    /// Check if the popup has timed out
+    pub fn isTimedOut(self: *Confirm) bool {
+        if (self.timeout_ms) |timeout| {
+            const now = std.time.milliTimestamp();
+            return (now - self.created_at) >= timeout;
+        }
+        return false;
+    }
+
+    /// Force timeout (set result to false/cancelled)
+    pub fn forceTimeout(self: *Confirm) void {
+        self.selected = .no;
+        self.result = false;
     }
 
     /// Calculate required box dimensions (including border)

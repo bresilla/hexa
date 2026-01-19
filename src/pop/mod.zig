@@ -60,6 +60,20 @@ pub const Popup = union(enum) {
         };
     }
 
+    pub fn isTimedOut(self: Popup) bool {
+        return switch (self) {
+            .confirm => |c| c.isTimedOut(),
+            .picker => |p| p.isTimedOut(),
+        };
+    }
+
+    pub fn forceTimeout(self: Popup) void {
+        switch (self) {
+            .confirm => |c| c.forceTimeout(),
+            .picker => |p| p.forceTimeout(),
+        }
+    }
+
     pub fn deinit(self: Popup, allocator: std.mem.Allocator) void {
         switch (self) {
             .confirm => |c| {
@@ -183,7 +197,34 @@ pub const PopupManager = struct {
     /// Update popup state - call each frame
     /// Returns true if display needs refresh
     pub fn update(self: *PopupManager) bool {
-        return self.notifications.update();
+        var needs_refresh = self.notifications.update();
+
+        // Check for timeout on active blocking popup
+        if (self.active) |popup| {
+            if (popup.isTimedOut()) {
+                // Store result (timeout = cancelled)
+                switch (popup) {
+                    .confirm => |c| {
+                        c.forceTimeout();
+                        self.last_confirm_result = c.getResult();
+                        self.last_picker_result = null;
+                        self.last_picker_cancelled = false;
+                    },
+                    .picker => |p| {
+                        p.forceTimeout();
+                        self.last_picker_result = null;
+                        self.last_picker_cancelled = true;
+                        self.last_confirm_result = null;
+                    },
+                }
+                // Clean up the popup
+                popup.deinit(self.allocator);
+                self.active = null;
+                needs_refresh = true;
+            }
+        }
+
+        return needs_refresh;
     }
 
     /// Handle keyboard input

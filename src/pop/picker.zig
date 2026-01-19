@@ -11,6 +11,7 @@ pub const PickerOptions = struct {
     style: ?Style = null,
     visible_count: usize = 10,
     title: ?[]const u8 = null,
+    timeout_ms: ?i64 = null, // Auto-cancel after this many milliseconds (null = no timeout)
 };
 
 /// Picker/Choose - Multi-option selector blocking popup
@@ -26,6 +27,8 @@ pub const Picker = struct {
     title_owned: bool,
     result: ?usize, // null if cancelled, index if selected
     cancelled: bool,
+    timeout_ms: ?i64, // Auto-cancel timeout (null = no timeout)
+    created_at: i64, // Timestamp when created (milliseconds)
 
     pub fn init(allocator: std.mem.Allocator, items: []const []const u8, opts: PickerOptions) Picker {
         const visible = @min(opts.visible_count, items.len);
@@ -41,6 +44,8 @@ pub const Picker = struct {
             .title_owned = false,
             .result = null,
             .cancelled = false,
+            .timeout_ms = opts.timeout_ms,
+            .created_at = std.time.milliTimestamp(),
         };
     }
 
@@ -153,6 +158,21 @@ pub const Picker = struct {
     /// Check if this is a blocking popup
     pub fn isBlocking(_: *Picker) bool {
         return true;
+    }
+
+    /// Check if the popup has timed out
+    pub fn isTimedOut(self: *Picker) bool {
+        if (self.timeout_ms) |timeout| {
+            const now = std.time.milliTimestamp();
+            return (now - self.created_at) >= timeout;
+        }
+        return false;
+    }
+
+    /// Force timeout (set result to cancelled)
+    pub fn forceTimeout(self: *Picker) void {
+        self.cancelled = true;
+        self.result = null;
     }
 
     /// Calculate required box dimensions
