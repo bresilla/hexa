@@ -2,6 +2,9 @@ const std = @import("std");
 const argonaut = @import("argonaut");
 const core = @import("core");
 const ipc = core.ipc;
+const mux = @import("mux");
+const ses = @import("ses");
+const pop = @import("pop");
 
 const print = std.debug.print;
 
@@ -47,9 +50,74 @@ pub fn main() !void {
     const pop_prompt_status = try pop_prompt.int("s", "status", null);
     const pop_prompt_duration = try pop_prompt.int("d", "duration", null);
     const pop_prompt_right = try pop_prompt.flag("r", "right", null);
+    const pop_prompt_shell = try pop_prompt.string("S", "shell", null);
+    const pop_prompt_jobs = try pop_prompt.int("j", "jobs", null);
 
     const pop_init = try pop_cmd.newCommand("init", "Print shell initialization script");
     const pop_init_shell = try pop_init.stringPositional(null);
+
+    // Check for help flag manually to avoid argonaut segfault
+    var has_help = false;
+    var found_com = false;
+    var found_ses = false;
+    var found_mux = false;
+    var found_pop = false;
+    var found_list = false;
+    var found_notify = false;
+    var found_daemon = false;
+    var found_info = false;
+    var found_new = false;
+    var found_attach = false;
+    var found_prompt = false;
+    var found_init = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) has_help = true;
+        if (std.mem.eql(u8, arg, "com")) found_com = true;
+        if (std.mem.eql(u8, arg, "ses")) found_ses = true;
+        if (std.mem.eql(u8, arg, "mux")) found_mux = true;
+        if (std.mem.eql(u8, arg, "pop")) found_pop = true;
+        if (std.mem.eql(u8, arg, "list")) found_list = true;
+        if (std.mem.eql(u8, arg, "notify")) found_notify = true;
+        if (std.mem.eql(u8, arg, "daemon")) found_daemon = true;
+        if (std.mem.eql(u8, arg, "info")) found_info = true;
+        if (std.mem.eql(u8, arg, "new")) found_new = true;
+        if (std.mem.eql(u8, arg, "attach")) found_attach = true;
+        if (std.mem.eql(u8, arg, "prompt")) found_prompt = true;
+        if (std.mem.eql(u8, arg, "init")) found_init = true;
+    }
+
+    if (has_help) {
+        // Show help for the most specific command found (manual strings to avoid argonaut crash)
+        if (found_com and found_notify) {
+            print("Usage: hexa com notify [OPTIONS] <message>\n\nSend notification to muxes/panes\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n", .{});
+        } else if (found_com and found_list) {
+            print("Usage: hexa com list [OPTIONS]\n\nList all sessions and panes\n\nOptions:\n  -d, --details  Show extra details\n", .{});
+        } else if (found_ses and found_daemon) {
+            print("Usage: hexa ses daemon\n\nStart the session daemon\n", .{});
+        } else if (found_ses and found_info) {
+            print("Usage: hexa ses info\n\nShow daemon status and socket path\n", .{});
+        } else if (found_mux and found_new) {
+            print("Usage: hexa mux new [OPTIONS]\n\nCreate new multiplexer session\n\nOptions:\n  -n, --name <NAME>  Session name\n", .{});
+        } else if (found_mux and found_attach) {
+            print("Usage: hexa mux attach <name>\n\nAttach to existing session by name or UUID prefix\n", .{});
+        } else if (found_pop and found_prompt) {
+            print("Usage: hexa pop prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
+        } else if (found_pop and found_init) {
+            print("Usage: hexa pop init <shell>\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n", .{});
+        } else if (found_com) {
+            print("Usage: hexa com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  notify  Send notification\n", .{});
+        } else if (found_ses) {
+            print("Usage: hexa ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  info    Show daemon info\n", .{});
+        } else if (found_mux) {
+            print("Usage: hexa mux <command>\n\nTerminal multiplexer\n\nCommands:\n  new     Create new multiplexer session\n  attach  Attach to existing session\n", .{});
+        } else if (found_pop) {
+            print("Usage: hexa pop <command>\n\nPrompt and status bar renderer\n\nCommands:\n  prompt  Render shell prompt\n  init    Print shell initialization script\n", .{});
+        } else {
+            print("Usage: hexa <command>\n\nHexa terminal multiplexer\n\nCommands:\n  com  Communication with sessions and panes\n  ses  Session daemon management\n  mux  Terminal multiplexer\n  pop  Prompt and status bar renderer\n", .{});
+        }
+        return;
+    }
 
     // Parse
     parser.parse(args) catch |err| {
@@ -89,7 +157,7 @@ pub fn main() !void {
         for (ses_cmd.commands.items) |cmd| {
             if (cmd.happened) {
                 if (std.mem.eql(u8, cmd.name, "daemon")) {
-                    try runSesDaemon(allocator);
+                    try runSesDaemon();
                 } else if (std.mem.eql(u8, cmd.name, "info")) {
                     try runSesInfo(allocator);
                 }
@@ -98,15 +166,15 @@ pub fn main() !void {
         }
     } else if (mux_cmd.happened) {
         if (mux_new.happened) {
-            try runMuxNew(allocator, mux_new_name.*);
+            try runMuxNew(mux_new_name.*);
         } else if (mux_attach.happened) {
-            try runMuxAttach(allocator, mux_attach_name.*);
+            try runMuxAttach(mux_attach_name.*);
         }
     } else if (pop_cmd.happened) {
         if (pop_prompt.happened) {
-            try runPopPrompt(allocator, pop_prompt_status.*, pop_prompt_duration.*, pop_prompt_right.*);
+            try runPopPrompt(pop_prompt_status.*, pop_prompt_duration.*, pop_prompt_right.*, pop_prompt_shell.*, pop_prompt_jobs.*);
         } else if (pop_init.happened) {
-            try runPopInit(allocator, pop_init_shell.*);
+            try runPopInit(pop_init_shell.*);
         }
     }
 }
@@ -233,7 +301,7 @@ fn runComNotify(allocator: std.mem.Allocator, uuid: []const u8, message: []const
         const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"targeted_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ uuid, message });
         try conn.sendLine(msg);
     } else {
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"notify\",\"message\":\"{s}\"}}", .{message});
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"broadcast_notify\",\"message\":\"{s}\"}}", .{message});
         try conn.sendLine(msg);
     }
 
@@ -260,13 +328,9 @@ fn runComNotify(allocator: std.mem.Allocator, uuid: []const u8, message: []const
 // SES handlers
 // ============================================================================
 
-fn runSesDaemon(allocator: std.mem.Allocator) !void {
-    // Spawn hexa-ses daemon
-    var child = std.process.Child.init(&.{"hexa-ses"}, allocator);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    _ = try child.spawnAndWait();
+fn runSesDaemon() !void {
+    // Call ses run() directly
+    try ses.run(.{ .daemon = true });
 }
 
 fn runSesInfo(allocator: std.mem.Allocator) !void {
@@ -289,29 +353,19 @@ fn runSesInfo(allocator: std.mem.Allocator) !void {
 // MUX handlers
 // ============================================================================
 
-fn runMuxNew(allocator: std.mem.Allocator, name: []const u8) !void {
-    if (name.len > 0) {
-        var child = std.process.Child.init(&.{ "hexa-mux", "--name", name }, allocator);
-        child.stdin_behavior = .Inherit;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-        _ = try child.spawnAndWait();
-    } else {
-        var child = std.process.Child.init(&.{"hexa-mux"}, allocator);
-        child.stdin_behavior = .Inherit;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-        _ = try child.spawnAndWait();
-    }
+fn runMuxNew(name: []const u8) !void {
+    // Call mux run() directly
+    try mux.run(.{
+        .name = if (name.len > 0) name else null,
+    });
 }
 
-fn runMuxAttach(allocator: std.mem.Allocator, name: []const u8) !void {
+fn runMuxAttach(name: []const u8) !void {
     if (name.len > 0) {
-        var child = std.process.Child.init(&.{ "hexa-mux", "-a", name }, allocator);
-        child.stdin_behavior = .Inherit;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-        _ = try child.spawnAndWait();
+        // Call mux run() directly with attach option
+        try mux.run(.{
+            .attach = name,
+        });
     } else {
         print("Error: session name required\n", .{});
     }
@@ -321,46 +375,20 @@ fn runMuxAttach(allocator: std.mem.Allocator, name: []const u8) !void {
 // POP handlers
 // ============================================================================
 
-fn runPopPrompt(allocator: std.mem.Allocator, status: i64, duration: i64, right: bool) !void {
-    var status_buf: [32]u8 = undefined;
-    var duration_buf: [32]u8 = undefined;
-
-    // Build args array
-    var args: [6][]const u8 = undefined;
-    var argc: usize = 0;
-
-    args[argc] = "pop";
-    argc += 1;
-    args[argc] = "prompt";
-    argc += 1;
-
-    if (status != 0) {
-        args[argc] = std.fmt.bufPrint(&status_buf, "--status={d}", .{status}) catch "--status=0";
-        argc += 1;
-    }
-    if (duration != 0) {
-        args[argc] = std.fmt.bufPrint(&duration_buf, "--duration={d}", .{duration}) catch "--duration=0";
-        argc += 1;
-    }
-    if (right) {
-        args[argc] = "--right";
-        argc += 1;
-    }
-
-    var child = std.process.Child.init(args[0..argc], allocator);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    _ = try child.spawnAndWait();
+fn runPopPrompt(status: i64, duration: i64, right: bool, shell: []const u8, jobs: i64) !void {
+    try pop.run(.{
+        .prompt = true,
+        .status = status,
+        .duration = duration,
+        .right = right,
+        .shell = if (shell.len > 0) shell else null,
+        .jobs = jobs,
+    });
 }
 
-fn runPopInit(allocator: std.mem.Allocator, shell: []const u8) !void {
+fn runPopInit(shell: []const u8) !void {
     if (shell.len > 0) {
-        var child = std.process.Child.init(&.{ "pop", "init", shell }, allocator);
-        child.stdin_behavior = .Inherit;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-        _ = try child.spawnAndWait();
+        try pop.run(.{ .init_shell = shell });
     } else {
         print("Error: shell name required (bash, zsh, fish)\n", .{});
     }

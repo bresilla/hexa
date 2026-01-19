@@ -627,38 +627,26 @@ const State = struct {
     }
 };
 
-pub fn main() !void {
+/// Arguments for mux commands
+pub const MuxArgs = struct {
+    name: ?[]const u8 = null,
+    attach: ?[]const u8 = null,
+    notify_message: ?[]const u8 = null,
+    list: bool = false,
+};
+
+/// Entry point for mux - can be called directly from unified CLI
+pub fn run(mux_args: MuxArgs) !void {
     const allocator = std.heap.page_allocator;
 
-    // Parse command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    var notify_message: ?[]const u8 = null;
-    var list_orphaned = false;
-    var attach_uuid: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if ((std.mem.eql(u8, arg, "--notify") or std.mem.eql(u8, arg, "-n")) and i + 1 < args.len) {
-            i += 1;
-            notify_message = args[i];
-        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
-            list_orphaned = true;
-        } else if ((std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "-a")) and i + 1 < args.len) {
-            i += 1;
-            attach_uuid = args[i];
-        }
-    }
-
     // Handle --notify: send to parent mux and exit
-    if (notify_message) |msg| {
+    if (mux_args.notify_message) |msg| {
         sendNotifyToParentMux(allocator, msg);
         return;
     }
 
     // Handle --list: show detached sessions and orphaned panes
-    if (list_orphaned) {
+    if (mux_args.list) {
         // Temporary connection for listing - generate a dummy UUID and name
         const tmp_uuid = core.ipc.generateUuid();
         const tmp_name = core.ipc.generateSessionName();
@@ -676,7 +664,7 @@ pub fn main() !void {
             std.debug.print("Detached sessions:\n", .{});
             for (sessions[0..sess_count]) |s| {
                 const name = s.session_name[0..s.session_name_len];
-                std.debug.print("  {s} [{s}] {d} panes - attach with: hexa-mux -a {s}\n", .{ name, s.session_id[0..8], s.pane_count, name });
+                std.debug.print("  {s} [{s}] {d} panes - attach with: hexa mux attach {s}\n", .{ name, s.session_id[0..8], s.pane_count, name });
             }
         }
 
@@ -697,7 +685,7 @@ pub fn main() !void {
     }
 
     // Handle --attach: attach to detached session by name or UUID prefix
-    if (attach_uuid) |uuid_arg| {
+    if (mux_args.attach) |uuid_arg| {
         if (uuid_arg.len < 3) {
             std.debug.print("Session name/UUID too short (need at least 3 chars)\n", .{});
             return;
@@ -720,6 +708,15 @@ pub fn main() !void {
     var state = try State.init(allocator, size.cols, size.rows);
     defer state.deinit();
 
+    // Set custom session name if provided
+    if (mux_args.name) |custom_name| {
+        const duped = allocator.dupe(u8, custom_name) catch null;
+        if (duped) |d| {
+            state.session_name = d;
+            state.session_name_owned = d;
+        }
+    }
+
     // Set HEXA_MUX_SOCKET environment for child processes
     if (state.socket_path) |path| {
         const path_z = allocator.dupeZ(u8, path) catch null;
@@ -738,7 +735,7 @@ pub fn main() !void {
     }
 
     // Handle --attach: try session first, then orphaned pane
-    if (attach_uuid) |uuid_prefix| {
+    if (mux_args.attach) |uuid_prefix| {
         // First try to reattach a detached session
         if (state.reattachSession(uuid_prefix)) {
             state.notifications.show("Session reattached");
@@ -754,6 +751,41 @@ pub fn main() !void {
         // Create first tab with one pane (will use ses if connected)
         try state.createTab();
     }
+
+    // Continue with main loop
+    try runMainLoop(&state);
+}
+
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+
+    // Parse command line arguments
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var mux_args = MuxArgs{};
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if ((std.mem.eql(u8, arg, "--notify") or std.mem.eql(u8, arg, "-n")) and i + 1 < args.len) {
+            i += 1;
+            mux_args.notify_message = args[i];
+        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
+            mux_args.list = true;
+        } else if ((std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "-a")) and i + 1 < args.len) {
+            i += 1;
+            mux_args.attach = args[i];
+        } else if ((std.mem.eql(u8, arg, "--name") or std.mem.eql(u8, arg, "-N")) and i + 1 < args.len) {
+            i += 1;
+            mux_args.name = args[i];
+        }
+    }
+
+    try run(mux_args);
+}
+
+fn runMainLoop(state: *State) !void {
+    const allocator = state.allocator;
 
     // Enter raw mode
     const orig_termios = try enableRawMode(posix.STDIN_FILENO);
@@ -805,7 +837,7 @@ pub fn main() !void {
                 }
 
                 // Resize floating panes based on their stored percentages
-                resizeFloatingPanes(&state);
+                resizeFloatingPanes(state);
 
                 // Resize renderer and force full redraw
                 state.renderer.resize(new_size.cols, new_size.rows) catch {};
@@ -948,20 +980,20 @@ pub fn main() !void {
         if (poll_fds[0].revents & posix.POLL.IN != 0) {
             const n = posix.read(posix.STDIN_FILENO, &buffer) catch break;
             if (n == 0) break;
-            handleInput(&state, buffer[0..n]);
+            handleInput(state, buffer[0..n]);
         }
 
         // Handle ses messages
         if (ses_fd_idx) |sidx| {
             if (poll_fds[sidx].revents & posix.POLL.IN != 0) {
-                handleSesMessage(&state, &buffer);
+                handleSesMessage(state, &buffer);
             }
         }
 
         // Handle IPC connections (for --notify)
         if (ipc_fd_idx) |iidx| {
             if (poll_fds[iidx].revents & posix.POLL.IN != 0) {
-                handleIpcConnection(&state, &buffer);
+                handleIpcConnection(state, &buffer);
             }
         }
 
@@ -1076,7 +1108,7 @@ pub fn main() !void {
         if (state.needs_render) {
             const render_now = std.time.milliTimestamp();
             if (render_now - last_render >= 16) { // ~60fps
-                renderTo(&state, stdout) catch {};
+                renderTo(state, stdout) catch {};
                 state.needs_render = false;
                 state.force_full_render = false;
                 last_render = render_now;

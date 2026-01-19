@@ -26,6 +26,62 @@ const JsonConfig = struct {
     prompt: ?JsonPrompt = null,
 };
 
+/// Arguments for pop commands
+pub const PopArgs = struct {
+    init_shell: ?[]const u8 = null,
+    prompt: bool = false,
+    status: i64 = 0,
+    duration: i64 = 0,
+    right: bool = false,
+    shell: ?[]const u8 = null,
+    jobs: i64 = 0,
+};
+
+/// Entry point for pop - can be called directly from unified CLI
+pub fn run(args: PopArgs) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    if (args.init_shell) |shell| {
+        try printInit(shell);
+    } else if (args.prompt) {
+        // Build args array for renderPrompt
+        var prompt_args: [6][]const u8 = undefined;
+        var argc: usize = 0;
+
+        var status_buf: [32]u8 = undefined;
+        var duration_buf: [32]u8 = undefined;
+        var jobs_buf: [32]u8 = undefined;
+        var shell_buf: [64]u8 = undefined;
+
+        if (args.status != 0) {
+            prompt_args[argc] = std.fmt.bufPrint(&status_buf, "--status={d}", .{args.status}) catch "--status=0";
+            argc += 1;
+        }
+        if (args.duration != 0) {
+            prompt_args[argc] = std.fmt.bufPrint(&duration_buf, "--duration={d}", .{args.duration}) catch "--duration=0";
+            argc += 1;
+        }
+        if (args.right) {
+            prompt_args[argc] = "--right";
+            argc += 1;
+        }
+        if (args.shell) |shell| {
+            prompt_args[argc] = std.fmt.bufPrint(&shell_buf, "--shell={s}", .{shell}) catch "--shell=bash";
+            argc += 1;
+        }
+        if (args.jobs != 0) {
+            prompt_args[argc] = std.fmt.bufPrint(&jobs_buf, "--jobs={d}", .{args.jobs}) catch "--jobs=0";
+            argc += 1;
+        }
+
+        try renderPrompt(allocator, prompt_args[0..argc]);
+    } else {
+        try printUsage();
+    }
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -44,7 +100,7 @@ pub fn main() !void {
     if (std.mem.eql(u8, command, "init")) {
         // pop init <shell>
         const shell = if (args.len > 2) args[2] else "bash";
-        try printInit(shell);
+        try run(.{ .init_shell = shell });
     } else if (std.mem.eql(u8, command, "prompt")) {
         // pop prompt [options]
         try renderPrompt(allocator, args[2..]);
@@ -84,14 +140,14 @@ fn printInit(shell: []const u8) !void {
 
     if (std.mem.eql(u8, shell, "bash")) {
         try stdout.writeAll(
-            \\# Pop prompt initialization for Bash
+            \\# Hexa prompt initialization for Bash
             \\__pop_precmd() {
             \\    local exit_status=$?
             \\    local duration=0
             \\    if [[ -n "$__pop_start" ]]; then
             \\        duration=$(( $(date +%s%3N) - __pop_start ))
             \\    fi
-            \\    PS1="$(pop prompt --status=$exit_status --duration=$duration --jobs=$(jobs -p 2>/dev/null | wc -l)) "
+            \\    PS1="$(hexa pop prompt --status=$exit_status --duration=$duration --jobs=$(jobs -p 2>/dev/null | wc -l)) "
             \\    unset __pop_start
             \\}
             \\
@@ -105,15 +161,15 @@ fn printInit(shell: []const u8) !void {
         );
     } else if (std.mem.eql(u8, shell, "zsh")) {
         try stdout.writeAll(
-            \\# Pop prompt initialization for Zsh
+            \\# Hexa prompt initialization for Zsh
             \\__pop_precmd() {
             \\    local exit_status=$?
             \\    local duration=0
             \\    if [[ -n "$__pop_start" ]]; then
             \\        duration=$(( $(date +%s%3N) - __pop_start ))
             \\    fi
-            \\    PROMPT="$(pop prompt --shell=zsh --status=$exit_status --duration=$duration --jobs=${(M)#jobstates}) "
-            \\    RPROMPT="$(pop prompt --shell=zsh --right --status=$exit_status)"
+            \\    PROMPT="$(hexa pop prompt --shell=zsh --status=$exit_status --duration=$duration --jobs=${(M)#jobstates}) "
+            \\    RPROMPT="$(hexa pop prompt --shell=zsh --right --status=$exit_status)"
             \\    unset __pop_start
             \\}
             \\
@@ -129,17 +185,17 @@ fn printInit(shell: []const u8) !void {
         );
     } else if (std.mem.eql(u8, shell, "fish")) {
         try stdout.writeAll(
-            \\# Pop prompt initialization for Fish
+            \\# Hexa prompt initialization for Fish
             \\function fish_prompt
             \\    set -l exit_status $status
             \\    set -l duration (math $CMD_DURATION)
             \\    set -l jobs (count (jobs -p))
-            \\    pop prompt --status=$exit_status --duration=$duration --jobs=$jobs
+            \\    hexa pop prompt --status=$exit_status --duration=$duration --jobs=$jobs
             \\    echo -n " "
             \\end
             \\
             \\function fish_right_prompt
-            \\    pop prompt --right
+            \\    hexa pop prompt --right
             \\end
             \\
         );

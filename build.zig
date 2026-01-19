@@ -34,75 +34,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Build pop executable (standalone prompt)
-    const pop_exe = b.addExecutable(.{
-        .name = "pop",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/pop/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(pop_exe);
-
-    // Run pop step
-    const run_pop = b.addRunArtifact(pop_exe);
-    run_pop.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_pop.addArgs(args);
-    }
-    const run_pop_step = b.step("pop", "Run pop prompt");
-    run_pop_step.dependOn(&run_pop.step);
-
-    // Build hexa-mux executable
-    const mux_root = b.createModule(.{
+    // Create mux module for unified CLI
+    const mux_module = b.createModule(.{
         .root_source_file = b.path("src/mux/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    mux_root.addImport("core", core_module);
-    mux_root.addImport("pop", pop_module);
+    mux_module.addImport("core", core_module);
+    mux_module.addImport("pop", pop_module);
     if (ghostty_vt_mod) |vt| {
-        mux_root.addImport("ghostty-vt", vt);
+        mux_module.addImport("ghostty-vt", vt);
     }
-    const mux_exe = b.addExecutable(.{
-        .name = "hexa-mux",
-        .root_module = mux_root,
-    });
-    b.installArtifact(mux_exe);
 
-    // Run step
-    const run_mux = b.addRunArtifact(mux_exe);
-    run_mux.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_mux.addArgs(args);
-    }
-    const run_step = b.step("run", "Run hexa-mux");
-    run_step.dependOn(&run_mux.step);
-
-    // Build hexa-ses executable (session server)
-    const ses_root = b.createModule(.{
+    // Create ses module for unified CLI
+    const ses_module = b.createModule(.{
         .root_source_file = b.path("src/ses/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    ses_root.addImport("core", core_module);
-    const ses_exe = b.addExecutable(.{
-        .name = "hexa-ses",
-        .root_module = ses_root,
-    });
-    b.installArtifact(ses_exe);
-
-    // Run ses step
-    const run_ses = b.addRunArtifact(ses_exe);
-    run_ses.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_ses.addArgs(args);
-    }
-    const run_ses_step = b.step("ses", "Run hexa-ses");
-    run_ses_step.dependOn(&run_ses.step);
+    ses_module.addImport("core", core_module);
 
     // Build unified hexa CLI executable
     const cli_root = b.createModule(.{
@@ -112,6 +64,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     cli_root.addImport("core", core_module);
+    cli_root.addImport("mux", mux_module);
+    cli_root.addImport("ses", ses_module);
+    cli_root.addImport("pop", pop_module);
     if (argonaut_mod) |arg| {
         cli_root.addImport("argonaut", arg);
     }
@@ -122,11 +77,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(cli_exe);
 
     // Run hexa step
-    const run_cli = b.addRunArtifact(cli_exe);
-    run_cli.step.dependOn(b.getInstallStep());
+    const run_hexa = b.addRunArtifact(cli_exe);
+    run_hexa.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        run_cli.addArgs(args);
+        run_hexa.addArgs(args);
     }
-    const run_cli_step = b.step("cli", "Run hexa CLI");
-    run_cli_step.dependOn(&run_cli.step);
+    const run_step = b.step("run", "Run hexa");
+    run_step.dependOn(&run_hexa.step);
 }

@@ -5,66 +5,33 @@ const ipc = core.ipc;
 const state = @import("state.zig");
 const server = @import("server.zig");
 
-pub fn main() !void {
-    // Use page_allocator for arg parsing before fork (survives fork cleanly)
+/// Arguments for ses commands
+pub const SesArgs = struct {
+    daemon: bool = false,
+    list: bool = false,
+    full: bool = false,
+    notify_message: ?[]const u8 = null,
+    notify_uuid: ?[]const u8 = null,
+};
+
+/// Entry point for ses daemon - can be called directly from unified CLI
+pub fn run(args: SesArgs) !void {
     const page_alloc = std.heap.page_allocator;
 
-    const args = try std.process.argsAlloc(page_alloc);
-    defer std.process.argsFree(page_alloc, args);
-
-    // Check for command modes
-    var daemon_mode = false;
-    var list_mode = false;
-    var full_mode = false;
-    var notify_message: ?[]const u8 = null;
-    var notify_uuid: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--daemon") or std.mem.eql(u8, arg, "-d")) {
-            daemon_mode = true;
-        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
-            list_mode = true;
-        } else if (std.mem.eql(u8, arg, "--full") or std.mem.eql(u8, arg, "-f")) {
-            full_mode = true;
-        } else if (std.mem.eql(u8, arg, "--notify") or std.mem.eql(u8, arg, "-n")) {
-            // Next arg is the message
-            if (i + 1 < args.len) {
-                i += 1;
-                notify_message = args[i];
-            } else {
-                print("Error: --notify requires a message argument\n", .{});
-                return;
-            }
-        } else if (std.mem.eql(u8, arg, "--uuid") or std.mem.eql(u8, arg, "-u")) {
-            // Next arg is the UUID (mux or pane)
-            if (i + 1 < args.len) {
-                i += 1;
-                notify_uuid = args[i];
-            } else {
-                print("Error: --uuid requires a UUID argument\n", .{});
-                return;
-            }
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try printUsage();
-            return;
-        }
-    }
-
     // Notify mode - send notification to muxes/panes (use page_alloc, no fork)
-    if (notify_message) |msg| {
-        try sendNotify(page_alloc, msg, notify_uuid);
+    if (args.notify_message) |msg| {
+        try sendNotify(page_alloc, msg, args.notify_uuid);
         return;
     }
 
     // List mode - connect to running daemon and show status (use page_alloc, no fork)
-    if (list_mode) {
-        try listStatus(page_alloc, full_mode);
+    if (args.list) {
+        try listStatus(page_alloc, args.full);
         return;
     }
 
     // Daemonize BEFORE creating GPA
-    if (daemon_mode) {
+    if (args.daemon) {
         try daemonize();
     }
 
@@ -79,7 +46,7 @@ pub fn main() !void {
 
     // Initialize server
     var srv = server.Server.init(allocator, &ses_state) catch |err| {
-        if (!daemon_mode) {
+        if (!args.daemon) {
             std.debug.print("ses: server init failed: {}\n", .{err});
         }
         return err;
@@ -90,7 +57,7 @@ pub fn main() !void {
     setupSignalHandlers(&srv);
 
     // Print socket path if not daemon
-    if (!daemon_mode) {
+    if (!args.daemon) {
         const socket_path = ipc.getSesSocketPath(allocator) catch "";
         defer if (socket_path.len > 0) allocator.free(socket_path);
         std.debug.print("ses: listening on {s}\n", .{socket_path});
@@ -98,11 +65,56 @@ pub fn main() !void {
 
     // Run server
     srv.run() catch |err| {
-        if (!daemon_mode) {
+        if (!args.daemon) {
             std.debug.print("Server error: {}\n", .{err});
         }
         return err;
     };
+}
+
+pub fn main() !void {
+    // Use page_allocator for arg parsing before fork (survives fork cleanly)
+    const page_alloc = std.heap.page_allocator;
+
+    const args = try std.process.argsAlloc(page_alloc);
+    defer std.process.argsFree(page_alloc, args);
+
+    // Check for command modes
+    var ses_args = SesArgs{};
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--daemon") or std.mem.eql(u8, arg, "-d")) {
+            ses_args.daemon = true;
+        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
+            ses_args.list = true;
+        } else if (std.mem.eql(u8, arg, "--full") or std.mem.eql(u8, arg, "-f")) {
+            ses_args.full = true;
+        } else if (std.mem.eql(u8, arg, "--notify") or std.mem.eql(u8, arg, "-n")) {
+            // Next arg is the message
+            if (i + 1 < args.len) {
+                i += 1;
+                ses_args.notify_message = args[i];
+            } else {
+                print("Error: --notify requires a message argument\n", .{});
+                return;
+            }
+        } else if (std.mem.eql(u8, arg, "--uuid") or std.mem.eql(u8, arg, "-u")) {
+            // Next arg is the UUID (mux or pane)
+            if (i + 1 < args.len) {
+                i += 1;
+                ses_args.notify_uuid = args[i];
+            } else {
+                print("Error: --uuid requires a UUID argument\n", .{});
+                return;
+            }
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printUsage();
+            return;
+        }
+    }
+
+    try run(ses_args);
 }
 
 fn print(comptime fmt: []const u8, args: anytype) void {

@@ -129,8 +129,8 @@ pub const SesClient = struct {
     /// Start the ses daemon
     fn startSes(self: *SesClient) !void {
         _ = self;
-        // Fork and exec hexa-ses --daemon
-        var child = std.process.Child.init(&[_][]const u8{ "hexa-ses", "--daemon" }, std.heap.page_allocator);
+        // Fork and exec hexa ses daemon
+        var child = std.process.Child.init(&[_][]const u8{ "hexa", "ses", "daemon" }, std.heap.page_allocator);
         child.spawn() catch |err| {
             std.debug.print("Failed to start ses daemon: {}\n", .{err});
             return err;
