@@ -30,6 +30,7 @@ const NotificationManager = notification.NotificationManager;
 const PendingAction = enum {
     exit,
     detach,
+    disown,
 };
 
 /// A tab contains a layout with splits (splits)
@@ -1416,6 +1417,7 @@ fn handleInput(state: *State, inp: []const u8) void {
                         switch (action) {
                             .exit => state.running = false,
                             .detach => performDetach(state),
+                            .disown => performDisown(state),
                         }
                     } else {
                         // User cancelled - if exit was from shell death, spawn new shell
@@ -2138,6 +2140,51 @@ fn performDetach(state: *State) void {
     state.running = false;
 }
 
+/// Perform the actual disown action - orphan pane in ses and spawn new shell in same place
+fn performDisown(state: *State) void {
+    const pane: ?*Pane = if (state.active_floating) |idx|
+        state.floats.items[idx]
+    else
+        state.currentLayout().getFocusedPane();
+
+    if (pane) |p| {
+        if (p.pty.external_process) {
+            // Get current working directory from the process before orphaning
+            const cwd = p.getRealCwd();
+
+            // Orphan the current pane in ses (keeps process alive)
+            state.ses_client.orphanPane(p.uuid) catch {};
+
+            // Create a new shell via ses in the same directory and replace the pane's PTY
+            if (state.ses_client.createPane(null, cwd, null, null)) |result| {
+                p.replaceWithFd(result.fd, result.pid, result.uuid) catch {
+                    state.notifications.show("Disown failed: couldn't replace PTY");
+                    state.needs_render = true;
+                    return;
+                };
+                state.notifications.show("Pane disowned (adopt with Alt+a)");
+            } else |_| {
+                // Fallback: respawn locally if ses fails
+                p.respawn() catch {
+                    state.notifications.show("Disown failed: couldn't spawn new shell");
+                    state.needs_render = true;
+                    return;
+                };
+                state.notifications.show("Pane disowned (local shell)");
+            }
+        } else {
+            // Local process - just respawn
+            p.respawn() catch {
+                state.notifications.show("Respawn failed");
+                state.needs_render = true;
+                return;
+            };
+            state.notifications.show("Pane respawned");
+        }
+    }
+    state.needs_render = true;
+}
+
 fn handleAltKey(state: *State, key: u8) bool {
     const cfg = &state.config;
 
@@ -2152,30 +2199,15 @@ fn handleAltKey(state: *State, key: u8) bool {
         return true;
     }
 
-    // Disown pane - orphans current pane in ses, adopt with Alt+a
+    // Disown pane - orphans current pane in ses, spawns new shell in same place
     if (key == cfg.key_disown) {
-        if (state.active_floating) |idx| {
-            const pane = state.floats.items[idx];
-            if (pane.pty.external_process) {
-                state.ses_client.orphanPane(pane.uuid) catch {};
-                state.notifications.show("Pane disowned (adopt with Alt+a)");
-            }
-            _ = state.floats.orderedRemove(idx);
-            pane.deinit();
-            state.allocator.destroy(pane);
-            state.active_floating = if (state.floats.items.len > 0) 0 else null;
-        } else if (state.currentLayout().getFocusedPane()) |pane| {
-            if (pane.pty.external_process) {
-                state.ses_client.orphanPane(pane.uuid) catch {};
-                state.notifications.show("Pane disowned (adopt with Alt+a)");
-            }
-            if (!state.currentLayout().closeFocused()) {
-                if (!state.closeCurrentTab()) {
-                    state.running = false;
-                }
-            }
+        if (cfg.confirm_on_disown) {
+            state.pending_action = .disown;
+            state.popups.showConfirm("Disown pane?", .{}) catch {};
+            state.needs_render = true;
+        } else {
+            performDisown(state);
         }
-        state.needs_render = true;
         return true;
     }
 
