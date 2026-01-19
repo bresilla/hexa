@@ -149,64 +149,159 @@ pub fn draw(
     ctx.active_tab = active_tab;
     ctx.session_name = session_name;
 
-    // === DRAW LEFT SECTION ===
-    var left_x: u16 = 0;
-    for (cfg.left) |mod| {
-        left_x = drawModule(renderer, &ctx, mod, left_x, y);
-    }
-
-    // === CALCULATE RIGHT WIDTH ===
-    var right_width: u16 = 0;
-    for (cfg.right) |mod| {
-        right_width += calcModuleWidth(&ctx, mod);
-    }
-    const right_start = width -| right_width;
-
-    // === DRAW RIGHT SECTION ===
-    var rx: u16 = right_start;
-    for (cfg.right) |mod| {
-        rx = drawModule(renderer, &ctx, mod, rx, y);
-    }
-
-    // === CALCULATE CENTER WIDTH ===
+    // === PRIORITY-BASED LAYOUT ===
+    // Measure center (tabs) width and get arrow config
     var center_width: u16 = 0;
+    var tabs_left_arrow: []const u8 = "";
+    var tabs_right_arrow: []const u8 = "";
     for (cfg.center) |mod| {
         if (std.mem.eql(u8, mod.name, "tabs")) {
-            for (ctx.tab_names, 0..) |tab_name, i| {
-                if (i > 0) center_width += @as(u16, @intCast(mod.separator.len));
-                center_width += 2 + @as(u16, @intCast(tab_name.len)) + 2;
-            }
+            tabs_left_arrow = mod.left_arrow;
+            tabs_right_arrow = mod.right_arrow;
+            center_width = measureTabsWidth(ctx.tab_names, mod.separator, mod.left_arrow, mod.right_arrow);
+            break;
         }
     }
 
-    // === DRAW CENTER SECTION (truly centered) ===
+    // True center position
     const center_start = (width -| center_width) / 2;
-    if (center_start > left_x + 2 and center_start + center_width < right_start -| 2) {
+    const left_budget = center_start;
+    const right_budget = width -| (center_start +| center_width);
+
+    // Collect left modules with widths
+    const ModuleInfo = struct { mod: *const core.StatusModule, width: u16, visible: bool };
+    var left_modules: [24]ModuleInfo = undefined;
+    var left_count: usize = 0;
+    for (cfg.left) |*mod| {
+        if (left_count < 24) {
+            left_modules[left_count] = .{
+                .mod = mod,
+                .width = calcModuleWidth(&ctx, mod.*),
+                .visible = false,
+            };
+            left_count += 1;
+        }
+    }
+
+    // Sort left by priority and mark visible
+    var left_order: [24]usize = undefined;
+    for (0..left_count) |i| left_order[i] = i;
+    for (1..left_count) |i| {
+        const key = left_order[i];
+        var j: usize = i;
+        while (j > 0 and left_modules[left_order[j - 1]].mod.priority > left_modules[key].mod.priority) : (j -= 1) {
+            left_order[j] = left_order[j - 1];
+        }
+        left_order[j] = key;
+    }
+    var left_used: u16 = 0;
+    for (left_order[0..left_count]) |idx| {
+        if (left_used + left_modules[idx].width <= left_budget) {
+            left_modules[idx].visible = true;
+            left_used += left_modules[idx].width;
+        }
+    }
+
+    // Collect right modules with widths
+    var right_modules: [24]ModuleInfo = undefined;
+    var right_count: usize = 0;
+    for (cfg.right) |*mod| {
+        if (right_count < 24) {
+            right_modules[right_count] = .{
+                .mod = mod,
+                .width = calcModuleWidth(&ctx, mod.*),
+                .visible = false,
+            };
+            right_count += 1;
+        }
+    }
+
+    // Sort right by priority and mark visible
+    var right_order: [24]usize = undefined;
+    for (0..right_count) |i| right_order[i] = i;
+    for (1..right_count) |i| {
+        const key = right_order[i];
+        var j: usize = i;
+        while (j > 0 and right_modules[right_order[j - 1]].mod.priority > right_modules[key].mod.priority) : (j -= 1) {
+            right_order[j] = right_order[j - 1];
+        }
+        right_order[j] = key;
+    }
+    var right_used: u16 = 0;
+    for (right_order[0..right_count]) |idx| {
+        if (right_used + right_modules[idx].width <= right_budget) {
+            right_modules[idx].visible = true;
+            right_used += right_modules[idx].width;
+        }
+    }
+
+    // === DRAW LEFT SECTION ===
+    var left_x: u16 = 0;
+    for (0..left_count) |i| {
+        if (left_modules[i].visible) {
+            left_x = drawModule(renderer, &ctx, left_modules[i].mod.*, left_x, y);
+        }
+    }
+
+    // === DRAW RIGHT SECTION (from right edge) ===
+    const right_start = width -| right_used;
+    var rx: u16 = right_start;
+    for (0..right_count) |i| {
+        if (right_modules[i].visible) {
+            rx = drawModule(renderer, &ctx, right_modules[i].mod.*, rx, y);
+        }
+    }
+
+    // === DRAW CENTER SECTION (truly centered, drawn last to win overlaps) ===
+    if (center_width > 0) {
+        // Use calculated center_start
         var cx: u16 = center_start;
+
         for (cfg.center) |mod| {
             if (std.mem.eql(u8, mod.name, "tabs")) {
                 const active_style = shp.Style.parse(mod.active_style);
                 const inactive_style = shp.Style.parse(mod.inactive_style);
                 const sep_style = shp.Style.parse(mod.separator_style);
 
-                for (ctx.tab_names, 0..) |tab_name, i| {
-                    if (i > 0) {
+                for (ctx.tab_names, 0..) |tab_name, ti| {
+                    // Stop at terminal edge
+                    if (cx >= width) break;
+
+                    if (ti > 0) {
                         cx = drawStyledText(renderer, cx, y, mod.separator, sep_style);
+                        if (cx >= width) break;
                     }
-                    const is_active = i == ctx.active_tab;
+                    const is_active = ti == ctx.active_tab;
                     const style = if (is_active) active_style else inactive_style;
                     const arrow_fg = if (is_active) active_style.bg else inactive_style.bg;
                     const arrow_style = shp.Style{ .fg = arrow_fg };
 
-                    cx = drawStyledText(renderer, cx, y, "", arrow_style);
+                    cx = drawStyledText(renderer, cx, y, tabs_left_arrow, arrow_style);
                     cx = drawStyledText(renderer, cx, y, " ", style);
                     cx = drawStyledText(renderer, cx, y, tab_name, style);
                     cx = drawStyledText(renderer, cx, y, " ", style);
-                    cx = drawStyledText(renderer, cx, y, "", arrow_style);
+                    cx = drawStyledText(renderer, cx, y, tabs_right_arrow, arrow_style);
                 }
             }
         }
     }
+}
+
+// Helper to measure tabs width - mirrors exact rendering logic
+fn measureTabsWidth(tab_names: []const []const u8, separator: []const u8, left_arrow: []const u8, right_arrow: []const u8) u16 {
+    var w: u16 = 0;
+    const left_arrow_width = measureText(left_arrow);
+    const right_arrow_width = measureText(right_arrow);
+
+    for (tab_names, 0..) |tab_name, ti| {
+        if (ti > 0) w += measureText(separator);
+        w += left_arrow_width;
+        w += 1; // space
+        w += measureText(tab_name);
+        w += 1; // space
+        w += right_arrow_width;
+    }
+    return w;
 }
 
 pub fn drawModule(renderer: *Renderer, ctx: *shp.Context, mod: core.config.StatusModule, start_x: u16, y: u16) u16 {
@@ -269,6 +364,23 @@ pub fn calcModuleWidth(ctx: *shp.Context, mod: core.config.StatusModule) u16 {
         width += calcFormattedWidth(out.format, output_text);
     }
 
+    return width;
+}
+
+pub fn countDisplayWidth(text: []const u8) u16 {
+    return measureText(text);
+}
+
+// Measure text width in terminal cells (same logic as drawStyledText)
+pub fn measureText(text: []const u8) u16 {
+    var width: u16 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const end = @min(i + len, text.len);
+        i = end;
+        width += 1;
+    }
     return width;
 }
 

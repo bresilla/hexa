@@ -12,6 +12,7 @@ const JsonOutput = struct {
 
 const JsonModule = struct {
     name: []const u8,
+    priority: ?i64 = null,
     outputs: ?[]const JsonOutput = null,
     command: ?[]const u8 = null,
     when: ?[]const u8 = null,
@@ -231,6 +232,11 @@ fn renderPrompt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     ctx.cwd = std.posix.getenv("PWD") orelse "";
     ctx.home = std.posix.getenv("HOME");
 
+    // Get terminal width from COLUMNS env var or default
+    if (posix.getenv("COLUMNS")) |cols| {
+        ctx.terminal_width = std.fmt.parseInt(u16, cols, 10) catch 80;
+    }
+
     const stdout = std.fs.File.stdout();
 
     // Detect shell from environment if not specified
@@ -327,6 +333,9 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
     const ModuleResult = struct {
         when_passed: bool = true,
         output: ?[]const u8 = null,
+        width: u16 = 0,
+        should_render: bool = true,
+        visible: bool = true, // After priority filtering
     };
 
     var results: [32]ModuleResult = [_]ModuleResult{.{}} ** 32;
@@ -405,18 +414,21 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
         }
     }
 
-    // Render modules
+    // First pass: calculate output text, width, and should_render for each module
     for (modules[0..mod_count], 0..) |mod, i| {
-        if (!results[i].when_passed) continue;
+        if (!results[i].when_passed) {
+            results[i].should_render = false;
+            continue;
+        }
 
         var output_text: []const u8 = "";
-        var should_render = true;
 
         if (mod.command != null) {
             if (results[i].output) |out| {
                 output_text = out;
             } else {
-                should_render = false;
+                results[i].should_render = false;
+                continue;
             }
         } else {
             var is_conditional = false;
@@ -432,11 +444,64 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
                     output_text = segs[0].text;
                 }
             } else if (is_conditional) {
-                should_render = false;
+                results[i].should_render = false;
+                continue;
             }
         }
 
-        if (!should_render) continue;
+        // Store output for later rendering
+        results[i].output = output_text;
+
+        // Calculate width from outputs
+        if (mod.outputs) |outputs| {
+            for (outputs) |out| {
+                const format = out.format orelse "$output";
+                results[i].width += calcFormatWidth(format, output_text);
+            }
+        }
+    }
+
+    // Priority-based width filtering
+    // Use half terminal width as budget (left/right prompts share the space)
+    const width_budget = ctx.terminal_width / 2;
+    var used_width: u16 = 0;
+
+    // Create sorted index array by priority (lower priority number = higher importance)
+    var priority_order: [32]usize = undefined;
+    for (0..mod_count) |i| {
+        priority_order[i] = i;
+    }
+
+    // Sort by priority (insertion sort - small array)
+    for (1..mod_count) |i| {
+        const key = priority_order[i];
+        const key_priority = modules[key].priority orelse 50;
+        var j: usize = i;
+        while (j > 0) {
+            const prev_priority = modules[priority_order[j - 1]].priority orelse 50;
+            if (prev_priority <= key_priority) break;
+            priority_order[j] = priority_order[j - 1];
+            j -= 1;
+        }
+        priority_order[j] = key;
+    }
+
+    // Mark modules as visible based on priority until budget exhausted
+    for (priority_order[0..mod_count]) |idx| {
+        if (!results[idx].should_render) continue;
+        if (used_width + results[idx].width <= width_budget) {
+            results[idx].visible = true;
+            used_width += results[idx].width;
+        } else {
+            results[idx].visible = false;
+        }
+    }
+
+    // Render modules in original order, but only visible ones
+    for (modules[0..mod_count], 0..) |mod, i| {
+        if (!results[i].should_render or !results[i].visible) continue;
+
+        const output_text = results[i].output orelse "";
 
         if (mod.outputs) |outputs| {
             for (outputs) |out| {
@@ -454,6 +519,22 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
             }
         }
     }
+}
+
+/// Calculate the visible width of a format string with $output substituted
+fn calcFormatWidth(format: []const u8, output: []const u8) u16 {
+    var width: u16 = 0;
+    var i: usize = 0;
+    while (i < format.len) {
+        if (i + 6 < format.len and std.mem.eql(u8, format[i .. i + 7], "$output")) {
+            width += @intCast(output.len);
+            i += 7;
+        } else {
+            width += 1;
+            i += 1;
+        }
+    }
+    return width;
 }
 
 fn runCommand(allocator: std.mem.Allocator, cmd: []const u8) ?[]const u8 {

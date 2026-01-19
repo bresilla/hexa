@@ -70,10 +70,29 @@ pub fn drawSplitBorders(
         }
     }
 
-    // Draw vertical lines
+    // Draw vertical lines - but only where there's actually a split boundary
     for (v_lines[0..v_line_count]) |x| {
         for (0..content_height) |row| {
             const y: u16 = @intCast(row);
+
+            // Check if this row actually has a vertical boundary at this x
+            // A vertical line should only be drawn where a pane ends (right_edge == x)
+            // and that row is within that pane's y range
+            var should_draw = false;
+            var pane_check = layout.splitIterator();
+            while (pane_check.next()) |pane| {
+                const right_edge = pane.*.x + pane.*.width;
+                if (right_edge == x) {
+                    // Check if y is within this pane's vertical range
+                    if (y >= pane.*.y and y < pane.*.y + pane.*.height) {
+                        should_draw = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!should_draw) continue;
+
             var char = v_char;
 
             // Check for junctions with horizontal lines
@@ -99,7 +118,7 @@ pub fn drawSplitBorders(
         }
     }
 
-    // Draw horizontal lines
+    // Draw horizontal lines - but only where there's actually a split boundary
     for (h_lines[0..h_line_count]) |y| {
         for (0..term_width) |col| {
             const x: u16 = @intCast(col);
@@ -113,6 +132,24 @@ pub fn drawSplitBorders(
                 }
             }
             if (is_junction) continue;
+
+            // Check if this column actually has a horizontal boundary at this y
+            // A horizontal line should only be drawn where a pane ends (bottom_edge == y)
+            // and that column is within that pane's x range
+            var should_draw = false;
+            var pane_check = layout.splitIterator();
+            while (pane_check.next()) |pane| {
+                const bottom_edge = pane.*.y + pane.*.height;
+                if (bottom_edge == y) {
+                    // Check if x is within this pane's horizontal range
+                    if (x >= pane.*.x and x < pane.*.x + pane.*.width) {
+                        should_draw = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!should_draw) continue;
 
             var char = h_char;
 

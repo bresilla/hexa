@@ -10,18 +10,23 @@ pub const OutputDef = struct {
 /// Status bar module definition
 pub const StatusModule = struct {
     name: []const u8,
+    // Priority for width-based hiding (lower = higher priority, stays longer)
+    priority: u8 = 50,
     // Array of outputs (each with style + format)
     outputs: []const OutputDef = &[_]OutputDef{},
     // Optional for custom modules
     command: ?[]const u8 = null,
     when: ?[]const u8 = null,
-    // For panes module
+    // For tabs module
     active_style: []const u8 = "bg:1 fg:0",
     inactive_style: []const u8 = "bg:237 fg:250",
     separator: []const u8 = " | ",
     separator_style: []const u8 = "fg:7",
-    // For panes module: what to show as tab title ("name" or "basename")
+    // For tabs module: what to show as tab title ("name" or "basename")
     tab_title: []const u8 = "basename",
+    // For tabs module: arrow decorations (empty string = no arrows)
+    left_arrow: []const u8 = "",
+    right_arrow: []const u8 = "",
 };
 
 /// Status bar config
@@ -477,6 +482,7 @@ pub const Config = struct {
 
             list.append(allocator, .{
                 .name = allocator.dupe(u8, jm.name) catch continue,
+                .priority = if (jm.priority) |p| @intCast(@max(1, @min(255, p))) else 50,
                 .outputs = outputs,
                 .command = if (jm.command) |c| allocator.dupe(u8, c) catch null else null,
                 .when = if (jm.when) |w| allocator.dupe(u8, w) catch null else null,
@@ -485,6 +491,8 @@ pub const Config = struct {
                 .separator = if (jm.separator) |s| allocator.dupe(u8, s) catch " | " else " | ",
                 .separator_style = if (jm.separator_style) |s| allocator.dupe(u8, s) catch "fg:7" else "fg:7",
                 .tab_title = if (jm.tab_title) |s| allocator.dupe(u8, s) catch "basename" else "basename",
+                .left_arrow = if (jm.left_arrow) |s| allocator.dupe(u8, s) catch "" else "",
+                .right_arrow = if (jm.right_arrow) |s| allocator.dupe(u8, s) catch "" else "",
             }) catch continue;
         }
         return list.toOwnedSlice(allocator) catch &[_]StatusModule{};
@@ -612,6 +620,7 @@ const JsonOutput = struct {
 
 const JsonStatusModule = struct {
     name: []const u8,
+    priority: ?i64 = null,
     outputs: ?[]const JsonOutput = null,
     command: ?[]const u8 = null,
     when: ?[]const u8 = null,
@@ -620,4 +629,6 @@ const JsonStatusModule = struct {
     separator: ?[]const u8 = null,
     separator_style: ?[]const u8 = null,
     tab_title: ?[]const u8 = null,
+    left_arrow: ?[]const u8 = null,
+    right_arrow: ?[]const u8 = null,
 };

@@ -1335,10 +1335,12 @@ fn handleInput(state: *State, inp: []const u8) void {
     // ==========================================================================
     const current_tab = &state.tabs.items[state.active_tab];
     if (current_tab.popups.isBlocked()) {
-        // Allow tab switching (Alt+N, Alt+P)
+        // Allow tab switching (Alt+N, Alt+P) - also support fallback keys for Alt+>/<
         if (inp.len >= 2 and inp[0] == 0x1b and inp[1] != '[' and inp[1] != 'O') {
             const cfg = &state.config;
-            if (inp[1] == cfg.tabs.key_next or inp[1] == cfg.tabs.key_prev) {
+            const is_next = inp[1] == cfg.tabs.key_next or (cfg.tabs.key_next == '>' and inp[1] == '.');
+            const is_prev = inp[1] == cfg.tabs.key_prev or (cfg.tabs.key_prev == '<' and inp[1] == ',');
+            if (is_next or is_prev) {
                 // Allow tab switch
                 if (handleAltKey(state, inp[1])) {
                     return;
@@ -2060,8 +2062,8 @@ fn handleAltKey(state: *State, key: u8) bool {
         return true;
     }
 
-    // Alt+n = next tab
-    if (key == cfg.tabs.key_next) {
+    // Alt+n = next tab (also support Alt+. as fallback for Alt+>)
+    if (key == cfg.tabs.key_next or (cfg.tabs.key_next == '>' and key == '.')) {
         const old_uuid = state.getCurrentFocusedUuid();
         if (state.active_floating) |idx| {
             if (idx < state.floats.items.len) {
@@ -2085,8 +2087,8 @@ fn handleAltKey(state: *State, key: u8) bool {
         return true;
     }
 
-    // Alt+p = previous tab
-    if (key == cfg.tabs.key_prev) {
+    // Alt+p = previous tab (also support Alt+, as fallback for Alt+<)
+    if (key == cfg.tabs.key_prev or (cfg.tabs.key_prev == '<' and key == ',')) {
         const old_uuid = state.getCurrentFocusedUuid();
         if (state.active_floating) |idx| {
             if (idx < state.floats.items.len) {
