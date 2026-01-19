@@ -4,6 +4,7 @@ const core = @import("core");
 const ghostty = @import("ghostty-vt");
 const notification = @import("notification.zig");
 const NotificationManager = notification.NotificationManager;
+const pop = @import("pop");
 
 /// A Pane is a ghostty VT + PTY that can be rendered to a region of the screen
 pub const Pane = struct {
@@ -62,6 +63,9 @@ pub const Pane = struct {
     // Pane-local notifications (PANE realm - renders at bottom of pane)
     notifications: NotificationManager = undefined,
     notifications_initialized: bool = false,
+    // Pane-local popups (blocking at PANE level)
+    popups: pop.PopupManager = undefined,
+    popups_initialized: bool = false,
 
     pub fn init(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16) !void {
         return self.initWithCommand(allocator, id, x, y, width, height, null);
@@ -81,6 +85,9 @@ pub const Pane = struct {
         // Initialize pane-local notifications
         self.notifications = NotificationManager.init(allocator);
         self.notifications_initialized = true;
+        // Initialize pane-local popups
+        self.popups = pop.PopupManager.init(allocator);
+        self.popups_initialized = true;
     }
 
     /// Initialize a pane with an fd received from ses daemon
@@ -111,6 +118,9 @@ pub const Pane = struct {
         // Initialize pane-local notifications
         self.notifications = NotificationManager.init(allocator);
         self.notifications_initialized = true;
+        // Initialize pane-local popups
+        self.popups = pop.PopupManager.init(allocator);
+        self.popups_initialized = true;
     }
 
     pub fn deinit(self: *Pane) void {
@@ -123,6 +133,10 @@ pub const Pane = struct {
         // Deinit pane-local notifications
         if (self.notifications_initialized) {
             self.notifications.deinit();
+        }
+        // Deinit pane-local popups
+        if (self.popups_initialized) {
+            self.popups.deinit();
         }
     }
 

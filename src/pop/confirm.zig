@@ -59,7 +59,7 @@ pub const Confirm = struct {
     }
 
     /// Handle keyboard input
-    /// Left/Right arrows, Enter to confirm, ESC to cancel
+    /// Left/Right arrows toggle, Enter to confirm, ESC to cancel
     pub fn handleInput(self: *Confirm, key: u8) InputResult {
         switch (key) {
             27 => { // ESC - cancel
@@ -71,15 +71,9 @@ pub const Confirm = struct {
                 self.result = self.selected == .yes;
                 return .dismissed;
             },
-            // For arrow keys, we receive escape sequences like \x1b[D (left) \x1b[C (right)
-            // But since we only get one byte at a time, we need to handle this differently
-            // Use simple h/l for now, or we can check for specific bytes
-            'h', 'H' => { // Left - select No
-                self.selected = .no;
-                return .consumed;
-            },
-            'l', 'L' => { // Right - select Yes
-                self.selected = .yes;
+            // Left/Right toggle between options
+            'h', 'H', 'l', 'L' => {
+                self.toggle();
                 return .consumed;
             },
             else => return .consumed, // Consume all other input when popup is active

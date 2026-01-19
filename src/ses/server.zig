@@ -1086,9 +1086,9 @@ pub const Server = struct {
             return self.sendError(conn, "mux_not_found");
         };
 
-        // Send pop_confirm request to mux
+        // Send pop_confirm request to mux (include target_uuid for scope detection)
         var msg_buf: [4096]u8 = undefined;
-        const pop_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pop_confirm\",\"message\":\"{s}\"}}\n", .{message}) catch {
+        const pop_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pop_confirm\",\"message\":\"{s}\",\"target_uuid\":\"{s}\"}}\n", .{ message, uuid_str }) catch {
             return self.sendError(conn, "message_too_long");
         };
         var mux_conn = ipc.Connection{ .fd = found_mux.fd };
@@ -1231,6 +1231,12 @@ pub const Server = struct {
                     }
                 }
             }
+        }
+
+        // UUID not found - might be a tab UUID (mux-internal, not tracked by ses)
+        // Return first available mux and let it check if UUID matches one of its tabs
+        if (self.ses_state.clients.items.len > 0) {
+            return &self.ses_state.clients.items[0];
         }
 
         return null;

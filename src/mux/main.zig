@@ -28,6 +28,7 @@ const Tab = struct {
     name: []const u8,
     uuid: [32]u8,
     notifications: NotificationManager,
+    popups: pop.PopupManager,
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator, width: u16, height: u16, name: []const u8, notif_cfg: pop.NotificationStyle) Tab {
@@ -36,6 +37,7 @@ const Tab = struct {
             .name = name,
             .uuid = core.ipc.generateUuid(),
             .notifications = NotificationManager.initWithPopConfig(allocator, notif_cfg),
+            .popups = pop.PopupManager.init(allocator),
             .allocator = allocator,
         };
     }
@@ -43,6 +45,7 @@ const Tab = struct {
     fn deinit(self: *Tab) void {
         self.layout.deinit();
         self.notifications.deinit();
+        self.popups.deinit();
     }
 };
 
@@ -68,6 +71,9 @@ const State = struct {
     notifications: NotificationManager,
     popups: pop.PopupManager, // For blocking popups (confirm, choose)
     pending_pop_response: bool, // True if waiting to send pop response
+    pending_pop_scope: pop.Scope, // Which scope the pending popup belongs to
+    pending_pop_tab: usize, // Tab index if scope is .tab
+    pending_pop_pane: ?*Pane, // Pane pointer if scope is .pane
     uuid: [32]u8,
     session_name: []const u8,
     session_name_owned: ?[]const u8, // If set, points to owned memory that must be freed
@@ -113,6 +119,9 @@ const State = struct {
             .notifications = NotificationManager.initWithPopConfig(allocator, pop_cfg.carrier.notification),
             .popups = pop.PopupManager.init(allocator),
             .pending_pop_response = false,
+            .pending_pop_scope = .mux,
+            .pending_pop_tab = 0,
+            .pending_pop_pane = null,
             .uuid = uuid,
             .session_name = session_name,
             .session_name_owned = null,
@@ -1295,27 +1304,71 @@ fn runMainLoop(state: *State) !void {
     }
 }
 
-fn handleInput(state: *State, input: []const u8) void {
-    // Check if popup is blocking input
-    if (state.popups.isBlocked()) {
-        if (input.len == 0) return;
-
-        // Convert arrow key escape sequences to simple keys
-        // Arrow keys: ESC [ A (up), ESC [ B (down), ESC [ C (right), ESC [ D (left)
-        var key: u8 = input[0];
-        if (input.len >= 3 and input[0] == 0x1b and input[1] == '[') {
-            key = switch (input[2]) {
-                'C' => 'l', // Right arrow -> 'l' (select yes / next)
-                'D' => 'h', // Left arrow -> 'h' (select no / prev)
-                'A' => 'k', // Up arrow -> 'k' (for picker)
-                'B' => 'j', // Down arrow -> 'j' (for picker)
-                else => input[0],
+/// Convert arrow key escape sequences to vim-style keys for popup navigation
+/// Returns 0 for keys that should be ignored (like Alt+key sequences)
+fn convertArrowKey(input: []const u8) u8 {
+    if (input.len == 0) return 0;
+    // Check for ESC sequences
+    if (input[0] == 0x1b) {
+        // Arrow keys: ESC [ A/B/C/D
+        if (input.len >= 3 and input[1] == '[') {
+            return switch (input[2]) {
+                'C' => 'l', // Right arrow -> toggle
+                'D' => 'h', // Left arrow -> toggle
+                'A' => 'k', // Up arrow -> up (picker)
+                'B' => 'j', // Down arrow -> down (picker)
+                else => 0, // Ignore other CSI sequences
             };
         }
+        // Alt+key: ESC followed by printable char (not '[' or 'O')
+        // Ignore these - return 0
+        if (input.len >= 2 and input[1] != '[' and input[1] != 'O') {
+            return 0; // Ignore Alt+key
+        }
+        // Bare ESC key (no following char, or timeout)
+        return 27; // ESC to cancel
+    }
+    return input[0];
+}
 
-        const result = state.popups.handleInput(key);
-        if (result == .dismissed) {
-            // Popup was dismissed, send response to ses
+/// Handle popup input and return true if popup was dismissed
+fn handlePopupInput(popups: *pop.PopupManager, input: []const u8) bool {
+    const key = convertArrowKey(input);
+    const result = popups.handleInput(key);
+    return result == .dismissed;
+}
+
+fn handleInput(state: *State, input: []const u8) void {
+    if (input.len == 0) return;
+
+    // ==========================================================================
+    // LEVEL 1: MUX-level popup blocks EVERYTHING
+    // ==========================================================================
+    if (state.popups.isBlocked()) {
+        if (handlePopupInput(&state.popups, input)) {
+            sendPopResponse(state);
+        }
+        state.needs_render = true;
+        return;
+    }
+
+    // ==========================================================================
+    // LEVEL 2: TAB-level popup - allows tab switching, blocks rest
+    // ==========================================================================
+    const current_tab = &state.tabs.items[state.active_tab];
+    if (current_tab.popups.isBlocked()) {
+        // Allow tab switching (Alt+N, Alt+P)
+        if (input.len >= 2 and input[0] == 0x1b and input[1] != '[' and input[1] != 'O') {
+            const cfg = &state.config;
+            if (input[1] == cfg.tabs.key_next or input[1] == cfg.tabs.key_prev) {
+                // Allow tab switch
+                if (handleAltKey(state, input[1])) {
+                    return;
+                }
+            }
+        }
+        // Block everything else - handle popup input
+        if (handlePopupInput(&current_tab.popups, input)) {
             sendPopResponse(state);
         }
         state.needs_render = true;
@@ -1350,7 +1403,9 @@ fn handleInput(state: *State, input: []const u8) void {
             return;
         }
 
-        // If pane is scrolled and user types, scroll to bottom first
+        // ==========================================================================
+        // LEVEL 3: PANE-level popup - blocks only input to that specific pane
+        // ==========================================================================
         if (state.active_floating) |idx| {
             const fpane = state.floats.items[idx];
             // Check tab ownership for tab-bound floats
@@ -1360,6 +1415,14 @@ fn handleInput(state: *State, input: []const u8) void {
                 true;
 
             if (fpane.visible and can_interact) {
+                // Check if this float pane has a blocking popup
+                if (fpane.popups.isBlocked()) {
+                    if (handlePopupInput(&fpane.popups, input[i..])) {
+                        sendPopResponse(state);
+                    }
+                    state.needs_render = true;
+                    return;
+                }
                 if (fpane.isScrolled()) {
                     fpane.scrollToBottom();
                     state.needs_render = true;
@@ -1368,6 +1431,14 @@ fn handleInput(state: *State, input: []const u8) void {
             } else {
                 // Can't input to tab-bound float on wrong tab, forward to tiled pane
                 if (state.currentLayout().getFocusedPane()) |pane| {
+                    // Check if this pane has a blocking popup
+                    if (pane.popups.isBlocked()) {
+                        if (handlePopupInput(&pane.popups, input[i..])) {
+                            sendPopResponse(state);
+                        }
+                        state.needs_render = true;
+                        return;
+                    }
                     if (pane.isScrolled()) {
                         pane.scrollToBottom();
                         state.needs_render = true;
@@ -1376,6 +1447,14 @@ fn handleInput(state: *State, input: []const u8) void {
                 }
             }
         } else if (state.currentLayout().getFocusedPane()) |pane| {
+            // Check if this pane has a blocking popup
+            if (pane.popups.isBlocked()) {
+                if (handlePopupInput(&pane.popups, input[i..])) {
+                    sendPopResponse(state);
+                }
+                state.needs_render = true;
+                return;
+            }
             if (pane.isScrolled()) {
                 pane.scrollToBottom();
                 state.needs_render = true;
@@ -1500,10 +1579,51 @@ fn handleSesMessage(state: *State, buffer: []u8) void {
     // Handle pop_confirm - show confirm dialog
     else if (std.mem.eql(u8, msg_type, "pop_confirm")) {
         const msg = (root.get("message") orelse return).string;
+        const target_uuid = if (root.get("target_uuid")) |v| v.string else null;
 
-        // Show confirm dialog at MUX level (blocks everything)
+        // Determine scope based on target_uuid
+        if (target_uuid) |uuid| {
+            // Check if it matches a tab UUID
+            for (state.tabs.items, 0..) |*tab, tab_idx| {
+                if (std.mem.startsWith(u8, &tab.uuid, uuid)) {
+                    tab.popups.showConfirmOwned(msg, .{}) catch return;
+                    state.pending_pop_response = true;
+                    state.pending_pop_scope = .tab;
+                    state.pending_pop_tab = tab_idx;
+                    state.needs_render = true;
+                    return;
+                }
+            }
+            // Check if it matches a pane UUID (tiled splits)
+            for (state.tabs.items) |*tab| {
+                var iter = tab.layout.splits.valueIterator();
+                while (iter.next()) |pane| {
+                    if (std.mem.startsWith(u8, &pane.*.uuid, uuid)) {
+                        pane.*.popups.showConfirmOwned(msg, .{}) catch return;
+                        state.pending_pop_response = true;
+                        state.pending_pop_scope = .pane;
+                        state.pending_pop_pane = pane.*;
+                        state.needs_render = true;
+                        return;
+                    }
+                }
+            }
+            // Check if it matches a float pane UUID
+            for (state.floats.items) |pane| {
+                if (std.mem.startsWith(u8, &pane.uuid, uuid)) {
+                    pane.popups.showConfirmOwned(msg, .{}) catch return;
+                    state.pending_pop_response = true;
+                    state.pending_pop_scope = .pane;
+                    state.pending_pop_pane = pane;
+                    state.needs_render = true;
+                    return;
+                }
+            }
+        }
+        // Default: MUX level (blocks everything)
         state.popups.showConfirmOwned(msg, .{}) catch return;
         state.pending_pop_response = true;
+        state.pending_pop_scope = .mux;
         state.needs_render = true;
     }
     // Handle pop_choose - show picker dialog
@@ -1548,30 +1668,37 @@ fn sendPopResponse(state: *State) void {
     // Get the connection to ses
     const conn = &(state.ses_client.conn orelse return);
 
+    // Get the correct PopupManager based on scope
+    var popups: *pop.PopupManager = switch (state.pending_pop_scope) {
+        .mux => &state.popups,
+        .tab => &state.tabs.items[state.pending_pop_tab].popups,
+        .pane => if (state.pending_pop_pane) |pane| &pane.popups else &state.popups,
+    };
+
     // Check what kind of response we need to send
     var buf: [256]u8 = undefined;
 
     // Try to get confirm result
-    if (state.popups.getConfirmResult()) |confirmed| {
+    if (popups.getConfirmResult()) |confirmed| {
         const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pop_response\",\"confirmed\":{}}}", .{confirmed}) catch return;
         conn.sendLine(msg) catch {};
-        state.popups.clearResults();
+        popups.clearResults();
         return;
     }
 
     // Try to get picker result
-    if (state.popups.getPickerResult()) |selected| {
+    if (popups.getPickerResult()) |selected| {
         const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pop_response\",\"selected\":{d}}}", .{selected}) catch return;
         conn.sendLine(msg) catch {};
-        state.popups.clearResults();
+        popups.clearResults();
         return;
     }
 
     // Picker was cancelled (result is null but wasPickerCancelled is true)
-    if (state.popups.wasPickerCancelled()) {
+    if (popups.wasPickerCancelled()) {
         const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pop_response\",\"cancelled\":true}}", .{}) catch return;
         conn.sendLine(msg) catch {};
-        state.popups.clearResults();
+        popups.clearResults();
         return;
     }
 
@@ -1579,7 +1706,7 @@ fn sendPopResponse(state: *State) void {
     // This handles edge cases
     const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pop_response\",\"cancelled\":true}}", .{}) catch return;
     conn.sendLine(msg) catch {};
-    state.popups.clearResults();
+    popups.clearResults();
 }
 
 fn sendNotifyToParentMux(_: std.mem.Allocator, message: []const u8) void {
@@ -2362,15 +2489,35 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
     // Draw TAB realm notifications (center of screen, below MUX)
     const current_tab = &state.tabs.items[state.active_tab];
+
+    // Draw PANE-level blocking popups (for ALL panes with active popups)
+    // Check all splits in current tab
+    var split_iter = current_tab.layout.splits.valueIterator();
+    while (split_iter.next()) |pane| {
+        if (pane.*.popups.getActivePopup()) |popup| {
+            drawPopupInBounds(state, renderer, popup, pane.*.x, pane.*.y, pane.*.width, pane.*.height);
+        }
+    }
+    // Check all floats
+    for (state.floats.items) |fpane| {
+        if (fpane.popups.getActivePopup()) |popup| {
+            drawPopupInBounds(state, renderer, popup, fpane.x, fpane.y, fpane.width, fpane.height);
+        }
+    }
     if (current_tab.notifications.hasActive()) {
         // TAB notifications render in center area (distinct from MUX at top)
         current_tab.notifications.renderInBounds(renderer, 0, 0, state.term_width, state.layout_height, true);
     }
 
+    // Draw TAB-level blocking popup (below MUX popup)
+    if (current_tab.popups.getActivePopup()) |popup| {
+        drawPopup(state, renderer, popup);
+    }
+
     // Draw MUX realm notifications overlay (top of screen)
     state.notifications.render(renderer, state.term_width, state.term_height);
 
-    // Draw blocking popup overlay (on top of everything)
+    // Draw MUX-level blocking popup overlay (on top of everything)
     if (state.popups.getActivePopup()) |popup| {
         drawPopup(state, renderer, popup);
     }
@@ -2429,15 +2576,19 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
 /// Draw a blocking popup (confirm or picker) centered on screen
 fn drawPopup(state: *State, renderer: *Renderer, popup: pop.Popup) void {
+    drawPopupInBounds(state, renderer, popup, 0, 0, state.term_width, state.term_height);
+}
+
+fn drawPopupInBounds(state: *State, renderer: *Renderer, popup: pop.Popup, bounds_x: u16, bounds_y: u16, bounds_w: u16, bounds_h: u16) void {
     const cfg = &state.pop_config.carrier;
 
     switch (popup) {
-        .confirm => |confirm| drawConfirmPopup(state, renderer, confirm, cfg.confirm),
-        .picker => |picker| drawPickerPopup(state, renderer, picker, cfg.choose),
+        .confirm => |confirm| drawConfirmPopupInBounds(renderer, confirm, cfg.confirm, bounds_x, bounds_y, bounds_w, bounds_h),
+        .picker => |picker| drawPickerPopupInBounds(renderer, picker, cfg.choose, bounds_x, bounds_y, bounds_w, bounds_h),
     }
 }
 
-fn drawConfirmPopup(state: *State, renderer: *Renderer, confirm: *pop.Confirm, cfg: pop.ConfirmStyle) void {
+fn drawConfirmPopupInBounds(renderer: *Renderer, confirm: *pop.Confirm, cfg: pop.ConfirmStyle, bounds_x: u16, bounds_y: u16, bounds_w: u16, bounds_h: u16) void {
     const dims = confirm.getBoxDimensions();
 
     // Ensure minimum width for the box
@@ -2445,9 +2596,9 @@ fn drawConfirmPopup(state: *State, renderer: *Renderer, confirm: *pop.Confirm, c
     const box_width = @max(dims.width, min_width);
     const box_height = dims.height;
 
-    // Center on screen
-    const center_x = state.term_width / 2;
-    const center_y = state.term_height / 2;
+    // Center within bounds
+    const center_x = bounds_x + bounds_w / 2;
+    const center_y = bounds_y + bounds_h / 2;
     const box_x = center_x -| (box_width / 2);
     const box_y = center_y -| (box_height / 2);
 
@@ -2554,7 +2705,7 @@ fn drawConfirmPopup(state: *State, renderer: *Renderer, confirm: *pop.Confirm, c
     renderer.setCell(bx, buttons_y, .{ .char = ']', .fg = no_fg, .bg = no_bg });
 }
 
-fn drawPickerPopup(state: *State, renderer: *Renderer, picker: *pop.Picker, cfg: pop.ChooseStyle) void {
+fn drawPickerPopupInBounds(renderer: *Renderer, picker: *pop.Picker, cfg: pop.ChooseStyle, bounds_x: u16, bounds_y: u16, bounds_w: u16, bounds_h: u16) void {
     const dims = picker.getBoxDimensions();
 
     // Ensure minimum width
@@ -2562,9 +2713,9 @@ fn drawPickerPopup(state: *State, renderer: *Renderer, picker: *pop.Picker, cfg:
     const box_width = @max(dims.width, min_width);
     const box_height = dims.height + 2; // +2 for border
 
-    // Center on screen
-    const center_x = state.term_width / 2;
-    const center_y = state.term_height / 2;
+    // Center within bounds
+    const center_x = bounds_x + bounds_w / 2;
+    const center_y = bounds_y + bounds_h / 2;
     const box_x = center_x -| (box_width / 2);
     const box_y = center_y -| (box_height / 2);
 
