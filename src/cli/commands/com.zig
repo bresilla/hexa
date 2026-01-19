@@ -100,24 +100,6 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
 }
 
 pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator: bool, show_last: bool) !void {
-    // Determine which UUID to query
-    var target_uuid: ?[]const u8 = null;
-
-    if (uuid_arg.len > 0) {
-        // Explicit UUID provided - can query from anywhere
-        target_uuid = uuid_arg;
-    } else {
-        // Need to be inside mux session
-        const pane_uuid = std.posix.getenv("HEXA_PANE_UUID");
-        if (pane_uuid == null) {
-            print("Not inside a hexa mux session (use --uuid to query specific pane)\n", .{});
-            return;
-        }
-        target_uuid = pane_uuid;
-    }
-
-    const uuid = target_uuid orelse return;
-
     // Connect to ses
     const socket_path = try ipc.getSesSocketPath(allocator);
     defer allocator.free(socket_path);
@@ -133,10 +115,80 @@ pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator:
 
     var conn = client.toConnection();
     var buf: [1024]u8 = undefined;
-    const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid});
+    var resp_buf: [4096]u8 = undefined;
+    var uuid_buf: [32]u8 = undefined;
+
+    // Determine which UUID to query
+    var target_uuid: []const u8 = undefined;
+
+    if (uuid_arg.len > 0) {
+        // Explicit UUID provided
+        target_uuid = uuid_arg;
+    } else if (show_creator or show_last) {
+        // Need current pane UUID first, then get creator/last from it
+        const current_uuid = std.posix.getenv("HEXA_PANE_UUID") orelse {
+            print("--creator/--last requires running inside hexa mux\n", .{});
+            return;
+        };
+
+        // Query current pane to get creator/last UUID
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{current_uuid});
+        try conn.sendLine(msg);
+
+        const response = try conn.recvLine(&resp_buf);
+        if (response == null) {
+            print("No response from daemon\n", .{});
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, response.?, .{}) catch {
+            print("Invalid response from daemon\n", .{});
+            return;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        if (show_creator) {
+            if (root.get("created_from")) |cf| {
+                if (cf.string.len == 32) {
+                    @memcpy(&uuid_buf, cf.string[0..32]);
+                    target_uuid = &uuid_buf;
+                } else {
+                    print("Current pane has no creator\n", .{});
+                    return;
+                }
+            } else {
+                print("Current pane has no creator\n", .{});
+                return;
+            }
+        } else if (show_last) {
+            if (root.get("focused_from")) |ff| {
+                if (ff.string.len == 32) {
+                    @memcpy(&uuid_buf, ff.string[0..32]);
+                    target_uuid = &uuid_buf;
+                } else {
+                    print("Current pane has no last focused\n", .{});
+                    return;
+                }
+            } else {
+                print("Current pane has no last focused\n", .{});
+                return;
+            }
+        }
+    } else {
+        // Default: query current pane
+        const pane_uuid = std.posix.getenv("HEXA_PANE_UUID");
+        if (pane_uuid == null) {
+            print("Not inside a hexa mux session (use --uuid to query specific pane)\n", .{});
+            return;
+        }
+        target_uuid = pane_uuid.?;
+    }
+
+    // Query the target pane
+    const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{target_uuid});
     try conn.sendLine(msg);
 
-    var resp_buf: [4096]u8 = undefined;
     const response = try conn.recvLine(&resp_buf);
     if (response == null) {
         print("No response from daemon\n", .{});
@@ -161,26 +213,22 @@ pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator:
         }
     }
 
-    // If --creator or --last, just print that UUID
-    if (show_creator) {
-        if (root.get("created_from")) |cf| {
-            print("{s}\n", .{cf.string});
-        }
-        return;
-    }
-    if (show_last) {
-        if (root.get("focused_from")) |ff| {
-            print("{s}\n", .{ff.string});
-        }
-        return;
-    }
-
-    // Default: show all info
+    // Show all info
     print("Pane Info:\n", .{});
-    print("  UUID: {s}\n", .{uuid});
+    print("  UUID: {s}\n", .{target_uuid});
 
     if (root.get("pid")) |pid| {
-        print("  PID: {d}\n", .{pid.integer});
+        print("  Shell PID: {d}\n", .{pid.integer});
+    }
+    if (root.get("fg_process")) |proc| {
+        if (root.get("fg_pid")) |pid| {
+            print("  Process: {s} (pid={d})\n", .{ proc.string, pid.integer });
+        } else {
+            print("  Process: {s}\n", .{proc.string});
+        }
+    }
+    if (root.get("cwd")) |cwd| {
+        print("  CWD: {s}\n", .{cwd.string});
     }
     if (root.get("session_name")) |sn| {
         print("  Session: {s}\n", .{sn.string});

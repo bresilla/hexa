@@ -308,6 +308,15 @@ pub fn handlePaneInfo(
     if (pane.focused_from) |focused_uuid| {
         try writer.print(",\"focused_from\":\"{s}\"", .{focused_uuid});
     }
+    if (pane.cwd) |cwd| {
+        try writer.print(",\"cwd\":\"{s}\"", .{cwd});
+    }
+    if (pane.fg_process) |proc| {
+        try writer.print(",\"fg_process\":\"{s}\"", .{proc});
+    }
+    if (pane.fg_pid) |pid| {
+        try writer.print(",\"fg_pid\":{d}", .{pid});
+    }
     try writer.print(",\"cursor_x\":{d},\"cursor_y\":{d}", .{ pane.cursor_x, pane.cursor_y });
 
     try writer.writeAll("}\n");
@@ -405,6 +414,40 @@ pub fn handleUpdatePaneAux(
     if (root.get("cursor_y")) |v| {
         switch (v) {
             .integer => |i| pane.cursor_y = @intCast(@max(0, i)),
+            else => {},
+        }
+    }
+
+    // Update CWD (owned string)
+    if (root.get("cwd")) |v| {
+        switch (v) {
+            .string => |s| {
+                if (pane.cwd) |old| {
+                    ses_state.allocator.free(old);
+                }
+                pane.cwd = ses_state.allocator.dupe(u8, s) catch null;
+            },
+            else => {},
+        }
+    }
+
+    // Update foreground process name (owned string)
+    if (root.get("fg_process")) |v| {
+        switch (v) {
+            .string => |s| {
+                if (pane.fg_process) |old| {
+                    ses_state.allocator.free(old);
+                }
+                pane.fg_process = ses_state.allocator.dupe(u8, s) catch null;
+            },
+            else => {},
+        }
+    }
+
+    // Update foreground process PID
+    if (root.get("fg_pid")) |v| {
+        switch (v) {
+            .integer => |i| pane.fg_pid = @intCast(i),
             else => {},
         }
     }

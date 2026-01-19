@@ -755,6 +755,9 @@ const State = struct {
             created_from,
             focused_from,
             .{ .x = cursor.x, .y = cursor.y },
+            pane.getRealCwd(),
+            pane.getFgProcess(),
+            pane.getFgPid(),
         ) catch {
             // Silently ignore errors - pane might not exist in ses yet or anymore
         };
@@ -772,7 +775,7 @@ const State = struct {
                     p.*.focused = false;
                     const pane_type: SesClient.PaneType = if (p.*.floating) .float else .split;
                     const cursor = p.*.getCursorPos();
-                    self.ses_client.updatePaneAux(p.*.uuid, p.*.floating, false, pane_type, null, null, .{ .x = cursor.x, .y = cursor.y }) catch {};
+                    self.ses_client.updatePaneAux(p.*.uuid, p.*.floating, false, pane_type, null, null, .{ .x = cursor.x, .y = cursor.y }, null, null, null) catch {};
                 }
             }
         }
@@ -782,7 +785,7 @@ const State = struct {
             if (fp.uuid[0] != 0) {
                 fp.focused = false;
                 const cursor = fp.getCursorPos();
-                self.ses_client.updatePaneAux(fp.uuid, fp.floating, false, .float, null, null, .{ .x = cursor.x, .y = cursor.y }) catch {};
+                self.ses_client.updatePaneAux(fp.uuid, fp.floating, false, .float, null, null, .{ .x = cursor.x, .y = cursor.y }, null, null, null) catch {};
             }
         }
     }
@@ -808,6 +811,9 @@ const State = struct {
             null, // don't update created_from on focus change
             focused_from,
             .{ .x = cursor.x, .y = cursor.y },
+            pane.getRealCwd(),
+            pane.getFgProcess(),
+            pane.getFgPid(),
         ) catch {
             // Silently ignore errors - pane might not exist in ses
         };
@@ -829,6 +835,9 @@ const State = struct {
             null,
             null,
             .{ .x = cursor.x, .y = cursor.y },
+            pane.getRealCwd(),
+            pane.getFgProcess(),
+            pane.getFgPid(),
         ) catch {
             // Silently ignore errors - pane might not exist in ses
         };
@@ -2334,7 +2343,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
     } else if (state.currentLayout().getFocusedPane()) |tiled| {
         state.syncPaneUnfocus(tiled);
     }
-    createNamedFloat(state, float_def, current_dir) catch {};
+    createNamedFloat(state, float_def, current_dir, old_uuid) catch {};
     // Focus the new float
     if (state.floats.items.len > 0) {
         state.syncPaneFocus(state.floats.items[state.floats.items.len - 1], old_uuid);
@@ -2392,8 +2401,7 @@ fn resizeFloatingPanes(state: *State) void {
     }
 }
 
-fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir: ?[]const u8) !void {
-    const parent_uuid = state.getCurrentFocusedUuid();
+fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir: ?[]const u8, parent_uuid: ?[32]u8) !void {
     const pane = try state.allocator.create(Pane);
     errdefer state.allocator.destroy(pane);
 

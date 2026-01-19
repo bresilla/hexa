@@ -321,10 +321,13 @@ pub const SesClient = struct {
         created_from: ?[32]u8,
         focused_from: ?[32]u8,
         cursor_pos: ?struct { x: u16, y: u16 },
+        cwd: ?[]const u8,
+        fg_process: ?[]const u8,
+        fg_pid: ?posix.pid_t,
     ) !void {
         const conn = &(self.conn orelse return error.NotConnected);
 
-        var buf: [512]u8 = undefined;
+        var buf: [1024]u8 = undefined;
         var stream = std.io.fixedBufferStream(&buf);
         var writer = stream.writer();
 
@@ -354,6 +357,18 @@ pub const SesClient = struct {
 
         if (cursor_pos) |pos| {
             try writer.print(",\"cursor_x\":{d},\"cursor_y\":{d}", .{ pos.x, pos.y });
+        }
+
+        if (cwd) |c| {
+            try writer.print(",\"cwd\":\"{s}\"", .{c});
+        }
+
+        if (fg_process) |p| {
+            try writer.print(",\"fg_process\":\"{s}\"", .{p});
+        }
+
+        if (fg_pid) |pid| {
+            try writer.print(",\"fg_pid\":{d}", .{pid});
         }
 
         try writer.writeAll("}");

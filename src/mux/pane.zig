@@ -294,16 +294,42 @@ pub const Pane = struct {
         return self.vt.getPwd();
     }
 
-    // Static buffer for readlink result
+    // Static buffers for proc reads
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var proc_buf: [256]u8 = undefined;
 
     /// Get current working directory by reading /proc/<pid>/cwd
     /// This is more reliable than OSC 7 as it works with any shell
     pub fn getRealCwd(self: *Pane) ?[]const u8 {
+        const pid = self.getFgPid() orelse self.pty.child_pid;
         var path_buf: [64]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{self.pty.child_pid}) catch return null;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
         const link = std.posix.readlink(path, &cwd_buf) catch return null;
         return link;
+    }
+
+    // External C function for getting foreground process group
+    extern fn tcgetpgrp(fd: c_int) posix.pid_t;
+
+    /// Get foreground process group PID using tcgetpgrp
+    pub fn getFgPid(self: *Pane) ?posix.pid_t {
+        const pgrp = tcgetpgrp(self.pty.master_fd);
+        if (pgrp < 0) return null;
+        return pgrp;
+    }
+
+    /// Get foreground process name by reading /proc/<pid>/comm
+    pub fn getFgProcess(self: *Pane) ?[]const u8 {
+        const pid = self.getFgPid() orelse return null;
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
+        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+        defer file.close();
+        const len = file.read(&proc_buf) catch return null;
+        if (len == 0) return null;
+        // Remove trailing newline
+        const end = if (len > 0 and proc_buf[len - 1] == '\n') len - 1 else len;
+        return proc_buf[0..end];
     }
 
     /// Scroll up by given number of lines

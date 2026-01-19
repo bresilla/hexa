@@ -47,12 +47,23 @@ pub const Pane = struct {
     // Cursor position (synced from mux, screen coordinates)
     cursor_x: u16 = 0,
     cursor_y: u16 = 0,
+    // Current working directory (synced from mux, owned)
+    cwd: ?[]const u8 = null,
+    // Foreground process info (synced from mux)
+    fg_process: ?[]const u8 = null,
+    fg_pid: ?i32 = null,
 
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Pane) void {
         if (self.sticky_pwd) |pwd| {
             self.allocator.free(pwd);
+        }
+        if (self.cwd) |c| {
+            self.allocator.free(c);
+        }
+        if (self.fg_process) |p| {
+            self.allocator.free(p);
         }
     }
 };
