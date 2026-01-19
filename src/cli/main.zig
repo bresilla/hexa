@@ -541,15 +541,18 @@ fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []const 
 
     const root = parsed.value.object;
 
+    // Get floats array for tab-bound float lookup
+    const floats_arr = if (root.get("floats")) |fv| fv.array.items else &[_]std.json.Value{};
+
     // Tabs
     if (root.get("tabs")) |tabs_val| {
         const tabs = tabs_val.array;
         const active = if (root.get("active_tab")) |at| @as(usize, @intCast(at.integer)) else 0;
 
-        for (tabs.items, 0..) |tab_val, i| {
+        for (tabs.items, 0..) |tab_val, ti| {
             const tab = tab_val.object;
             const name = if (tab.get("name")) |n| n.string else "tab";
-            const marker = if (i == active) "*" else " ";
+            const marker = if (ti == active) "*" else " ";
             print("{s}{s} Tab: {s}\n", .{ indent, marker, name });
 
             if (tab.get("panes")) |panes_val| {
@@ -562,16 +565,37 @@ fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []const 
                     print("{s}  {s} Pane {d} [{s}]\n", .{ indent, fm, pid, uuid[0..@min(8, uuid.len)] });
                 }
             }
+
+            // Print tab-bound floats for this tab
+            for (floats_arr, 0..) |float_val, fi| {
+                const float = float_val.object;
+                if (float.get("parent_tab")) |pt| {
+                    if (pt == .integer and @as(usize, @intCast(pt.integer)) == ti) {
+                        const uuid = if (float.get("uuid")) |u| u.string else "?";
+                        const visible = if (float.get("visible")) |v| v.bool else false;
+                        const vm = if (visible) "*" else " ";
+                        print("{s}  {s} Float {d} [{s}]\n", .{ indent, vm, fi, uuid[0..@min(8, uuid.len)] });
+                    }
+                }
+            }
         }
     }
 
-    // Floats
-    if (root.get("floats")) |floats_val| {
-        const floats = floats_val.array;
-        if (floats.items.len > 0) {
-            print("{s}Floats:\n", .{indent});
-            for (floats.items, 0..) |float_val, i| {
-                const float = float_val.object;
+    // Global floats (no parent_tab)
+    var has_global_floats = false;
+    for (floats_arr) |float_val| {
+        const float = float_val.object;
+        if (float.get("parent_tab") == null) {
+            has_global_floats = true;
+            break;
+        }
+    }
+
+    if (has_global_floats) {
+        print("{s}Floats (global):\n", .{indent});
+        for (floats_arr, 0..) |float_val, i| {
+            const float = float_val.object;
+            if (float.get("parent_tab") == null) {
                 const uuid = if (float.get("uuid")) |u| u.string else "?";
                 const visible = if (float.get("visible")) |v| v.bool else false;
                 const vm = if (visible) "*" else " ";

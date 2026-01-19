@@ -1009,10 +1009,9 @@ pub const Server = struct {
             }
         }
 
-        // Update created_from
+        // Update created_from (only if a string value is provided, null means "don't update")
         if (root.get("created_from")) |v| {
             switch (v) {
-                .null => pane.created_from = null,
                 .string => |s| {
                     if (s.len == 32) {
                         var created_uuid: [32]u8 = undefined;
@@ -1020,14 +1019,13 @@ pub const Server = struct {
                         pane.created_from = created_uuid;
                     }
                 },
-                else => {},
+                else => {}, // null or other = don't update, preserve existing value
             }
         }
 
-        // Update focused_from
+        // Update focused_from (only if a string value is provided, null means "don't update")
         if (root.get("focused_from")) |v| {
             switch (v) {
-                .null => pane.focused_from = null,
                 .string => |s| {
                     if (s.len == 32) {
                         var focused_uuid: [32]u8 = undefined;
@@ -1035,7 +1033,7 @@ pub const Server = struct {
                         pane.focused_from = focused_uuid;
                     }
                 },
-                else => {},
+                else => {}, // null or other = don't update, preserve existing value
             }
         }
 

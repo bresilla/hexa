@@ -47,6 +47,9 @@ pub const Pane = struct {
     is_pwd: bool = false,
     // Sticky float - survives mux exit, can be reattached
     sticky: bool = false,
+    // For tab-bound floats: which tab owns this float
+    // null = global float (special=true or pwd=true)
+    parent_tab: ?usize = null,
     // Border style and optional module
     float_style: ?*const core.FloatStyle = null,
 

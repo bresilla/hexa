@@ -189,6 +189,36 @@ const State = struct {
     /// Close the current tab
     fn closeCurrentTab(self: *State) bool {
         if (self.tabs.items.len <= 1) return false;
+        const closing_tab = self.active_tab;
+
+        // Handle tab-bound floats belonging to this tab
+        var i: usize = 0;
+        while (i < self.floating_panes.items.len) {
+            const fp = self.floating_panes.items[i];
+            if (fp.parent_tab) |parent| {
+                if (parent == closing_tab) {
+                    // Kill this tab-bound float
+                    self.ses_client.killPane(fp.uuid) catch {};
+                    fp.deinit();
+                    self.allocator.destroy(fp);
+                    _ = self.floating_panes.orderedRemove(i);
+                    // Clear active_floating if it was this float
+                    if (self.active_floating) |afi| {
+                        if (afi == i) {
+                            self.active_floating = null;
+                        } else if (afi > i) {
+                            self.active_floating = afi - 1;
+                        }
+                    }
+                    continue;
+                } else if (parent > closing_tab) {
+                    // Adjust index for floats on later tabs
+                    fp.parent_tab = parent - 1;
+                }
+            }
+            i += 1;
+        }
+
         var tab = self.tabs.orderedRemove(self.active_tab);
         tab.deinit();
         if (self.active_tab >= self.tabs.items.len) {
@@ -345,6 +375,9 @@ const State = struct {
         try writer.print("\"float_pad_x\":{d},\"float_pad_y\":{d},", .{ pane.float_pad_x, pane.float_pad_y });
         try writer.print("\"is_pwd\":{},", .{pane.is_pwd});
         try writer.print("\"sticky\":{}", .{pane.sticky});
+        if (pane.parent_tab) |pt| {
+            try writer.print(",\"parent_tab\":{d}", .{pt});
+        }
         if (pane.pwd_dir) |pwd| {
             try writer.print(",\"pwd_dir\":\"{s}\"", .{pwd});
         }
@@ -504,6 +537,10 @@ const State = struct {
                     pane.float_pad_y = if (pane_obj.get("float_pad_y")) |py| @intCast(py.integer) else 0;
                     pane.is_pwd = if (pane_obj.get("is_pwd")) |ip| (ip == .bool and ip.bool) else false;
                     pane.sticky = if (pane_obj.get("sticky")) |s| (s == .bool and s.bool) else false;
+                    pane.parent_tab = if (pane_obj.get("parent_tab")) |pt|
+                        @intCast(pt.integer)
+                    else
+                        null;
 
                     // Configure pane notifications
                     pane.configureNotifications(&self.config.notifications.pane);
@@ -1259,12 +1296,27 @@ fn handleInput(state: *State, input: []const u8) void {
         // If pane is scrolled and user types, scroll to bottom first
         if (state.active_floating) |idx| {
             const fpane = state.floating_panes.items[idx];
-            if (fpane.visible) {
+            // Check tab ownership for tab-bound floats
+            const can_interact = if (fpane.parent_tab) |parent|
+                parent == state.active_tab
+            else
+                true;
+
+            if (fpane.visible and can_interact) {
                 if (fpane.isScrolled()) {
                     fpane.scrollToBottom();
                     state.needs_render = true;
                 }
                 fpane.write(input[i..]) catch {};
+            } else {
+                // Can't input to tab-bound float on wrong tab, forward to tiled pane
+                if (state.currentLayout().getFocusedPane()) |pane| {
+                    if (pane.isScrolled()) {
+                        pane.scrollToBottom();
+                        state.needs_render = true;
+                    }
+                    pane.write(input[i..]) catch {};
+                }
             }
         } else if (state.currentLayout().getFocusedPane()) |pane| {
             if (pane.isScrolled()) {
@@ -1481,6 +1533,10 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
             // Check floating panes first (they're on top)
             var clicked_float: ?usize = null;
             for (state.floating_panes.items, 0..) |fp, fi| {
+                // Skip tab-bound floats on wrong tab
+                if (fp.parent_tab) |parent| {
+                    if (parent != state.active_tab) continue;
+                }
                 if (fp.visible and mouse_x >= fp.x and mouse_x < fp.x + fp.width and
                     mouse_y >= fp.y and mouse_y < fp.y + fp.height)
                 {
@@ -1671,15 +1727,21 @@ fn handleAltKey(state: *State, key: u8) bool {
         const old_uuid = state.getCurrentFocusedUuid();
         if (state.active_floating) |idx| {
             if (idx < state.floating_panes.items.len) {
-                state.syncPaneUnfocus(state.floating_panes.items[idx]);
+                const fp = state.floating_panes.items[idx];
+                // Tab-bound floats lose focus when switching tabs
+                if (fp.parent_tab != null) {
+                    state.syncPaneUnfocus(fp);
+                    state.active_floating = null;
+                }
             }
         } else if (state.currentLayout().getFocusedPane()) |old_pane| {
             state.syncPaneUnfocus(old_pane);
         }
-        state.active_floating = null;
         state.nextTab();
-        if (state.currentLayout().getFocusedPane()) |new_pane| {
-            state.syncPaneFocus(new_pane, old_uuid);
+        if (state.active_floating == null) {
+            if (state.currentLayout().getFocusedPane()) |new_pane| {
+                state.syncPaneFocus(new_pane, old_uuid);
+            }
         }
         state.needs_render = true;
         return true;
@@ -1690,15 +1752,21 @@ fn handleAltKey(state: *State, key: u8) bool {
         const old_uuid = state.getCurrentFocusedUuid();
         if (state.active_floating) |idx| {
             if (idx < state.floating_panes.items.len) {
-                state.syncPaneUnfocus(state.floating_panes.items[idx]);
+                const fp = state.floating_panes.items[idx];
+                // Tab-bound floats lose focus when switching tabs
+                if (fp.parent_tab != null) {
+                    state.syncPaneUnfocus(fp);
+                    state.active_floating = null;
+                }
             }
         } else if (state.currentLayout().getFocusedPane()) |old_pane| {
             state.syncPaneUnfocus(old_pane);
         }
-        state.active_floating = null;
         state.prevTab();
-        if (state.currentLayout().getFocusedPane()) |new_pane| {
-            state.syncPaneFocus(new_pane, old_uuid);
+        if (state.active_floating == null) {
+            if (state.currentLayout().getFocusedPane()) |new_pane| {
+                state.syncPaneFocus(new_pane, old_uuid);
+            }
         }
         state.needs_render = true;
         return true;
@@ -1759,12 +1827,23 @@ fn handleAltKey(state: *State, key: u8) bool {
                     state.syncPaneFocus(new_pane, old_uuid);
                 }
             } else {
-                if (state.currentLayout().getFocusedPane()) |old_pane| {
-                    state.syncPaneUnfocus(old_pane);
+                // Find first float valid for current tab
+                var first_valid: ?usize = null;
+                for (state.floating_panes.items, 0..) |fp, fi| {
+                    // Skip tab-bound floats on wrong tab
+                    if (fp.parent_tab) |parent| {
+                        if (parent != state.active_tab) continue;
+                    }
+                    first_valid = fi;
+                    break;
                 }
-                state.active_floating = 0;
-                if (state.floating_panes.items.len > 0) {
-                    state.syncPaneFocus(state.floating_panes.items[0], old_uuid);
+
+                if (first_valid) |valid_idx| {
+                    if (state.currentLayout().getFocusedPane()) |old_pane| {
+                        state.syncPaneUnfocus(old_pane);
+                    }
+                    state.active_floating = valid_idx;
+                    state.syncPaneFocus(state.floating_panes.items[valid_idx], old_uuid);
                 }
             }
             state.needs_render = true;
@@ -1793,6 +1872,11 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
     // Find existing float by key (and directory if pwd)
     for (state.floating_panes.items, 0..) |pane, i| {
         if (pane.float_key == float_def.key) {
+            // Tab-bound: skip if on wrong tab
+            if (pane.parent_tab) |parent| {
+                if (parent != state.active_tab) continue;
+            }
+
             // For pwd floats, also check directory match
             if (float_def.pwd and pane.is_pwd) {
                 // Both dirs must exist and match, or both be null
@@ -1963,6 +2047,12 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
         }
     }
 
+    // For tab-bound floats (special=false and not pwd), set parent tab
+    // pwd floats are always global since they're directory-specific
+    if (!float_def.special and !float_def.pwd) {
+        pane.parent_tab = state.active_tab;
+    }
+
     // Store style reference (includes border characters and optional module)
     if (float_def.style) |*style| {
         pane.float_style = style;
@@ -2012,6 +2102,10 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     for (state.floating_panes.items, 0..) |pane, i| {
         if (!pane.visible) continue;
         if (state.active_floating == i) continue; // Skip active, draw it last
+        // Skip tab-bound floats on wrong tab
+        if (pane.parent_tab) |parent| {
+            if (parent != state.active_tab) continue;
+        }
 
         drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, "", pane.border_color, pane.float_style);
 
@@ -2031,7 +2125,12 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     // Draw active float last so it's on top
     if (state.active_floating) |idx| {
         const pane = state.floating_panes.items[idx];
-        if (pane.visible) {
+        // Check tab ownership for tab-bound floats
+        const can_render = if (pane.parent_tab) |parent|
+            parent == state.active_tab
+        else
+            true;
+        if (pane.visible and can_render) {
             drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, "", pane.border_color, pane.float_style);
 
             if (pane.getRenderState()) |render_state| {
