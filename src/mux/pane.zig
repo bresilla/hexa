@@ -153,6 +153,23 @@ pub const Pane = struct {
         try self.vt.init(self.allocator, self.width, self.height);
     }
 
+    /// Respawn the shell process (used when shell exits but user wants to continue)
+    pub fn respawn(self: *Pane) !void {
+        // Close old PTY
+        self.pty.close();
+        // Spawn new shell
+        const cmd = posix.getenv("SHELL") orelse "/bin/sh";
+        self.pty = try core.Pty.spawn(cmd);
+        try self.pty.setSize(self.width, self.height);
+        // Reset VT state
+        self.vt.deinit();
+        try self.vt.init(self.allocator, self.width, self.height);
+        // Clear escape sequence tracking
+        self.did_clear = false;
+        self.esc_tail = .{ 0, 0, 0 };
+        self.esc_tail_len = 0;
+    }
+
     /// Read from PTY and feed to VT. Returns true if data was read.
     pub fn poll(self: *Pane, buffer: []u8) !bool {
         self.did_clear = false;

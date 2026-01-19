@@ -153,7 +153,7 @@ pub const Config = struct {
     key_adopt: u8 = 'a',
 
     // Confirmation popups
-    confirm_on_exit: bool = false,
+    confirm_on_exit: bool = false, // When Alt+q or last shell exits
     confirm_on_detach: bool = false,
 
     // Floating pane defaults

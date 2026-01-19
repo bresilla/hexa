@@ -81,6 +81,8 @@ const State = struct {
     notifications: NotificationManager,
     popups: pop.PopupManager, // For blocking popups (confirm, choose)
     pending_action: ?PendingAction, // Action waiting for confirmation (exit/detach)
+    exit_from_shell_death: bool, // True if exit confirmation was triggered by shell death
+    skip_dead_check: bool, // Skip dead pane processing this iteration (after respawn)
     pending_pop_response: bool, // True if waiting to send pop response
     pending_pop_scope: pop.Scope, // Which scope the pending popup belongs to
     pending_pop_tab: usize, // Tab index if scope is .tab
@@ -130,6 +132,8 @@ const State = struct {
             .notifications = NotificationManager.initWithPopConfig(allocator, pop_cfg.carrier.notification),
             .popups = pop.PopupManager.init(allocator),
             .pending_action = null,
+            .exit_from_shell_death = false,
+            .skip_dead_check = false,
             .pending_pop_response = false,
             .pending_pop_scope = .mux,
             .pending_pop_tab = 0,
@@ -1022,6 +1026,9 @@ fn runMainLoop(state: *State) !void {
 
     // Main loop
     while (state.running) {
+        // Clear skip flag from previous iteration
+        state.skip_dead_check = false;
+
         // Check for terminal resize
         {
             const new_size = terminal.getTermSize();
@@ -1085,39 +1092,6 @@ fn runMainLoop(state: *State) !void {
                         state.floats.items.len - 1
                     else
                         null;
-                }
-            }
-        }
-
-        // Check for dead splits in current tab
-        {
-            var any_dead = false;
-            var pane_it = state.currentLayout().splitIterator();
-            while (pane_it.next()) |pane| {
-                if (!pane.*.isAlive()) {
-                    any_dead = true;
-                    break;
-                }
-            }
-            if (any_dead) {
-                if (state.currentLayout().splitCount() > 1) {
-                    // Multiple splits in tab - just close this one
-                    _ = state.currentLayout().closeFocused();
-                    state.needs_render = true;
-                    state.syncStateToSes();
-                } else if (state.tabs.items.len > 1) {
-                    // Only 1 pane but multiple tabs - close this tab
-                    _ = state.closeCurrentTab();
-                    state.needs_render = true;
-                } else {
-                    // Last pane in last tab - kill pane in ses and exit
-                    if (state.currentLayout().getFocusedPane()) |pane| {
-                        if (state.ses_client.isConnected()) {
-                            state.ses_client.killPane(pane.uuid) catch {};
-                        }
-                    }
-                    state.running = false;
-                    continue;
                 }
             }
         }
@@ -1270,19 +1244,28 @@ fn runMainLoop(state: *State) !void {
             }
         }
 
-        // Remove dead splits
-        for (dead_splits.items) |_| {
-            if (state.currentLayout().splitCount() > 1) {
-                // Multiple splits in tab - just close this one
-                _ = state.currentLayout().closeFocused();
-                state.needs_render = true;
-            } else if (state.tabs.items.len > 1) {
-                // Only 1 pane but multiple tabs - close this tab
-                _ = state.closeCurrentTab();
-                state.needs_render = true;
-            } else {
-                // Last pane in last tab - exit
-                state.running = false;
+        // Remove dead splits (skip if just respawned a shell)
+        if (!state.skip_dead_check) {
+            for (dead_splits.items) |_| {
+                if (state.currentLayout().splitCount() > 1) {
+                    // Multiple splits in tab - just close this one
+                    _ = state.currentLayout().closeFocused();
+                    state.needs_render = true;
+                } else if (state.tabs.items.len > 1) {
+                    // Only 1 pane but multiple tabs - close this tab
+                    _ = state.closeCurrentTab();
+                    state.needs_render = true;
+                } else {
+                    // Last pane in last tab - confirm before exit if enabled
+                    if (state.config.confirm_on_exit and state.pending_action == null) {
+                        state.pending_action = .exit;
+                        state.exit_from_shell_death = true;
+                        state.popups.showConfirm("Shell exited. Close mux?", .{}) catch {};
+                        state.needs_render = true;
+                    } else if (state.pending_action != .exit or !state.exit_from_shell_death) {
+                        state.running = false;
+                    }
+                }
             }
         }
 
@@ -1340,9 +1323,18 @@ fn handleInput(state: *State, inp: []const u8) void {
                             .exit => state.running = false,
                             .detach => performDetach(state),
                         }
+                    } else {
+                        // User cancelled - if exit was from shell death, spawn new shell
+                        if (action == .exit and state.exit_from_shell_death) {
+                            if (state.currentLayout().getFocusedPane()) |pane| {
+                                pane.respawn() catch {};
+                                state.skip_dead_check = true; // Skip dead check this iteration
+                            }
+                        }
                     }
                 }
                 state.pending_action = null;
+                state.exit_from_shell_death = false;
                 state.popups.clearResults();
             } else {
                 sendPopResponse(state);
