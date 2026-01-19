@@ -43,6 +43,8 @@ pub const Pane = struct {
     // For pwd floats: the directory this float is bound to
     pwd_dir: ?[]const u8 = null,
     is_pwd: bool = false,
+    // Sticky float - survives mux exit, can be reattached
+    sticky: bool = false,
     // Border style and optional module
     float_style: ?*const core.FloatStyle = null,
 
@@ -101,6 +103,19 @@ pub const Pane = struct {
         if (self.pwd_dir) |dir| {
             self.allocator.free(dir);
         }
+    }
+
+    /// Replace this pane's PTY with an adopted one from ses
+    pub fn replaceWithFd(self: *Pane, fd: posix.fd_t, child_pid: posix.pid_t, uuid: [32]u8) !void {
+        // Close old PTY
+        self.pty.close();
+        // Replace with new fd
+        self.pty = core.Pty.fromFd(fd, child_pid);
+        try self.pty.setSize(self.width, self.height);
+        self.uuid = uuid;
+        // Reset VT state
+        self.vt.deinit();
+        try self.vt.init(self.allocator, self.width, self.height);
     }
 
     /// Read from PTY and feed to VT. Returns true if data was read.

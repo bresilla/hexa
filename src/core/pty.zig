@@ -18,7 +18,11 @@ pub const Pty = struct {
     external_process: bool = false,
 
     pub fn spawn(shell: []const u8) !Pty {
-        return spawnWithEnv(shell);
+        return spawnWithCwd(shell, null);
+    }
+
+    pub fn spawnWithCwd(shell: []const u8, cwd: ?[]const u8) !Pty {
+        return spawnInternal(shell, cwd);
     }
 
     /// Create a Pty from an existing file descriptor
@@ -32,7 +36,7 @@ pub const Pty = struct {
         };
     }
 
-    pub fn spawnWithEnv(shell: []const u8) !Pty {
+    fn spawnInternal(shell: []const u8, cwd: ?[]const u8) !Pty {
         var master_fd: c_int = 0;
         var slave_fd: c_int = 0;
 
@@ -66,6 +70,11 @@ pub const Pty = struct {
             posix.dup2(@intCast(slave_fd), posix.STDERR_FILENO) catch posix.exit(1);
             _ = posix.close(@intCast(slave_fd));
             _ = posix.close(@intCast(master_fd));
+
+            // Change to working directory if specified
+            if (cwd) |dir| {
+                posix.chdir(dir) catch {};
+            }
 
             // Build environment: inherit parent env + BOX=1 + TERM override
             const envp = buildEnv() catch posix.exit(1);

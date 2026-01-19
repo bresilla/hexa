@@ -6,12 +6,11 @@ const state = @import("state.zig");
 const server = @import("server.zig");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Use page_allocator for arg parsing before fork (survives fork cleanly)
+    const page_alloc = std.heap.page_allocator;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try std.process.argsAlloc(page_alloc);
+    defer std.process.argsFree(page_alloc, args);
 
     // Check for command modes
     var daemon_mode = false;
@@ -39,21 +38,27 @@ pub fn main() !void {
         }
     }
 
-    // Notify mode - send notification to all connected muxes
+    // Notify mode - send notification to all connected muxes (use page_alloc, no fork)
     if (notify_message) |msg| {
-        try sendNotify(allocator, msg);
+        try sendNotify(page_alloc, msg);
         return;
     }
 
-    // List mode - connect to running daemon and show status
+    // List mode - connect to running daemon and show status (use page_alloc, no fork)
     if (list_mode) {
-        try listStatus(allocator);
+        try listStatus(page_alloc);
         return;
     }
 
+    // Daemonize BEFORE creating GPA
     if (daemon_mode) {
         try daemonize();
     }
+
+    // Now create GPA AFTER fork - this ensures clean allocator state
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
     // Initialize state
     var ses_state = state.SesState.init(allocator);
@@ -61,7 +66,9 @@ pub fn main() !void {
 
     // Initialize server
     var srv = server.Server.init(allocator, &ses_state) catch |err| {
-        std.debug.print("Failed to initialize server: {}\n", .{err});
+        if (!daemon_mode) {
+            std.debug.print("ses: server init failed: {}\n", .{err});
+        }
         return err;
     };
     defer srv.deinit();
@@ -78,7 +85,9 @@ pub fn main() !void {
 
     // Run server
     srv.run() catch |err| {
-        std.debug.print("Server error: {}\n", .{err});
+        if (!daemon_mode) {
+            std.debug.print("Server error: {}\n", .{err});
+        }
         return err;
     };
 }
@@ -190,15 +199,14 @@ fn listStatus(allocator: std.mem.Allocator) !void {
             const id = c.get("id").?.integer;
             const panes = c.get("panes").?.array;
 
-            print("\n  Mux #{d} ({d} panes)\n", .{ id, panes.items.len });
+            print("  Mux #{d} ({d} panes)\n", .{ id, panes.items.len });
 
             for (panes.items) |pane_val| {
                 const p = pane_val.object;
                 const uuid = p.get("uuid").?.string;
                 const pid = p.get("pid").?.integer;
-                const pane_state = p.get("state").?.string;
 
-                print("    [{s}] pid={d} state={s}", .{ uuid[0..8], pid, pane_state });
+                print("    [{s}] pid={d}", .{ uuid[0..8], pid });
 
                 if (p.get("sticky_pwd")) |pwd| {
                     print(" pwd={s}", .{pwd.string});
@@ -208,22 +216,56 @@ fn listStatus(allocator: std.mem.Allocator) !void {
         }
     }
 
-    // Print orphaned panes
+    // Print detached sessions
+    if (root.get("detached_sessions")) |sessions_val| {
+        const sessions = sessions_val.array;
+        if (sessions.items.len > 0) {
+            print("\nDetached sessions: {d}\n", .{sessions.items.len});
+
+            for (sessions.items) |sess_val| {
+                const s = sess_val.object;
+                const sid = s.get("session_id").?.string;
+                const pane_count = s.get("pane_count").?.integer;
+
+                print("  [{s}] {d} panes - reattach: hexa-mux -a {s}\n", .{ sid[0..8], pane_count, sid[0..8] });
+            }
+        }
+    }
+
+    // Print orphaned panes (disowned)
     if (root.get("orphaned")) |orphaned_val| {
         const orphaned = orphaned_val.array;
         if (orphaned.items.len > 0) {
-            print("\nOrphaned panes: {d}\n", .{orphaned.items.len});
+            print("\nOrphaned panes (disowned): {d}\n", .{orphaned.items.len});
 
             for (orphaned.items) |pane_val| {
                 const p = pane_val.object;
                 const uuid = p.get("uuid").?.string;
                 const pid = p.get("pid").?.integer;
-                const pane_state = p.get("state").?.string;
 
-                print("  [{s}] pid={d} state={s}", .{ uuid[0..8], pid, pane_state });
+                print("  [{s}] pid={d}\n", .{ uuid[0..8], pid });
+            }
+        }
+    }
 
-                if (p.get("sticky_pwd")) |pwd| {
+    // Print sticky panes
+    if (root.get("sticky")) |sticky_val| {
+        const sticky = sticky_val.array;
+        if (sticky.items.len > 0) {
+            print("\nSticky panes: {d}\n", .{sticky.items.len});
+
+            for (sticky.items) |pane_val| {
+                const p = pane_val.object;
+                const uuid = p.get("uuid").?.string;
+                const pid = p.get("pid").?.integer;
+
+                print("  [{s}] pid={d}", .{ uuid[0..8], pid });
+
+                if (p.get("pwd")) |pwd| {
                     print(" pwd={s}", .{pwd.string});
+                }
+                if (p.get("key")) |key| {
+                    print(" key={s}", .{key.string});
                 }
                 print("\n", .{});
             }

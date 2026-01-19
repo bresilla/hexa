@@ -6,8 +6,9 @@ const ipc = core.ipc;
 /// Pane state - minimal, just keeps process alive
 pub const PaneState = enum {
     attached, // mux is connected and owns this pane
-    half_orphaned, // sticky pwd float, waiting for same pwd+key
-    orphaned, // fully detached, any mux can adopt
+    detached, // part of detached session, waiting for reattach
+    sticky, // sticky pwd float, waiting for same pwd+key
+    orphaned, // fully orphaned, any mux can adopt
 };
 
 /// Minimal pane structure - just what's needed to keep process alive
@@ -21,8 +22,11 @@ pub const Pane = struct {
     sticky_pwd: ?[]const u8,
     sticky_key: ?u8,
 
-    // Which client owns this pane (null if orphaned)
+    // Which client owns this pane (null if orphaned/detached)
     attached_to: ?usize,
+
+    // Session ID for detached panes (so they can be reattached together)
+    session_id: ?[16]u8,
 
     // Timestamps
     created_at: i64,
@@ -62,11 +66,32 @@ pub const Client = struct {
     }
 };
 
+/// Detached session info (for listing)
+pub const DetachedSession = struct {
+    session_id: [16]u8,
+    pane_count: usize,
+};
+
+/// Full detached mux state - stores the entire layout for reattachment
+pub const DetachedMuxState = struct {
+    session_id: [16]u8,
+    mux_state_json: []const u8, // Full serialized mux state
+    pane_uuids: [][32]u8, // List of pane UUIDs in this session
+    detached_at: i64,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DetachedMuxState) void {
+        self.allocator.free(self.mux_state_json);
+        self.allocator.free(self.pane_uuids);
+    }
+};
+
 /// Main ses state - the PTY holder
 pub const SesState = struct {
     allocator: std.mem.Allocator,
     panes: std.AutoHashMap([32]u8, Pane),
     clients: std.ArrayList(Client),
+    detached_sessions: std.AutoHashMap([16]u8, DetachedMuxState),
     next_client_id: usize,
     orphan_timeout_hours: u32,
 
@@ -75,6 +100,7 @@ pub const SesState = struct {
             .allocator = allocator,
             .panes = std.AutoHashMap([32]u8, Pane).init(allocator),
             .clients = .empty,
+            .detached_sessions = std.AutoHashMap([16]u8, DetachedMuxState).init(allocator),
             .next_client_id = 1,
             .orphan_timeout_hours = 24,
         };
@@ -90,6 +116,14 @@ pub const SesState = struct {
             p.deinit();
         }
         self.panes.deinit();
+
+        // Cleanup detached sessions
+        var sess_iter = self.detached_sessions.valueIterator();
+        while (sess_iter.next()) |sess| {
+            var s = sess;
+            s.deinit();
+        }
+        self.detached_sessions.deinit();
 
         // Cleanup clients
         for (self.clients.items) |*client| {
@@ -130,6 +164,114 @@ pub const SesState = struct {
         }
     }
 
+    /// Detach a client's session with a specific session ID (mux's UUID)
+    /// Stores the full mux state for later restoration
+    /// If the session already exists (re-detach), it updates the existing state
+    /// Returns true on success, false if client not found
+    pub fn detachSession(self: *SesState, client_id: usize, session_id: [16]u8, mux_state_json: []const u8) bool {
+        // Find client
+        var client_index: ?usize = null;
+        var pane_uuids_list: std.ArrayList([32]u8) = .empty;
+
+        for (self.clients.items, 0..) |*client, i| {
+            if (client.id == client_id) {
+                // Mark all panes as detached with session_id and collect UUIDs
+                for (client.pane_uuids.items) |uuid| {
+                    if (self.panes.getPtr(uuid)) |pane| {
+                        pane.state = .detached;
+                        pane.session_id = session_id;
+                        pane.attached_to = null;
+                        pane_uuids_list.append(self.allocator, uuid) catch continue;
+                    }
+                }
+                client.deinit();
+                client_index = i;
+                break;
+            }
+        }
+
+        if (client_index) |idx| {
+            _ = self.clients.orderedRemove(idx);
+
+            // If session already exists (re-detach), remove old state first
+            if (self.detached_sessions.fetchRemove(session_id)) |old| {
+                var old_state = old.value;
+                old_state.deinit();
+            }
+
+            // Store the full mux state
+            const owned_json = self.allocator.dupe(u8, mux_state_json) catch return true;
+            const owned_uuids = pane_uuids_list.toOwnedSlice(self.allocator) catch {
+                self.allocator.free(owned_json);
+                return true;
+            };
+
+            const detached_state = DetachedMuxState{
+                .session_id = session_id,
+                .mux_state_json = owned_json,
+                .pane_uuids = owned_uuids,
+                .detached_at = std.time.timestamp(),
+                .allocator = self.allocator,
+            };
+
+            self.detached_sessions.put(session_id, detached_state) catch {
+                self.allocator.free(owned_json);
+                self.allocator.free(owned_uuids);
+            };
+
+            return true;
+        } else {
+            pane_uuids_list.deinit(self.allocator);
+        }
+        return false;
+    }
+
+    /// Result of reattaching a session
+    pub const ReattachResult = struct {
+        mux_state_json: []const u8, // The full mux state to restore
+        pane_uuids: [][32]u8, // UUIDs of panes to adopt
+    };
+
+    /// Reattach to a detached session - returns mux state and pane UUIDs
+    /// Note: Panes remain in "detached" state until adoptPane is called for each
+    pub fn reattachSession(self: *SesState, session_id: [16]u8, client_id: usize) !?ReattachResult {
+        _ = client_id; // Client will adopt panes individually
+
+        // Find the detached session
+        const detached = self.detached_sessions.fetchRemove(session_id) orelse return null;
+        const detached_state = detached.value;
+
+        // Clear session_id from panes (they're no longer part of a detached session)
+        // But keep them as "detached" state - adoptPane will mark them as attached
+        for (detached_state.pane_uuids) |uuid| {
+            if (self.panes.getPtr(uuid)) |pane| {
+                pane.session_id = null;
+            }
+        }
+
+        // Return the stored state (caller takes ownership)
+        return .{
+            .mux_state_json = detached_state.mux_state_json,
+            .pane_uuids = detached_state.pane_uuids,
+        };
+    }
+
+    /// List detached sessions
+    pub fn listDetachedSessions(self: *SesState, allocator: std.mem.Allocator) ![]DetachedSession {
+        var result: std.ArrayList(DetachedSession) = .empty;
+        errdefer result.deinit(allocator);
+
+        var iter = self.detached_sessions.valueIterator();
+        while (iter.next()) |detached| {
+            try result.append(allocator, .{
+                .session_id = detached.session_id,
+                .pane_count = detached.pane_uuids.len,
+            });
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
     /// Get client by ID
     pub fn getClient(self: *SesState, client_id: usize) ?*Client {
         for (self.clients.items) |*client| {
@@ -145,7 +287,7 @@ pub const SesState = struct {
 
         if (pane.sticky_pwd != null and pane.sticky_key != null) {
             // Sticky pwd float - becomes half-orphaned
-            pane.state = .half_orphaned;
+            pane.state = .sticky;
         } else {
             // Regular pane - becomes fully orphaned
             pane.state = .orphaned;
@@ -160,11 +302,12 @@ pub const SesState = struct {
         self: *SesState,
         client_id: usize,
         shell: []const u8,
+        cwd: ?[]const u8,
         sticky_pwd: ?[]const u8,
         sticky_key: ?u8,
     ) !*Pane {
-        // Spawn PTY
-        const pty = try core.Pty.spawn(shell);
+        // Spawn PTY with optional working directory
+        const pty = try core.Pty.spawnWithCwd(shell, cwd);
 
         // Generate UUID
         const uuid = ipc.generateUuid();
@@ -185,6 +328,7 @@ pub const SesState = struct {
             .sticky_pwd = owned_pwd,
             .sticky_key = sticky_key,
             .attached_to = client_id,
+            .session_id = null,
             .created_at = now,
             .orphaned_at = null,
             .allocator = self.allocator,
@@ -204,7 +348,7 @@ pub const SesState = struct {
     pub fn findStickyPane(self: *SesState, pwd: []const u8, key: u8) ?*Pane {
         var iter = self.panes.valueIterator();
         while (iter.next()) |pane| {
-            if (pane.state == .half_orphaned) {
+            if (pane.state == .sticky) {
                 if (pane.sticky_pwd) |spwd| {
                     if (pane.sticky_key) |skey| {
                         if (skey == key and std.mem.eql(u8, spwd, pwd)) {
@@ -229,10 +373,9 @@ pub const SesState = struct {
         pane.attached_to = client_id;
         pane.orphaned_at = null;
 
-        // Add to client's pane list
-        if (self.getClient(client_id)) |client| {
-            try client.appendUuid(uuid);
-        }
+        // Add to client's pane list - fail if client not found
+        const client = self.getClient(client_id) orelse return error.ClientNotFound;
+        try client.appendUuid(uuid);
 
         return pane;
     }
@@ -279,7 +422,7 @@ pub const SesState = struct {
 
         var iter = self.panes.valueIterator();
         while (iter.next()) |pane| {
-            if (pane.state == .orphaned or pane.state == .half_orphaned) {
+            if (pane.state == .orphaned or pane.state == .sticky) {
                 try result.append(allocator, pane.*);
             }
         }
@@ -298,7 +441,7 @@ pub const SesState = struct {
         var iter = self.panes.iterator();
         while (iter.next()) |entry| {
             const pane = entry.value_ptr;
-            if (pane.state == .orphaned or pane.state == .half_orphaned) {
+            if (pane.state == .orphaned or pane.state == .sticky) {
                 if (pane.orphaned_at) |orphaned_time| {
                     if (now - orphaned_time > timeout_secs) {
                         to_remove.append(self.allocator, entry.key_ptr.*) catch continue;

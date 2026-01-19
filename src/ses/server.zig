@@ -116,8 +116,8 @@ pub const Server = struct {
                     }
 
                     if (pfd.revents & posix.POLL.IN != 0) {
-                        // Try to read message
-                        var buf: [4096]u8 = undefined;
+                        // Try to read message (large buffer for mux state JSON)
+                        var buf: [65536]u8 = undefined;
                         const line = conn.recvLine(&buf) catch null;
 
                         if (line) |msg| {
@@ -158,8 +158,42 @@ pub const Server = struct {
     /// client_id is optional - queries like status/ping don't need a registered client
     /// For operations that need a client (create_pane, etc.), we register on first use
     fn handleMessage(self: *Server, conn: *ipc.Connection, client_id: ?usize, fd: posix.fd_t, msg: []const u8) !void {
+        // Debug log incoming message type and size
+        {
+            var log_buf: [1024]u8 = undefined;
+            const type_end = std.mem.indexOf(u8, msg, ",") orelse @min(msg.len, 100);
+            const msg_end_start = if (msg.len > 50) msg.len - 50 else 0;
+            // Also show around position 800 to catch middle issues
+            const mid_start = if (msg.len > 850) @as(usize, 800) else 0;
+            const mid_end = @min(mid_start + 100, msg.len);
+            const log_msg = std.fmt.bufPrint(&log_buf, "SES handleMessage: len={}, start={s}, mid={s}, end={s}\n", .{ msg.len, msg[0..type_end], msg[mid_start..mid_end], msg[msg_end_start..] }) catch "";
+            const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+            if (file) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                _ = f.write(log_msg) catch {};
+            }
+        }
+
         // Parse JSON message
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, msg, .{}) catch {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, msg, .{}) catch |err| {
+            // Debug - dump full message to file for inspection
+            {
+                var log_buf: [256]u8 = undefined;
+                const log_msg = std.fmt.bufPrint(&log_buf, "SES: JSON parse failed: {}, len={}\n", .{ err, msg.len }) catch "";
+                const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+                if (file) |f| {
+                    defer f.close();
+                    f.seekFromEnd(0) catch {};
+                    _ = f.write(log_msg) catch {};
+                }
+                // Dump full message to separate file
+                const dump_file = std.fs.cwd().createFile("/tmp/hexa-bad-msg.txt", .{}) catch null;
+                if (dump_file) |df| {
+                    defer df.close();
+                    _ = df.write(msg) catch {};
+                }
+            }
             try self.sendError(conn, "invalid_json");
             return;
         };
@@ -167,11 +201,32 @@ pub const Server = struct {
 
         const root = parsed.value.object;
         const msg_type = root.get("type") orelse {
+            // Debug
+            {
+                const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+                if (file) |f| {
+                    defer f.close();
+                    f.seekFromEnd(0) catch {};
+                    _ = f.write("SES: missing type!\n") catch {};
+                }
+            }
             try self.sendError(conn, "missing_type");
             return;
         };
 
         const type_str = msg_type.string;
+
+        // Debug: type extracted
+        {
+            var log_buf: [128]u8 = undefined;
+            const log_msg = std.fmt.bufPrint(&log_buf, "SES: type extracted: {s}\n", .{type_str}) catch "";
+            const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+            if (file) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                _ = f.write(log_msg) catch {};
+            }
+        }
 
         // Read-only queries - don't need a registered client
         if (std.mem.eql(u8, type_str, "ping")) {
@@ -192,6 +247,18 @@ pub const Server = struct {
             break :blk new_id;
         };
 
+        // Debug: log type and cid before dispatch
+        {
+            var log_buf: [128]u8 = undefined;
+            const log_msg = std.fmt.bufPrint(&log_buf, "SES dispatch: type={s}, cid={d}\n", .{ type_str, cid }) catch "";
+            const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+            if (file) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                _ = f.write(log_msg) catch {};
+            }
+        }
+
         if (std.mem.eql(u8, type_str, "create_pane")) {
             try self.handleCreatePane(conn, cid, root);
         } else if (std.mem.eql(u8, type_str, "find_sticky")) {
@@ -208,6 +275,32 @@ pub const Server = struct {
             try self.handleKillPane(conn, root);
         } else if (std.mem.eql(u8, type_str, "broadcast_notify")) {
             try self.handleBroadcastNotify(conn, root);
+        } else if (std.mem.eql(u8, type_str, "detach_session")) {
+            // Debug before calling handler
+            {
+                const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+                if (file) |f| {
+                    defer f.close();
+                    f.seekFromEnd(0) catch {};
+                    _ = f.write("SES: About to call handleDetachSession\n") catch {};
+                }
+            }
+            self.handleDetachSession(conn, cid, root) catch |err| {
+                // Debug the error
+                var log_buf: [128]u8 = undefined;
+                const log_msg = std.fmt.bufPrint(&log_buf, "SES: handleDetachSession threw: {}\n", .{err}) catch "SES: handleDetachSession threw unknown\n";
+                const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+                if (file) |f| {
+                    defer f.close();
+                    f.seekFromEnd(0) catch {};
+                    _ = f.write(log_msg) catch {};
+                }
+                return err;
+            };
+        } else if (std.mem.eql(u8, type_str, "reattach")) {
+            try self.handleReattach(conn, cid, root);
+        } else if (std.mem.eql(u8, type_str, "list_sessions")) {
+            try self.handleListSessions(conn);
         } else {
             try self.sendError(conn, "unknown_type");
         }
@@ -217,6 +310,9 @@ pub const Server = struct {
         // Get shell (default to $SHELL or /bin/sh)
         const shell = if (root.get("shell")) |s| s.string else (std.posix.getenv("SHELL") orelse "/bin/sh");
 
+        // Get working directory
+        const cwd: ?[]const u8 = if (root.get("cwd")) |c| c.string else null;
+
         // Get sticky options
         const sticky_pwd: ?[]const u8 = if (root.get("sticky_pwd")) |p| p.string else null;
         const sticky_key: ?u8 = if (root.get("sticky_key")) |k|
@@ -225,7 +321,7 @@ pub const Server = struct {
             null;
 
         // Create pane
-        const pane = try self.ses_state.createPane(client_id, shell, sticky_pwd, sticky_key);
+        const pane = try self.ses_state.createPane(client_id, shell, cwd, sticky_pwd, sticky_key);
 
         // Send response with fd
         var response_buf: [256]u8 = undefined;
@@ -349,7 +445,8 @@ pub const Server = struct {
             }
             const state_str = switch (pane.state) {
                 .attached => "attached",
-                .half_orphaned => "half_orphaned",
+                .detached => "detached",
+                .sticky => "sticky",
                 .orphaned => "orphaned",
             };
             try writer.print(",\"state\":\"{s}\"}}", .{state_str});
@@ -414,13 +511,13 @@ pub const Server = struct {
     }
 
     fn handleStatus(self: *Server, conn: *ipc.Connection) !void {
-        var json_buf: [16384]u8 = undefined;
+        var json_buf: [32768]u8 = undefined;
         var stream = std.io.fixedBufferStream(&json_buf);
         var writer = stream.writer();
 
         try writer.writeAll("{\"type\":\"status\",\"clients\":[");
 
-        // Iterate over clients
+        // Iterate over clients (connected muxes)
         for (self.ses_state.clients.items, 0..) |client, ci| {
             if (ci > 0) try writer.writeAll(",");
             try writer.print("{{\"id\":{d},\"panes\":[", .{client.id});
@@ -429,15 +526,9 @@ pub const Server = struct {
             for (client.pane_uuids.items, 0..) |uuid, pi| {
                 if (pi > 0) try writer.writeAll(",");
                 if (self.ses_state.panes.get(uuid)) |pane| {
-                    const state_str = switch (pane.state) {
-                        .attached => "attached",
-                        .half_orphaned => "half_orphaned",
-                        .orphaned => "orphaned",
-                    };
-                    try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d},\"state\":\"{s}\"", .{
+                    try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d}", .{
                         uuid,
                         pane.child_pid,
-                        state_str,
                     });
                     if (pane.sticky_pwd) |pwd| {
                         try writer.print(",\"sticky_pwd\":\"{s}\"", .{pwd});
@@ -448,29 +539,54 @@ pub const Server = struct {
             try writer.writeAll("]}");
         }
 
-        try writer.writeAll("],\"orphaned\":[");
+        // Detached sessions
+        try writer.writeAll("],\"detached_sessions\":[");
+        var sess_iter = self.ses_state.detached_sessions.iterator();
+        var first_sess = true;
+        while (sess_iter.next()) |entry| {
+            if (!first_sess) try writer.writeAll(",");
+            first_sess = false;
+            const hex_id: [32]u8 = std.fmt.bytesToHex(&entry.key_ptr.*, .lower);
+            try writer.print("{{\"session_id\":\"{s}\",\"pane_count\":{d}}}", .{
+                &hex_id,
+                entry.value_ptr.pane_uuids.len,
+            });
+        }
 
-        // List orphaned panes (not attached to any client)
+        // Orphaned panes (truly orphaned, not part of session)
+        try writer.writeAll("],\"orphaned\":[");
         var first_orphan = true;
         var pane_iter = self.ses_state.panes.iterator();
         while (pane_iter.next()) |entry| {
             const pane = entry.value_ptr;
-            if (pane.state != .attached) {
+            if (pane.state == .orphaned) {
                 if (!first_orphan) try writer.writeAll(",");
                 first_orphan = false;
-
-                const state_str = switch (pane.state) {
-                    .attached => "attached",
-                    .half_orphaned => "half_orphaned",
-                    .orphaned => "orphaned",
-                };
-                try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d},\"state\":\"{s}\"", .{
+                try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d}}}", .{
                     entry.key_ptr.*,
                     pane.child_pid,
-                    state_str,
+                });
+            }
+        }
+
+        // Sticky panes (waiting for same pwd+key)
+        try writer.writeAll("],\"sticky\":[");
+        var first_sticky = true;
+        pane_iter = self.ses_state.panes.iterator();
+        while (pane_iter.next()) |entry| {
+            const pane = entry.value_ptr;
+            if (pane.state == .sticky) {
+                if (!first_sticky) try writer.writeAll(",");
+                first_sticky = false;
+                try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d}", .{
+                    entry.key_ptr.*,
+                    pane.child_pid,
                 });
                 if (pane.sticky_pwd) |pwd| {
-                    try writer.print(",\"sticky_pwd\":\"{s}\"", .{pwd});
+                    try writer.print(",\"pwd\":\"{s}\"", .{pwd});
+                }
+                if (pane.sticky_key) |key| {
+                    try writer.print(",\"key\":\"{c}\"", .{key});
                 }
                 try writer.writeAll("}");
             }
@@ -485,6 +601,188 @@ pub const Server = struct {
         var buf: [256]u8 = undefined;
         const response = try std.fmt.bufPrint(&buf, "{{\"type\":\"error\",\"message\":\"{s}\"}}\n", .{msg});
         try conn.send(response);
+    }
+
+    fn handleDetachSession(self: *Server, conn: *ipc.Connection, client_id: usize, root: std.json.ObjectMap) !void {
+        // Debug: log what we received
+        {
+            const sid = root.get("session_id");
+            const mstate = root.get("mux_state");
+            var log_buf: [256]u8 = undefined;
+            const log_msg = std.fmt.bufPrint(&log_buf, "SES handleDetachSession: has_session_id={}, has_mux_state={}\n", .{ sid != null, mstate != null }) catch "";
+            const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+            if (file) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                _ = f.write(log_msg) catch {};
+            }
+        }
+
+        // Get the session_id (mux UUID) and mux state JSON from the message
+        const session_id_hex = (root.get("session_id") orelse return self.sendError(conn, "missing_session_id")).string;
+        const mux_state = (root.get("mux_state") orelse return self.sendError(conn, "missing_mux_state")).string;
+
+        // Debug: log session_id length
+        {
+            var log_buf: [128]u8 = undefined;
+            const log_msg = std.fmt.bufPrint(&log_buf, "SES handleDetachSession: session_id_hex.len={}\n", .{session_id_hex.len}) catch "";
+            const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+            if (file) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                _ = f.write(log_msg) catch {};
+            }
+        }
+
+        // Convert 32-char hex to 16 bytes
+        if (session_id_hex.len != 32) {
+            return self.sendError(conn, "invalid_session_id");
+        }
+        var session_id: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&session_id, session_id_hex) catch {
+            return self.sendError(conn, "invalid_session_id");
+        };
+
+        // Debug log
+        {
+            var log_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&log_buf, "SES: detachSession client_id={d}, session_id={s}\n", .{ client_id, session_id_hex }) catch "";
+            const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+            if (file) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                _ = f.write(msg) catch {};
+            }
+        }
+
+        if (self.ses_state.detachSession(client_id, session_id, mux_state)) {
+            var buf: [128]u8 = undefined;
+            const response = try std.fmt.bufPrint(&buf, "{{\"type\":\"session_detached\",\"session_id\":\"{s}\"}}\n", .{
+                session_id_hex,
+            });
+            try conn.send(response);
+
+            // Debug log success
+            {
+                const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+                if (file) |f| {
+                    defer f.close();
+                    f.seekFromEnd(0) catch {};
+                    _ = f.write("SES: detachSession succeeded\n") catch {};
+                }
+            }
+        } else {
+            // Debug log failure
+            {
+                const file = std.fs.cwd().openFile("/tmp/hexa-debug.log", .{ .mode = .write_only }) catch null;
+                if (file) |f| {
+                    defer f.close();
+                    f.seekFromEnd(0) catch {};
+                    _ = f.write("SES: detachSession FAILED - client not found\n") catch {};
+                }
+            }
+            try self.sendError(conn, "client_not_found");
+        }
+    }
+
+    fn handleReattach(self: *Server, conn: *ipc.Connection, client_id: usize, root: std.json.ObjectMap) !void {
+        const session_id_prefix = (root.get("session_id") orelse return self.sendError(conn, "missing_session_id")).string;
+        if (session_id_prefix.len < 4 or session_id_prefix.len > 32) return self.sendError(conn, "invalid_session_id");
+
+        // Find session by prefix match
+        var matched_session_id: ?[16]u8 = null;
+        var match_count: usize = 0;
+
+        var iter = self.ses_state.detached_sessions.keyIterator();
+        while (iter.next()) |key_ptr| {
+            const hex_id: [32]u8 = std.fmt.bytesToHex(key_ptr, .lower);
+            if (std.mem.startsWith(u8, &hex_id, session_id_prefix)) {
+                matched_session_id = key_ptr.*;
+                match_count += 1;
+            }
+        }
+
+        if (match_count == 0) {
+            return self.sendError(conn, "session_not_found");
+        }
+        if (match_count > 1) {
+            return self.sendError(conn, "ambiguous_session_id");
+        }
+
+        const session_id = matched_session_id.?;
+
+        const result = self.ses_state.reattachSession(session_id, client_id) catch {
+            return self.sendError(conn, "reattach_failed");
+        };
+
+        if (result == null) {
+            return self.sendError(conn, "session_not_found");
+        }
+
+        const reattach_result = result.?;
+        defer {
+            self.allocator.free(reattach_result.mux_state_json);
+            self.allocator.free(reattach_result.pane_uuids);
+        }
+
+        // Send response with mux state and pane UUIDs
+        // Use dynamic allocation for large mux states
+        // mux_state needs to be escaped since it's a JSON string containing JSON
+        const estimated_size = reattach_result.mux_state_json.len * 2 + 1024;
+        const json_buf = self.allocator.alloc(u8, estimated_size) catch {
+            return self.sendError(conn, "alloc_failed");
+        };
+        defer self.allocator.free(json_buf);
+
+        var stream = std.io.fixedBufferStream(json_buf);
+        var writer = stream.writer();
+
+        try writer.writeAll("{\"type\":\"session_reattached\",\"mux_state\":\"");
+        // Escape the mux state JSON string (escape quotes and backslashes)
+        for (reattach_result.mux_state_json) |c| {
+            switch (c) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                else => try writer.writeByte(c),
+            }
+        }
+        try writer.writeAll("\",\"panes\":[");
+
+        for (reattach_result.pane_uuids, 0..) |uuid, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.print("\"{s}\"", .{uuid});
+        }
+
+        try writer.print("],\"count\":{d}}}\n", .{reattach_result.pane_uuids.len});
+        try conn.send(stream.getWritten());
+    }
+
+    fn handleListSessions(self: *Server, conn: *ipc.Connection) !void {
+        const sessions = self.ses_state.listDetachedSessions(self.allocator) catch {
+            return self.sendError(conn, "list_failed");
+        };
+        defer self.allocator.free(sessions);
+
+        var json_buf: [4096]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&json_buf);
+        var writer = stream.writer();
+
+        try writer.writeAll("{\"type\":\"sessions\",\"sessions\":[");
+
+        for (sessions, 0..) |s, i| {
+            if (i > 0) try writer.writeAll(",");
+            const hex_id: [32]u8 = std.fmt.bytesToHex(&s.session_id, .lower);
+            try writer.print("{{\"session_id\":\"{s}\",\"pane_count\":{d}}}", .{
+                &hex_id,
+                s.pane_count,
+            });
+        }
+
+        try writer.writeAll("]}\n");
+        try conn.send(stream.getWritten());
     }
 
     pub fn stop(self: *Server) void {

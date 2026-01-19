@@ -109,6 +109,7 @@ pub const PanesConfig = struct {
     key_next: u8 = 'n',
     key_prev: u8 = 'p',
     key_close: u8 = 'x',
+    key_detach: u8 = 'd',
     // Status bar
     status: StatusConfig = .{},
 };
@@ -129,6 +130,8 @@ pub const NotificationConfig = struct {
 pub const Config = struct {
     // Global keybindings (Alt + key)
     key_quit: u8 = 'q',
+    key_disown: u8 = 'z',
+    key_adopt: u8 = 'a',
 
     // Floating pane defaults
     float_width_percent: u8 = 60,
@@ -175,6 +178,12 @@ pub const Config = struct {
             if (keys.quit) |k| {
                 if (k.len > 0) config.key_quit = k[0];
             }
+            if (keys.disown) |k| {
+                if (k.len > 0) config.key_disown = k[0];
+            }
+            if (keys.adopt) |k| {
+                if (k.len > 0) config.key_adopt = k[0];
+            }
         }
 
         // Parse panes config
@@ -192,6 +201,9 @@ pub const Config = struct {
                 };
                 if (keys.close) |k| if (k.len > 0) {
                     config.panes.key_close = k[0];
+                };
+                if (keys.detach) |k| if (k.len > 0) {
+                    config.panes.key_detach = k[0];
                 };
             }
             // Status bar
@@ -525,6 +537,7 @@ const JsonPanesConfig = struct {
         next: ?[]const u8 = null,
         prev: ?[]const u8 = null,
         close: ?[]const u8 = null,
+        detach: ?[]const u8 = null,
     } = null,
     status: ?struct {
         enabled: ?bool = null,
@@ -549,6 +562,8 @@ const JsonNotificationConfig = struct {
 const JsonConfig = struct {
     keys: ?struct {
         quit: ?[]const u8 = null,
+        disown: ?[]const u8 = null,
+        adopt: ?[]const u8 = null,
     } = null,
     floats: ?[]const JsonFloatPane = null,
     splits: ?JsonSplitsConfig = null,

@@ -4,11 +4,15 @@ const core = @import("core");
 const pop = @import("pop");
 
 const Pane = @import("pane.zig").Pane;
-const Layout = @import("layout.zig").Layout;
+const layout_mod = @import("layout.zig");
+const Layout = layout_mod.Layout;
+const LayoutNode = layout_mod.LayoutNode;
 const SplitDir = @import("layout.zig").SplitDir;
 const render = @import("render.zig");
 const Renderer = render.Renderer;
-const SesClient = @import("ses_client.zig").SesClient;
+const ses_client = @import("ses_client.zig");
+const SesClient = ses_client.SesClient;
+const OrphanedPaneInfo = ses_client.OrphanedPaneInfo;
 const notification = @import("notification.zig");
 const NotificationManager = notification.NotificationManager;
 
@@ -42,6 +46,7 @@ const State = struct {
     floating_panes: std.ArrayList(*Pane),
     active_floating: ?usize,
     running: bool,
+    detach_mode: bool,
     needs_render: bool,
     force_full_render: bool,
     term_width: u16,
@@ -63,6 +68,7 @@ const State = struct {
 
         // Generate UUID for this mux instance
         const uuid = core.ipc.generateUuid();
+        debugLog("State.init generated new UUID: {s}\n", .{uuid});
 
         // Create IPC server socket
         const socket_path = core.ipc.getMuxSocketPath(allocator, &uuid) catch null;
@@ -79,6 +85,7 @@ const State = struct {
             .floating_panes = .empty,
             .active_floating = null,
             .running = true,
+            .detach_mode = false,
             .needs_render = true,
             .force_full_render = true,
             .term_width = width,
@@ -98,12 +105,28 @@ const State = struct {
     fn deinit(self: *State) void {
         // Deinit floating panes
         for (self.floating_panes.items) |pane| {
+            // In detach mode, panes are already handled by ses - don't kill
+            // Otherwise: sticky floats get orphaned, non-sticky get killed
+            if (!self.detach_mode and self.ses_client.isConnected()) {
+                if (pane.sticky) {
+                    self.ses_client.orphanPane(pane.uuid) catch {};
+                } else {
+                    self.ses_client.killPane(pane.uuid) catch {};
+                }
+            }
             pane.deinit();
             self.allocator.destroy(pane);
         }
         self.floating_panes.deinit(self.allocator);
-        // Deinit all tabs
+
+        // Deinit all tabs - kill panes in ses if not detaching
         for (self.tabs.items) |*tab| {
+            if (!self.detach_mode and self.ses_client.isConnected()) {
+                var pane_it = tab.layout.panes.valueIterator();
+                while (pane_it.next()) |pane_ptr| {
+                    self.ses_client.killPane(pane_ptr.*.uuid) catch {};
+                }
+            }
             tab.deinit();
         }
         self.tabs.deinit(self.allocator);
@@ -126,12 +149,24 @@ const State = struct {
 
     /// Create a new tab with one pane
     fn createTab(self: *State) !void {
+        // Get cwd from currently focused pane, or use mux's cwd for first tab
+        var cwd: ?[]const u8 = null;
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (self.tabs.items.len > 0) {
+            if (self.currentLayout().getFocusedPane()) |focused| {
+                cwd = focused.getRealCwd();
+            }
+        } else {
+            // First tab - use mux's current directory
+            cwd = std.posix.getcwd(&cwd_buf) catch null;
+        }
+
         var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, "tab");
         // Set ses client if connected (for new tabs after startup)
         if (self.ses_client.isConnected()) {
             tab.layout.setSesClient(&self.ses_client);
         }
-        _ = try tab.layout.createFirstPane();
+        _ = try tab.layout.createFirstPane(cwd);
         try self.tabs.append(self.allocator, tab);
         self.active_tab = self.tabs.items.len - 1;
         self.renderer.invalidate();
@@ -168,6 +203,394 @@ const State = struct {
             self.force_full_render = true;
         }
     }
+
+    /// Adopt first orphaned pane, replacing current focused pane
+    fn adoptOrphanedPane(self: *State) bool {
+        if (!self.ses_client.isConnected()) return false;
+
+        // Get list of orphaned panes
+        var panes: [32]OrphanedPaneInfo = undefined;
+        const count = self.ses_client.listOrphanedPanes(&panes) catch return false;
+        if (count == 0) return false;
+
+        // Adopt the first one
+        const result = self.ses_client.adoptPane(panes[0].uuid) catch return false;
+
+        // Get the current focused pane and replace it
+        if (self.active_floating) |idx| {
+            const old_pane = self.floating_panes.items[idx];
+            // Replace with adopted pane
+            old_pane.replaceWithFd(result.fd, result.pid, result.uuid) catch return false;
+        } else if (self.currentLayout().getFocusedPane()) |pane| {
+            pane.replaceWithFd(result.fd, result.pid, result.uuid) catch return false;
+        } else {
+            return false;
+        }
+
+        self.renderer.invalidate();
+        self.force_full_render = true;
+        return true;
+    }
+
+    /// Serialize entire mux state to JSON for detach
+    fn serializeState(self: *State) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        const writer = buf.writer(self.allocator);
+
+        try writer.writeAll("{");
+
+        // Mux UUID (persistent identity)
+        try writer.print("\"uuid\":\"{s}\",", .{self.uuid});
+
+        // Active tab/float
+        try writer.print("\"active_tab\":{d},", .{self.active_tab});
+        if (self.active_floating) |af| {
+            try writer.print("\"active_floating\":{d},", .{af});
+        } else {
+            try writer.writeAll("\"active_floating\":null,");
+        }
+
+        // Tabs
+        try writer.writeAll("\"tabs\":[");
+        for (self.tabs.items, 0..) |*tab, ti| {
+            if (ti > 0) try writer.writeAll(",");
+            try writer.writeAll("{");
+            try writer.print("\"name\":\"{s}\",", .{tab.name});
+            try writer.print("\"focused_pane_id\":{d},", .{tab.layout.focused_pane_id});
+            try writer.print("\"next_pane_id\":{d},", .{tab.layout.next_pane_id});
+
+            // Layout tree
+            try writer.writeAll("\"tree\":");
+            if (tab.layout.root) |root| {
+                try self.serializeLayoutNode(writer, root);
+            } else {
+                try writer.writeAll("null");
+            }
+
+            // Panes in this tab
+            try writer.writeAll(",\"panes\":[");
+            var first_pane = true;
+            var pit = tab.layout.panes.iterator();
+            while (pit.next()) |entry| {
+                const pane = entry.value_ptr.*;
+                if (!first_pane) try writer.writeAll(",");
+                first_pane = false;
+                try self.serializePane(writer, pane);
+            }
+            try writer.writeAll("]");
+
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("],");
+
+        // Floating panes
+        try writer.writeAll("\"floats\":[");
+        for (self.floating_panes.items, 0..) |pane, fi| {
+            if (fi > 0) try writer.writeAll(",");
+            try self.serializePane(writer, pane);
+        }
+        try writer.writeAll("]");
+
+        try writer.writeAll("}");
+
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    fn serializeLayoutNode(self: *State, writer: anytype, node: *LayoutNode) !void {
+        _ = self;
+        switch (node.*) {
+            .pane => |id| {
+                try writer.print("{{\"type\":\"pane\",\"id\":{d}}}", .{id});
+            },
+            .split => |split| {
+                const dir_str: []const u8 = if (split.dir == .horizontal) "horizontal" else "vertical";
+                try writer.print("{{\"type\":\"split\",\"dir\":\"{s}\",\"ratio\":{d},\"first\":", .{ dir_str, split.ratio });
+                try serializeLayoutNode(undefined, writer, split.first);
+                try writer.writeAll(",\"second\":");
+                try serializeLayoutNode(undefined, writer, split.second);
+                try writer.writeAll("}");
+            },
+        }
+    }
+
+    fn serializePane(self: *State, writer: anytype, pane: *Pane) !void {
+        _ = self;
+        try writer.writeAll("{");
+        try writer.print("\"id\":{d},", .{pane.id});
+        try writer.print("\"uuid\":\"{s}\",", .{pane.uuid});
+        try writer.print("\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},", .{ pane.x, pane.y, pane.width, pane.height });
+        try writer.print("\"focused\":{},", .{pane.focused});
+        try writer.print("\"floating\":{},", .{pane.floating});
+        try writer.print("\"visible\":{},", .{pane.visible});
+        try writer.print("\"float_key\":{d},", .{pane.float_key});
+        try writer.print("\"border_x\":{d},\"border_y\":{d},\"border_w\":{d},\"border_h\":{d},", .{ pane.border_x, pane.border_y, pane.border_w, pane.border_h });
+        try writer.print("\"float_width_pct\":{d},\"float_height_pct\":{d},", .{ pane.float_width_pct, pane.float_height_pct });
+        try writer.print("\"float_pos_x_pct\":{d},\"float_pos_y_pct\":{d},", .{ pane.float_pos_x_pct, pane.float_pos_y_pct });
+        try writer.print("\"float_pad_x\":{d},\"float_pad_y\":{d},", .{ pane.float_pad_x, pane.float_pad_y });
+        try writer.print("\"is_pwd\":{},", .{pane.is_pwd});
+        try writer.print("\"sticky\":{}", .{pane.sticky});
+        if (pane.pwd_dir) |pwd| {
+            try writer.print(",\"pwd_dir\":\"{s}\"", .{pwd});
+        }
+        try writer.writeAll("}");
+    }
+
+    /// Reattach to a detached session, restoring full state
+    fn reattachSession(self: *State, session_id_prefix: []const u8) bool {
+        if (!self.ses_client.isConnected()) return false;
+
+        // Try to reattach session (server supports prefix matching)
+        const result = self.ses_client.reattachSession(session_id_prefix) catch return false;
+        if (result == null) return false;
+
+        const reattach_result = result.?;
+        defer {
+            self.allocator.free(reattach_result.mux_state_json);
+            self.allocator.free(reattach_result.pane_uuids);
+        }
+
+        // Parse the mux state JSON
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, reattach_result.mux_state_json, .{}) catch return false;
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+
+        // Restore mux UUID (persistent identity)
+        if (root.get("uuid")) |uuid_val| {
+            const uuid_str = uuid_val.string;
+            if (uuid_str.len == 32) {
+                @memcpy(&self.uuid, uuid_str[0..32]);
+                debugLog("Restored UUID from saved state: {s}\n", .{self.uuid});
+            }
+        } else {
+            debugLog("No UUID found in saved state!\n", .{});
+        }
+
+        // Restore active tab/floating
+        if (root.get("active_tab")) |at| {
+            self.active_tab = @intCast(at.integer);
+        }
+        if (root.get("active_floating")) |af| {
+            self.active_floating = if (af == .null) null else @intCast(af.integer);
+        }
+
+        // Build a map of UUID -> fd for pane adoption
+        var uuid_fd_map = std.AutoHashMap([32]u8, struct { fd: std.posix.fd_t, pid: std.posix.pid_t }).init(self.allocator);
+        defer uuid_fd_map.deinit();
+
+        debugLog("Reattach: adopting {d} panes\n", .{reattach_result.pane_uuids.len});
+        for (reattach_result.pane_uuids) |uuid| {
+            // Adopt each pane to get its fd
+            const adopt_result = self.ses_client.adoptPane(uuid) catch |err| {
+                debugLog("Failed to adopt pane {s}: {}\n", .{ std.fmt.bytesToHex(uuid[0..8], .lower), err });
+                continue;
+            };
+            uuid_fd_map.put(uuid, .{ .fd = adopt_result.fd, .pid = adopt_result.pid }) catch continue;
+            debugLog("Adopted pane {s}, fd={d}\n", .{ std.fmt.bytesToHex(uuid[0..8], .lower), adopt_result.fd });
+        }
+
+        // Restore tabs
+        if (root.get("tabs")) |tabs_arr| {
+            debugLog("Reattach: restoring {d} tabs\n", .{tabs_arr.array.items.len});
+            for (tabs_arr.array.items) |tab_val| {
+                const tab_obj = tab_val.object;
+                const name_json = (tab_obj.get("name") orelse continue).string;
+                const focused_pane_id: u16 = @intCast((tab_obj.get("focused_pane_id") orelse continue).integer);
+                const next_pane_id: u16 = @intCast((tab_obj.get("next_pane_id") orelse continue).integer);
+
+                // Dupe the name since parsed JSON will be freed
+                const name = self.allocator.dupe(u8, name_json) catch continue;
+                var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, name);
+                if (self.ses_client.isConnected()) {
+                    tab.layout.setSesClient(&self.ses_client);
+                }
+                tab.layout.focused_pane_id = focused_pane_id;
+                tab.layout.next_pane_id = next_pane_id;
+
+                // Restore panes
+                if (tab_obj.get("panes")) |panes_arr| {
+                    for (panes_arr.array.items) |pane_val| {
+                        const pane_obj = pane_val.object;
+                        const pane_id: u16 = @intCast((pane_obj.get("id") orelse continue).integer);
+                        const uuid_str = (pane_obj.get("uuid") orelse continue).string;
+                        if (uuid_str.len != 32) continue;
+
+                        // Convert to [32]u8 for lookup
+                        var uuid_arr: [32]u8 = undefined;
+                        @memcpy(&uuid_arr, uuid_str[0..32]);
+
+                        // Look up fd for this pane
+                        if (uuid_fd_map.get(uuid_arr)) |fd_info| {
+                            const pane = self.allocator.create(Pane) catch continue;
+
+                            pane.initWithFd(self.allocator, pane_id, 0, 0, self.layout_width, self.layout_height, fd_info.fd, fd_info.pid, uuid_arr) catch {
+                                self.allocator.destroy(pane);
+                                continue;
+                            };
+
+                            // Restore pane properties
+                            pane.focused = if (pane_obj.get("focused")) |f| (f == .bool and f.bool) else false;
+
+                            tab.layout.panes.put(pane_id, pane) catch {
+                                pane.deinit();
+                                self.allocator.destroy(pane);
+                                continue;
+                            };
+                        }
+                    }
+                }
+
+                // Restore layout tree
+                if (tab_obj.get("tree")) |tree_val| {
+                    if (tree_val != .null) {
+                        tab.layout.root = self.deserializeLayoutNode(tree_val.object) catch null;
+                    }
+                }
+
+                self.tabs.append(self.allocator, tab) catch continue;
+            }
+        }
+
+        // Restore floating panes
+        if (root.get("floats")) |floats_arr| {
+            for (floats_arr.array.items) |pane_val| {
+                const pane_obj = pane_val.object;
+                const uuid_str = (pane_obj.get("uuid") orelse continue).string;
+                if (uuid_str.len != 32) continue;
+
+                var uuid_arr: [32]u8 = undefined;
+                @memcpy(&uuid_arr, uuid_str[0..32]);
+
+                if (uuid_fd_map.get(uuid_arr)) |fd_info| {
+                    const pane = self.allocator.create(Pane) catch continue;
+
+                    pane.initWithFd(self.allocator, 0, 0, 0, self.layout_width, self.layout_height, fd_info.fd, fd_info.pid, uuid_arr) catch {
+                        self.allocator.destroy(pane);
+                        continue;
+                    };
+
+                    // Restore float properties
+                    pane.floating = true;
+                    pane.visible = if (pane_obj.get("visible")) |v| (v != .bool or v.bool) else true;
+                    pane.float_key = if (pane_obj.get("float_key")) |fk| @intCast(fk.integer) else 0;
+                    pane.float_width_pct = if (pane_obj.get("float_width_pct")) |wp| @intCast(wp.integer) else 60;
+                    pane.float_height_pct = if (pane_obj.get("float_height_pct")) |hp| @intCast(hp.integer) else 60;
+                    pane.float_pos_x_pct = if (pane_obj.get("float_pos_x_pct")) |xp| @intCast(xp.integer) else 50;
+                    pane.float_pos_y_pct = if (pane_obj.get("float_pos_y_pct")) |yp| @intCast(yp.integer) else 50;
+                    pane.float_pad_x = if (pane_obj.get("float_pad_x")) |px| @intCast(px.integer) else 1;
+                    pane.float_pad_y = if (pane_obj.get("float_pad_y")) |py| @intCast(py.integer) else 0;
+                    pane.is_pwd = if (pane_obj.get("is_pwd")) |ip| (ip == .bool and ip.bool) else false;
+                    pane.sticky = if (pane_obj.get("sticky")) |s| (s == .bool and s.bool) else false;
+
+                    self.floating_panes.append(self.allocator, pane) catch {
+                        pane.deinit();
+                        self.allocator.destroy(pane);
+                        continue;
+                    };
+                }
+            }
+        }
+
+        // Recalculate all layouts for current terminal size
+        for (self.tabs.items) |*tab| {
+            tab.layout.resize(self.layout_width, self.layout_height);
+        }
+
+        // Recalculate floating pane positions
+        resizeFloatingPanes(self);
+
+        self.renderer.invalidate();
+        self.force_full_render = true;
+        debugLog("Reattach complete: {d} tabs, {d} floats restored\n", .{ self.tabs.items.len, self.floating_panes.items.len });
+        return self.tabs.items.len > 0;
+    }
+
+    fn deserializeLayoutNode(self: *State, obj: std.json.ObjectMap) !*LayoutNode {
+        const node = try self.allocator.create(LayoutNode);
+        errdefer self.allocator.destroy(node);
+
+        const node_type = (obj.get("type") orelse return error.InvalidNode).string;
+
+        if (std.mem.eql(u8, node_type, "pane")) {
+            const id: u16 = @intCast((obj.get("id") orelse return error.InvalidNode).integer);
+            node.* = .{ .pane = id };
+        } else if (std.mem.eql(u8, node_type, "split")) {
+            const dir_str = (obj.get("dir") orelse return error.InvalidNode).string;
+            const dir: SplitDir = if (std.mem.eql(u8, dir_str, "horizontal")) .horizontal else .vertical;
+            const ratio_val = obj.get("ratio") orelse return error.InvalidNode;
+            const ratio: f32 = switch (ratio_val) {
+                .float => @floatCast(ratio_val.float),
+                .integer => @floatFromInt(ratio_val.integer),
+                else => return error.InvalidNode,
+            };
+            const first_obj = (obj.get("first") orelse return error.InvalidNode).object;
+            const second_obj = (obj.get("second") orelse return error.InvalidNode).object;
+
+            const first = try self.deserializeLayoutNode(first_obj);
+            errdefer self.allocator.destroy(first);
+            const second = try self.deserializeLayoutNode(second_obj);
+
+            node.* = .{ .split = .{
+                .dir = dir,
+                .ratio = ratio,
+                .first = first,
+                .second = second,
+            } };
+        } else {
+            return error.InvalidNode;
+        }
+
+        return node;
+    }
+
+    /// Attach to orphaned pane by UUID prefix (for --attach CLI)
+    fn attachOrphanedPane(self: *State, uuid_prefix: []const u8) bool {
+        if (!self.ses_client.isConnected()) return false;
+
+        // Get list of orphaned panes and find matching UUID
+        var panes: [32]OrphanedPaneInfo = undefined;
+        const count = self.ses_client.listOrphanedPanes(&panes) catch return false;
+
+        for (panes[0..count]) |p| {
+            if (std.mem.startsWith(u8, &p.uuid, uuid_prefix)) {
+                // Found matching pane, adopt it
+                const result = self.ses_client.adoptPane(p.uuid) catch return false;
+
+                // Create a new tab with this pane
+                var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, "attached");
+                if (self.ses_client.isConnected()) {
+                    tab.layout.setSesClient(&self.ses_client);
+                }
+
+                // Create pane with adopted fd
+                const pane = self.allocator.create(Pane) catch return false;
+                pane.initWithFd(self.allocator, 0, 0, 0, self.layout_width, self.layout_height, result.fd, result.pid, result.uuid) catch {
+                    self.allocator.destroy(pane);
+                    return false;
+                };
+                pane.focused = true;
+
+                // Add pane to layout manually
+                tab.layout.panes.put(0, pane) catch {
+                    pane.deinit();
+                    self.allocator.destroy(pane);
+                    return false;
+                };
+                const node = self.allocator.create(LayoutNode) catch return false;
+                node.* = .{ .pane = 0 };
+                tab.layout.root = node;
+                tab.layout.next_pane_id = 1;
+
+                self.tabs.append(self.allocator, tab) catch return false;
+                self.active_tab = self.tabs.items.len - 1;
+                self.renderer.invalidate();
+                self.force_full_render = true;
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 pub fn main() !void {
@@ -178,12 +601,19 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var notify_message: ?[]const u8 = null;
+    var list_orphaned = false;
+    var attach_uuid: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if ((std.mem.eql(u8, arg, "--notify") or std.mem.eql(u8, arg, "-n")) and i + 1 < args.len) {
             i += 1;
             notify_message = args[i];
+        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
+            list_orphaned = true;
+        } else if ((std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "-a")) and i + 1 < args.len) {
+            i += 1;
+            attach_uuid = args[i];
         }
     }
 
@@ -191,6 +621,50 @@ pub fn main() !void {
     if (notify_message) |msg| {
         sendNotifyToParentMux(allocator, msg);
         return;
+    }
+
+    // Handle --list: show detached sessions and orphaned panes
+    if (list_orphaned) {
+        var ses = SesClient.init(allocator);
+        defer ses.deinit();
+        ses.connect() catch {
+            std.debug.print("Could not connect to ses daemon\n", .{});
+            return;
+        };
+
+        // List detached sessions
+        var sessions: [16]ses_client.DetachedSessionInfo = undefined;
+        const sess_count = ses.listSessions(&sessions) catch 0;
+        if (sess_count > 0) {
+            std.debug.print("Detached sessions:\n", .{});
+            for (sessions[0..sess_count]) |s| {
+                std.debug.print("  [{s}] {d} panes - attach with: hexa-mux -a {s}\n", .{ s.session_id[0..8], s.pane_count, s.session_id[0..8] });
+            }
+        }
+
+        // List orphaned panes
+        var panes: [32]OrphanedPaneInfo = undefined;
+        const count = ses.listOrphanedPanes(&panes) catch 0;
+        if (count > 0) {
+            std.debug.print("Orphaned panes (disowned):\n", .{});
+            for (panes[0..count]) |p| {
+                std.debug.print("  [{s}] pid={d}\n", .{ p.uuid[0..8], p.pid });
+            }
+        }
+
+        if (sess_count == 0 and count == 0) {
+            std.debug.print("No detached sessions or orphaned panes\n", .{});
+        }
+        return;
+    }
+
+    // Handle --attach: attach to orphaned pane
+    if (attach_uuid) |uuid_arg| {
+        if (uuid_arg.len < 8) {
+            std.debug.print("UUID too short (need at least 8 chars)\n", .{});
+            return;
+        }
+        // Will be handled after state init
     }
 
     // Redirect stderr to /dev/null to suppress ghostty warnings
@@ -225,8 +699,23 @@ pub fn main() !void {
         state.notifications.showFor("ses daemon started", 2000);
     }
 
-    // Create first tab with one pane (will use ses if connected)
-    try state.createTab();
+    // Handle --attach: try session first, then orphaned pane
+    if (attach_uuid) |uuid_prefix| {
+        // First try to reattach a detached session
+        if (state.reattachSession(uuid_prefix)) {
+            state.notifications.show("Session reattached");
+        } else if (state.attachOrphanedPane(uuid_prefix)) {
+            // Fall back to orphaned pane
+            state.notifications.show("Attached to orphaned pane");
+        } else {
+            // Fallback to creating new tab
+            try state.createTab();
+            state.notifications.show("Session/pane not found, created new");
+        }
+    } else {
+        // Create first tab with one pane (will use ses if connected)
+        try state.createTab();
+    }
 
     // Enter raw mode
     const orig_termios = try enableRawMode(posix.STDIN_FILENO);
@@ -297,6 +786,12 @@ pub fn main() !void {
                     const was_active = if (state.active_floating) |af| af == fi else false;
 
                     const pane = state.floating_panes.orderedRemove(fi);
+
+                    // Kill in ses (dead panes don't need to be orphaned)
+                    if (state.ses_client.isConnected()) {
+                        state.ses_client.killPane(pane.uuid) catch {};
+                    }
+
                     pane.deinit();
                     state.allocator.destroy(pane);
                     state.needs_render = true;
@@ -341,7 +836,12 @@ pub fn main() !void {
                     _ = state.closeCurrentTab();
                     state.needs_render = true;
                 } else {
-                    // Last pane in last tab - exit
+                    // Last pane in last tab - kill pane in ses and exit
+                    if (state.currentLayout().getFocusedPane()) |pane| {
+                        if (state.ses_client.isConnected()) {
+                            state.ses_client.killPane(pane.uuid) catch {};
+                        }
+                    }
                     state.running = false;
                     continue;
                 }
@@ -683,19 +1183,38 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
     else
         state.currentLayout().getFocusedPane() orelse return null;
 
-    // SGR mouse wheel: ESC [ < 64 ; x ; y M (up) or ESC [ < 65 ; x ; y M (down)
+    // SGR mouse format: ESC [ < btn ; x ; y M (press) or m (release)
     if (input.len >= 4 and input[2] == '<') {
         // Find the 'M' or 'm' terminator
         var end: usize = 3;
         while (end < input.len and input[end] != 'M' and input[end] != 'm') : (end += 1) {}
         if (end >= input.len) return null;
 
-        // Parse button number (first number after '<')
-        var btn: u8 = 0;
+        const is_release = input[end] == 'm';
+
+        // Parse: btn ; x ; y
+        var btn: u16 = 0;
+        var mouse_x: u16 = 0;
+        var mouse_y: u16 = 0;
+        var field: u8 = 0;
         var i: usize = 3;
-        while (i < end and input[i] >= '0' and input[i] <= '9') : (i += 1) {
-            btn = btn * 10 + (input[i] - '0');
+        while (i < end) : (i += 1) {
+            if (input[i] == ';') {
+                field += 1;
+            } else if (input[i] >= '0' and input[i] <= '9') {
+                const digit = input[i] - '0';
+                switch (field) {
+                    0 => btn = btn * 10 + digit,
+                    1 => mouse_x = mouse_x * 10 + digit,
+                    2 => mouse_y = mouse_y * 10 + digit,
+                    else => {},
+                }
+            }
         }
+
+        // Convert from 1-based to 0-based coordinates
+        if (mouse_x > 0) mouse_x -= 1;
+        if (mouse_y > 0) mouse_y -= 1;
 
         // Button 64 = wheel up, 65 = wheel down
         if (btn == 64) {
@@ -707,6 +1226,40 @@ fn handleScrollKeys(state: *State, input: []const u8) ?usize {
             state.needs_render = true;
             return end + 1;
         }
+
+        // Left click (btn 0) on release - focus pane at position
+        if (btn == 0 and is_release) {
+            // Check floating panes first (they're on top)
+            var clicked_float: ?usize = null;
+            for (state.floating_panes.items, 0..) |fp, fi| {
+                if (fp.visible and mouse_x >= fp.x and mouse_x < fp.x + fp.width and
+                    mouse_y >= fp.y and mouse_y < fp.y + fp.height)
+                {
+                    clicked_float = fi;
+                    // Don't break - later floats are on top
+                }
+            }
+
+            if (clicked_float) |fi| {
+                state.active_floating = fi;
+                state.needs_render = true;
+            } else {
+                // Check tiled panes in current tab
+                state.active_floating = null;
+                var pane_it = state.currentLayout().paneIterator();
+                while (pane_it.next()) |p| {
+                    if (mouse_x >= p.*.x and mouse_x < p.*.x + p.*.width and
+                        mouse_y >= p.*.y and mouse_y < p.*.y + p.*.height)
+                    {
+                        state.currentLayout().focused_pane_id = p.*.id;
+                        state.needs_render = true;
+                        break;
+                    }
+                }
+            }
+            return end + 1;
+        }
+
         // Other mouse events - consume but don't act
         return end + 1;
     }
@@ -788,18 +1341,58 @@ fn handleAltKey(state: *State, key: u8) bool {
         return true;
     }
 
+    // Disown pane - orphans current pane in ses, adopt with Alt+a
+    if (key == cfg.key_disown) {
+        if (state.active_floating) |idx| {
+            const pane = state.floating_panes.items[idx];
+            if (pane.pty.external_process) {
+                state.ses_client.orphanPane(pane.uuid) catch {};
+                state.notifications.show("Pane disowned (adopt with Alt+a)");
+            }
+            _ = state.floating_panes.orderedRemove(idx);
+            pane.deinit();
+            state.allocator.destroy(pane);
+            state.active_floating = if (state.floating_panes.items.len > 0) 0 else null;
+        } else if (state.currentLayout().getFocusedPane()) |pane| {
+            if (pane.pty.external_process) {
+                state.ses_client.orphanPane(pane.uuid) catch {};
+                state.notifications.show("Pane disowned (adopt with Alt+a)");
+            }
+            if (!state.currentLayout().closeFocused()) {
+                if (!state.closeCurrentTab()) {
+                    state.running = false;
+                }
+            }
+        }
+        state.needs_render = true;
+        return true;
+    }
+
+    // Adopt first orphaned pane, replace current pane
+    if (key == cfg.key_adopt) {
+        if (state.adoptOrphanedPane()) {
+            state.notifications.show("Adopted orphaned pane");
+            state.needs_render = true;
+        } else {
+            state.notifications.show("No orphaned panes");
+        }
+        return true;
+    }
+
     // Split keys
     const split_h_key = cfg.splits.key_split_h;
     const split_v_key = cfg.splits.key_split_v;
 
     if (key == split_h_key) {
-        _ = state.currentLayout().splitFocused(.horizontal) catch null;
+        const cwd = if (state.currentLayout().getFocusedPane()) |p| p.getRealCwd() else null;
+        _ = state.currentLayout().splitFocused(.horizontal, cwd) catch null;
         state.needs_render = true;
         return true;
     }
 
     if (key == split_v_key) {
-        _ = state.currentLayout().splitFocused(.vertical) catch null;
+        const cwd = if (state.currentLayout().getFocusedPane()) |p| p.getRealCwd() else null;
+        _ = state.currentLayout().splitFocused(.vertical, cwd) catch null;
         state.needs_render = true;
         return true;
     }
@@ -842,6 +1435,34 @@ fn handleAltKey(state: *State, key: u8) bool {
             }
         }
         state.needs_render = true;
+        return true;
+    }
+
+    // Alt+d = detach whole mux - keeps all panes alive in ses for --attach
+    if (key == cfg.panes.key_detach) {
+        // Always set detach_mode to prevent killing panes on exit
+        state.detach_mode = true;
+
+        // Serialize entire mux state
+        const mux_state_json = state.serializeState() catch {
+            state.notifications.showFor("Failed to serialize state", 2000);
+            state.running = false;
+            return true;
+        };
+        defer state.allocator.free(mux_state_json);
+
+        // Detach session with our UUID - panes stay grouped with full state
+        debugLog("Detaching with UUID: {s}\n", .{state.uuid});
+        state.ses_client.detachSession(state.uuid, mux_state_json) catch |err| {
+            debugLog("Detach FAILED: {}\n", .{err});
+            std.debug.print("\nDetach failed - panes orphaned\n", .{});
+            state.running = false;
+            return true;
+        };
+        debugLog("Detach succeeded!\n", .{});
+        // Print session_id (our UUID) so user can reattach
+        std.debug.print("\nSession detached: {s}\nReattach with: hexa-mux --attach {s}\n", .{ state.uuid, state.uuid[0..8] });
+        state.running = false;
         return true;
     }
 
@@ -1010,7 +1631,18 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
     const content_h = outer_h -| (pad_y * 2);
 
     const id: u16 = @intCast(100 + state.floating_panes.items.len);
-    try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command);
+
+    // Try to create pane via ses if available
+    if (state.ses_client.isConnected()) {
+        if (state.ses_client.createPane(float_def.command, current_dir, null, null)) |result| {
+            try pane.initWithFd(state.allocator, id, content_x, content_y, content_w, content_h, result.fd, result.pid, result.uuid);
+        } else |_| {
+            // Fall back to local spawn
+            try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command);
+        }
+    } else {
+        try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command);
+    }
     pane.floating = true;
     pane.focused = true;
     pane.visible = true;

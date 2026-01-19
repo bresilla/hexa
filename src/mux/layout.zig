@@ -58,7 +58,7 @@ pub const Layout = struct {
     }
 
     pub fn deinit(self: *Layout) void {
-        // Deinit all panes
+        // Deinit all panes (don't kill in ses - caller handles that)
         var it = self.panes.valueIterator();
         while (it.next()) |pane_ptr| {
             pane_ptr.*.deinit();
@@ -84,7 +84,7 @@ pub const Layout = struct {
     }
 
     /// Create the first pane
-    pub fn createFirstPane(self: *Layout) !*Pane {
+    pub fn createFirstPane(self: *Layout, cwd: ?[]const u8) !*Pane {
         const id = self.next_pane_id;
         self.next_pane_id += 1;
 
@@ -94,7 +94,7 @@ pub const Layout = struct {
         // Try to create pane via ses if available
         if (self.ses_client) |ses| {
             if (ses.isConnected()) {
-                const result = ses.createPane(null, null, null) catch {
+                const result = ses.createPane(null, cwd, null, null) catch {
                     // Fall back to local spawn
                     try pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
                     pane.focused = true;
@@ -134,7 +134,7 @@ pub const Layout = struct {
     }
 
     /// Split the focused pane
-    pub fn splitFocused(self: *Layout, dir: SplitDir) !?*Pane {
+    pub fn splitFocused(self: *Layout, dir: SplitDir, cwd: ?[]const u8) !?*Pane {
         if (self.root == null) return null;
 
         const focused = self.getFocusedPane() orelse return null;
@@ -156,7 +156,7 @@ pub const Layout = struct {
         // Try to create pane via ses if available
         if (self.ses_client) |ses| {
             if (ses.isConnected()) {
-                if (ses.createPane(null, null, null)) |result| {
+                if (ses.createPane(null, cwd, null, null)) |result| {
                     try new_pane.initWithFd(self.allocator, new_id, new_x, new_y, new_width, new_height, result.fd, result.pid, result.uuid);
                 } else |_| {
                     // Fall back to local spawn
@@ -330,6 +330,10 @@ pub const Layout = struct {
 
         // Remove pane
         if (self.panes.fetchRemove(id_to_close)) |kv| {
+            // Tell ses to kill the pane
+            if (self.ses_client) |ses| {
+                ses.killPane(kv.value.uuid) catch {};
+            }
             kv.value.deinit();
             self.allocator.destroy(kv.value);
         }
