@@ -20,6 +20,8 @@ pub const StatusModule = struct {
     inactive_style: []const u8 = "bg:237 fg:250",
     separator: []const u8 = " | ",
     separator_style: []const u8 = "fg:7",
+    // For panes module: what to show as tab title ("name" or "basename")
+    tab_title: []const u8 = "basename",
 };
 
 /// Status bar config
@@ -482,6 +484,7 @@ pub const Config = struct {
                 .inactive_style = if (jm.inactive_style) |s| allocator.dupe(u8, s) catch "bg:237 fg:250" else "bg:237 fg:250",
                 .separator = if (jm.separator) |s| allocator.dupe(u8, s) catch " | " else " | ",
                 .separator_style = if (jm.separator_style) |s| allocator.dupe(u8, s) catch "fg:7" else "fg:7",
+                .tab_title = if (jm.tab_title) |s| allocator.dupe(u8, s) catch "basename" else "basename",
             }) catch continue;
         }
         return list.toOwnedSlice(allocator) catch &[_]StatusModule{};
@@ -616,4 +619,5 @@ const JsonStatusModule = struct {
     inactive_style: ?[]const u8 = null,
     separator: ?[]const u8 = null,
     separator_style: ?[]const u8 = null,
+    tab_title: ?[]const u8 = null,
 };

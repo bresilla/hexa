@@ -1775,10 +1775,21 @@ fn handleAltKey(state: *State, key: u8) bool {
     // Alt+x or Alt+w = close current tab (or quit if last tab)
     if (key == cfg.panes.key_close or key == 'w') {
         if (state.active_floating) |idx| {
+            const old_uuid = state.getCurrentFocusedUuid();
             const pane = state.floating_panes.orderedRemove(idx);
+            state.syncPaneUnfocus(pane);
             pane.deinit();
             state.allocator.destroy(pane);
-            state.active_floating = if (state.floating_panes.items.len > 0) 0 else null;
+            // Focus another float or fall back to tiled pane
+            if (state.floating_panes.items.len > 0) {
+                state.active_floating = 0;
+                state.syncPaneFocus(state.floating_panes.items[0], old_uuid);
+            } else {
+                state.active_floating = null;
+                if (state.currentLayout().getFocusedPane()) |tiled| {
+                    state.syncPaneFocus(tiled, old_uuid);
+                }
+            }
         } else {
             // Close current tab, or quit if it's the last one
             if (!state.closeCurrentTab()) {
@@ -1891,9 +1902,19 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
             }
 
             // Toggle visibility
+            const old_uuid = state.getCurrentFocusedUuid();
             pane.visible = !pane.visible;
             if (pane.visible) {
+                // Unfocus current pane (tiled or another float)
+                if (state.active_floating) |afi| {
+                    if (afi < state.floating_panes.items.len) {
+                        state.syncPaneUnfocus(state.floating_panes.items[afi]);
+                    }
+                } else if (state.currentLayout().getFocusedPane()) |tiled| {
+                    state.syncPaneUnfocus(tiled);
+                }
                 state.active_floating = i;
+                state.syncPaneFocus(pane, old_uuid);
                 // If alone mode, hide all other floats
                 if (float_def.alone) {
                     for (state.floating_panes.items) |other| {
@@ -1911,14 +1932,32 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                     }
                 }
             } else {
+                // Hiding float - focus tiled pane
+                state.syncPaneUnfocus(pane);
                 state.active_floating = null;
+                if (state.currentLayout().getFocusedPane()) |tiled| {
+                    state.syncPaneFocus(tiled, old_uuid);
+                }
             }
             return;
         }
     }
 
     // Not found - create new float
+    // First unfocus current pane
+    const old_uuid = state.getCurrentFocusedUuid();
+    if (state.active_floating) |afi| {
+        if (afi < state.floating_panes.items.len) {
+            state.syncPaneUnfocus(state.floating_panes.items[afi]);
+        }
+    } else if (state.currentLayout().getFocusedPane()) |tiled| {
+        state.syncPaneUnfocus(tiled);
+    }
     createNamedFloat(state, float_def, current_dir) catch {};
+    // Focus the new float
+    if (state.floating_panes.items.len > 0) {
+        state.syncPaneFocus(state.floating_panes.items[state.floating_panes.items.len - 1], old_uuid);
+    }
 
     // If alone mode, hide all other floats after creation
     if (float_def.alone) {
@@ -2585,17 +2624,31 @@ fn drawStatusBar(state: *State, renderer: *Renderer) void {
     defer ctx.deinit();
     ctx.terminal_width = width;
 
-    // Collect tab names for center section (shows tabs, not panes within a tab)
+    // Find the panes module to check tab_title setting
+    var use_basename = true; // default to basename
+    for (cfg.center) |mod| {
+        if (std.mem.eql(u8, mod.name, "panes")) {
+            use_basename = std.mem.eql(u8, mod.tab_title, "basename");
+            break;
+        }
+    }
+
+    // Collect tab titles for center section
     var tab_names: [16][]const u8 = undefined;
     var tab_count: usize = 0;
     for (state.tabs.items) |*tab| {
         if (tab_count < 16) {
-            // Use the focused pane's pwd as tab name
-            if (tab.layout.getFocusedPane()) |pane| {
-                const pwd = pane.getPwd();
-                tab_names[tab_count] = if (pwd) |p| std.fs.path.basename(p) else "tab";
+            if (use_basename) {
+                // Use the focused pane's cwd basename (reads /proc/<pid>/cwd)
+                if (tab.layout.getFocusedPane()) |pane| {
+                    const pwd = pane.getRealCwd();
+                    tab_names[tab_count] = if (pwd) |p| std.fs.path.basename(p) else tab.name;
+                } else {
+                    tab_names[tab_count] = tab.name;
+                }
             } else {
-                tab_names[tab_count] = "tab";
+                // Use the static tab name
+                tab_names[tab_count] = tab.name;
             }
             tab_count += 1;
         }
