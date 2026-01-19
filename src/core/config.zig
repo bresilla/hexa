@@ -66,6 +66,7 @@ pub const FloatDef = struct {
     pwd: bool = false, // if true, each directory gets its own instance
     sticky: bool = false, // if true, preserved by ses daemon across mux restarts
     special: bool = true, // if true, float is global; if false, float is tab-bound
+    destroy: bool = false, // if true, kill float on hide (ignored if pwd or special)
     // Per-float overrides (null = use default)
     width_percent: ?u8 = null,
     height_percent: ?u8 = null,
@@ -352,13 +353,18 @@ pub const Config = struct {
                     break :blk result;
                 } else null;
 
+                const destroy = jf.destroy orelse false;
+                // If destroy is set and special not explicitly provided, default special to false
+                const special = jf.special orelse (if (destroy) false else true);
+
                 float_list.append(allocator, .{
                     .key = key,
                     .command = command,
                     .alone = jf.alone orelse false,
                     .pwd = jf.pwd orelse false,
                     .sticky = jf.sticky orelse false,
-                    .special = jf.special orelse true,
+                    .special = special,
+                    .destroy = destroy,
                     .width_percent = if (jf.width) |v| @intCast(@min(100, @max(10, v))) else def_width,
                     .height_percent = if (jf.height) |v| @intCast(@min(100, @max(10, v))) else def_height,
                     .pos_x = if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else def_pos_x,
@@ -546,6 +552,7 @@ const JsonFloatPane = struct {
     pwd: ?bool = null,
     sticky: ?bool = null,
     special: ?bool = null,
+    destroy: ?bool = null,
     width: ?i64 = null,
     height: ?i64 = null,
     pos_x: ?i64 = null,

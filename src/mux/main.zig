@@ -2309,6 +2309,14 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                 if (state.currentLayout().getFocusedPane()) |tiled| {
                     state.syncPaneFocus(tiled, old_uuid);
                 }
+                // Destroy float if configured (pwd/special take priority - never destroy)
+                if (float_def.destroy and !float_def.pwd and !float_def.special) {
+                    if (state.ses_client.isConnected()) {
+                        state.ses_client.killPane(pane.uuid) catch {};
+                    }
+                    pane.deinit();
+                    _ = state.floats.orderedRemove(i);
+                }
             }
             return;
         }
