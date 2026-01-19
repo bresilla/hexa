@@ -31,6 +31,7 @@ const PendingAction = enum {
     exit,
     detach,
     disown,
+    close,
 };
 
 /// A tab contains a layout with splits (splits)
@@ -1122,9 +1123,12 @@ fn runMainLoop(state: *State) !void {
                     state.needs_render = true;
                     state.syncStateToSes();
 
-                    // Clear focus if this was the active float
+                    // Clear focus if this was the active float, sync focus to tiled pane
                     if (was_active) {
                         state.active_floating = null;
+                        if (state.currentLayout().getFocusedPane()) |tiled| {
+                            state.syncPaneFocus(tiled, null);
+                        }
                     }
                     // Don't increment fi, next item shifted into this position
                 } else {
@@ -1302,6 +1306,11 @@ fn runMainLoop(state: *State) !void {
                 if (state.currentLayout().splitCount() > 1) {
                     // Multiple splits in tab - just close this one
                     _ = state.currentLayout().closeFocused();
+                    // Sync focus to new pane and update ses state
+                    if (state.currentLayout().getFocusedPane()) |new_pane| {
+                        state.syncPaneFocus(new_pane, null);
+                    }
+                    state.syncStateToSes();
                     state.needs_render = true;
                 } else if (state.tabs.items.len > 1) {
                     // Only 1 pane but multiple tabs - close this tab
@@ -1418,6 +1427,7 @@ fn handleInput(state: *State, inp: []const u8) void {
                             .exit => state.running = false,
                             .detach => performDetach(state),
                             .disown => performDisown(state),
+                            .close => performClose(state),
                         }
                     } else {
                         // User cancelled - if exit was from shell death, spawn new shell
@@ -2208,6 +2218,38 @@ fn performDisown(state: *State) void {
     state.needs_render = true;
 }
 
+/// Perform the actual close action - close current float or tab
+fn performClose(state: *State) void {
+    if (state.active_floating) |idx| {
+        const old_uuid = state.getCurrentFocusedUuid();
+        const pane = state.floats.orderedRemove(idx);
+        state.syncPaneUnfocus(pane);
+        // Kill in ses
+        if (state.ses_client.isConnected()) {
+            state.ses_client.killPane(pane.uuid) catch {};
+        }
+        pane.deinit();
+        state.allocator.destroy(pane);
+        // Focus another float or fall back to tiled pane
+        if (state.floats.items.len > 0) {
+            state.active_floating = 0;
+            state.syncPaneFocus(state.floats.items[0], old_uuid);
+        } else {
+            state.active_floating = null;
+            if (state.currentLayout().getFocusedPane()) |tiled| {
+                state.syncPaneFocus(tiled, old_uuid);
+            }
+        }
+        state.syncStateToSes();
+    } else {
+        // Close current tab, or quit if it's the last one
+        if (!state.closeCurrentTab()) {
+            state.running = false;
+        }
+    }
+    state.needs_render = true;
+}
+
 fn handleAltKey(state: *State, key: u8) bool {
     const cfg = &state.config;
 
@@ -2329,31 +2371,16 @@ fn handleAltKey(state: *State, key: u8) bool {
         return true;
     }
 
-    // Alt+x or Alt+w = close current tab (or quit if last tab)
-    if (key == cfg.tabs.key_close or key == 'w') {
-        if (state.active_floating) |idx| {
-            const old_uuid = state.getCurrentFocusedUuid();
-            const pane = state.floats.orderedRemove(idx);
-            state.syncPaneUnfocus(pane);
-            pane.deinit();
-            state.allocator.destroy(pane);
-            // Focus another float or fall back to tiled pane
-            if (state.floats.items.len > 0) {
-                state.active_floating = 0;
-                state.syncPaneFocus(state.floats.items[0], old_uuid);
-            } else {
-                state.active_floating = null;
-                if (state.currentLayout().getFocusedPane()) |tiled| {
-                    state.syncPaneFocus(tiled, old_uuid);
-                }
-            }
+    // Alt+x (configurable) = close current float/tab (or quit if last tab)
+    if (key == cfg.tabs.key_close) {
+        if (cfg.confirm_on_close) {
+            state.pending_action = .close;
+            const msg = if (state.active_floating != null) "Close float?" else "Close tab?";
+            state.popups.showConfirm(msg, .{}) catch {};
+            state.needs_render = true;
         } else {
-            // Close current tab, or quit if it's the last one
-            if (!state.closeCurrentTab()) {
-                state.running = false;
-            }
+            performClose(state);
         }
-        state.needs_render = true;
         return true;
     }
 
@@ -2489,6 +2516,7 @@ fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                     }
                     pane.deinit();
                     _ = state.floats.orderedRemove(i);
+                    state.syncStateToSes();
                 }
             }
             return;

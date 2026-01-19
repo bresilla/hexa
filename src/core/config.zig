@@ -157,6 +157,7 @@ pub const Config = struct {
     confirm_on_exit: bool = false, // When Alt+q or last shell exits
     confirm_on_detach: bool = false,
     confirm_on_disown: bool = false, // When Alt+z disowns a pane
+    confirm_on_close: bool = false, // When Alt+x closes a float/tab
 
     // Floating pane defaults
     float_width_percent: u8 = 60,
@@ -215,6 +216,7 @@ pub const Config = struct {
         if (json.confirm_on_exit) |v| config.confirm_on_exit = v;
         if (json.confirm_on_detach) |v| config.confirm_on_detach = v;
         if (json.confirm_on_disown) |v| config.confirm_on_disown = v;
+        if (json.confirm_on_close) |v| config.confirm_on_close = v;
 
         // Parse panes config
         if (json.tabs) |p| {
@@ -627,6 +629,7 @@ const JsonConfig = struct {
     confirm_on_exit: ?bool = null,
     confirm_on_detach: ?bool = null,
     confirm_on_disown: ?bool = null,
+    confirm_on_close: ?bool = null,
     floats: ?[]const JsonFloatPane = null,
     splits: ?JsonSplitsConfig = null,
     tabs: ?JsonTabsConfig = null,
