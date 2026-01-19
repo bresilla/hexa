@@ -152,6 +152,10 @@ pub const Config = struct {
     key_disown: u8 = 'z',
     key_adopt: u8 = 'a',
 
+    // Confirmation popups
+    confirm_on_exit: bool = false,
+    confirm_on_detach: bool = false,
+
     // Floating pane defaults
     float_width_percent: u8 = 60,
     float_height_percent: u8 = 60,
@@ -204,6 +208,10 @@ pub const Config = struct {
                 if (k.len > 0) config.key_adopt = k[0];
             }
         }
+
+        // Apply confirmation settings
+        if (json.confirm_on_exit) |v| config.confirm_on_exit = v;
+        if (json.confirm_on_detach) |v| config.confirm_on_detach = v;
 
         // Parse panes config
         if (json.tabs) |p| {
@@ -607,6 +615,8 @@ const JsonConfig = struct {
         disown: ?[]const u8 = null,
         adopt: ?[]const u8 = null,
     } = null,
+    confirm_on_exit: ?bool = null,
+    confirm_on_detach: ?bool = null,
     floats: ?[]const JsonFloatPane = null,
     splits: ?JsonSplitsConfig = null,
     tabs: ?JsonTabsConfig = null,

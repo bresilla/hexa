@@ -26,6 +26,12 @@ const OrphanedPaneInfo = ses_client.OrphanedPaneInfo;
 const notification = @import("notification.zig");
 const NotificationManager = notification.NotificationManager;
 
+/// Pending action that needs confirmation
+const PendingAction = enum {
+    exit,
+    detach,
+};
+
 /// A tab contains a layout with splits (splits)
 const Tab = struct {
     layout: Layout,
@@ -74,6 +80,7 @@ const State = struct {
     ses_client: SesClient,
     notifications: NotificationManager,
     popups: pop.PopupManager, // For blocking popups (confirm, choose)
+    pending_action: ?PendingAction, // Action waiting for confirmation (exit/detach)
     pending_pop_response: bool, // True if waiting to send pop response
     pending_pop_scope: pop.Scope, // Which scope the pending popup belongs to
     pending_pop_tab: usize, // Tab index if scope is .tab
@@ -122,6 +129,7 @@ const State = struct {
             .ses_client = SesClient.init(allocator, uuid, session_name, true), // keepalive=true by default
             .notifications = NotificationManager.initWithPopConfig(allocator, pop_cfg.carrier.notification),
             .popups = pop.PopupManager.init(allocator),
+            .pending_action = null,
             .pending_pop_response = false,
             .pending_pop_scope = .mux,
             .pending_pop_tab = 0,
@@ -1324,7 +1332,21 @@ fn handleInput(state: *State, inp: []const u8) void {
     // ==========================================================================
     if (state.popups.isBlocked()) {
         if (input.handlePopupInput(&state.popups, inp)) {
-            sendPopResponse(state);
+            // Check if this was a confirm dialog for exit/detach
+            if (state.pending_action) |action| {
+                if (state.popups.getConfirmResult()) |confirmed| {
+                    if (confirmed) {
+                        switch (action) {
+                            .exit => state.running = false,
+                            .detach => performDetach(state),
+                        }
+                    }
+                }
+                state.pending_action = null;
+                state.popups.clearResults();
+            } else {
+                sendPopResponse(state);
+            }
         }
         state.needs_render = true;
         return;
@@ -1982,11 +2004,41 @@ fn handleScrollKeys(state: *State, inp: []const u8) ?usize {
     return null;
 }
 
+/// Perform the actual detach action
+fn performDetach(state: *State) void {
+    // Always set detach_mode to prevent killing panes on exit
+    state.detach_mode = true;
+
+    // Serialize entire mux state
+    const mux_state_json = state.serializeState() catch {
+        state.notifications.showFor("Failed to serialize state", 2000);
+        state.running = false;
+        return;
+    };
+    defer state.allocator.free(mux_state_json);
+
+    // Detach session with our UUID - panes stay grouped with full state
+    state.ses_client.detachSession(state.uuid, mux_state_json) catch {
+        std.debug.print("\nDetach failed - panes orphaned\n", .{});
+        state.running = false;
+        return;
+    };
+    // Print session_id (our UUID) so user can reattach
+    std.debug.print("\nSession detached: {s}\nReattach with: hexa-mux --attach {s}\n", .{ state.uuid, state.uuid[0..8] });
+    state.running = false;
+}
+
 fn handleAltKey(state: *State, key: u8) bool {
     const cfg = &state.config;
 
     if (key == cfg.key_quit) {
-        state.running = false;
+        if (cfg.confirm_on_exit) {
+            state.pending_action = .exit;
+            state.popups.showConfirm("Exit mux?", .{}) catch {};
+            state.needs_render = true;
+        } else {
+            state.running = false;
+        }
         return true;
     }
 
@@ -2142,26 +2194,13 @@ fn handleAltKey(state: *State, key: u8) bool {
 
     // Alt+d = detach whole mux - keeps all panes alive in ses for --attach
     if (key == cfg.tabs.key_detach) {
-        // Always set detach_mode to prevent killing panes on exit
-        state.detach_mode = true;
-
-        // Serialize entire mux state
-        const mux_state_json = state.serializeState() catch {
-            state.notifications.showFor("Failed to serialize state", 2000);
-            state.running = false;
+        if (cfg.confirm_on_detach) {
+            state.pending_action = .detach;
+            state.popups.showConfirm("Detach session?", .{}) catch {};
+            state.needs_render = true;
             return true;
-        };
-        defer state.allocator.free(mux_state_json);
-
-        // Detach session with our UUID - panes stay grouped with full state
-        state.ses_client.detachSession(state.uuid, mux_state_json) catch {
-            std.debug.print("\nDetach failed - panes orphaned\n", .{});
-            state.running = false;
-            return true;
-        };
-        // Print session_id (our UUID) so user can reattach
-        std.debug.print("\nSession detached: {s}\nReattach with: hexa-mux --attach {s}\n", .{ state.uuid, state.uuid[0..8] });
-        state.running = false;
+        }
+        performDetach(state);
         return true;
     }
 
