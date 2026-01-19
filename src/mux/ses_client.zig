@@ -320,6 +320,7 @@ pub const SesClient = struct {
         pane_type: PaneType,
         created_from: ?[32]u8,
         focused_from: ?[32]u8,
+        cursor_pos: ?struct { x: u16, y: u16 },
     ) !void {
         const conn = &(self.conn orelse return error.NotConnected);
 
@@ -349,6 +350,10 @@ pub const SesClient = struct {
             try writer.print(",\"focused_from\":\"{s}\"", .{ff});
         } else {
             try writer.writeAll(",\"focused_from\":null");
+        }
+
+        if (cursor_pos) |pos| {
+            try writer.print(",\"cursor_x\":{d},\"cursor_y\":{d}", .{ pos.x, pos.y });
         }
 
         try writer.writeAll("}");

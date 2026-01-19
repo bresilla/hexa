@@ -732,6 +732,7 @@ const State = struct {
         }
 
         const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
+        const cursor = pane.getCursorPos();
         self.ses_client.updatePaneAux(
             pane.uuid,
             pane.floating,
@@ -739,6 +740,7 @@ const State = struct {
             pane_type,
             created_from,
             null, // focused_from is null for new panes
+            .{ .x = cursor.x, .y = cursor.y },
         ) catch {
             // Silently ignore errors - pane might not exist in ses yet or anymore
         };
@@ -755,7 +757,8 @@ const State = struct {
                 if (p.*.uuid[0] != 0) {
                     p.*.focused = false;
                     const pane_type: SesClient.PaneType = if (p.*.floating) .float else .split;
-                    self.ses_client.updatePaneAux(p.*.uuid, p.*.floating, false, pane_type, null, null) catch {};
+                    const cursor = p.*.getCursorPos();
+                    self.ses_client.updatePaneAux(p.*.uuid, p.*.floating, false, pane_type, null, null, .{ .x = cursor.x, .y = cursor.y }) catch {};
                 }
             }
         }
@@ -764,7 +767,8 @@ const State = struct {
         for (self.floats.items) |fp| {
             if (fp.uuid[0] != 0) {
                 fp.focused = false;
-                self.ses_client.updatePaneAux(fp.uuid, fp.floating, false, .float, null, null) catch {};
+                const cursor = fp.getCursorPos();
+                self.ses_client.updatePaneAux(fp.uuid, fp.floating, false, .float, null, null, .{ .x = cursor.x, .y = cursor.y }) catch {};
             }
         }
     }
@@ -781,6 +785,7 @@ const State = struct {
         // Then focus this pane
         pane.focused = true;
         const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
+        const cursor = pane.getCursorPos();
         self.ses_client.updatePaneAux(
             pane.uuid,
             pane.floating,
@@ -788,6 +793,7 @@ const State = struct {
             pane_type,
             null, // don't update created_from on focus change
             focused_from,
+            .{ .x = cursor.x, .y = cursor.y },
         ) catch {
             // Silently ignore errors - pane might not exist in ses
         };
@@ -800,6 +806,7 @@ const State = struct {
         if (pane.uuid[0] == 0) return; // Skip if UUID not set
 
         const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
+        const cursor = pane.getCursorPos();
         self.ses_client.updatePaneAux(
             pane.uuid,
             pane.floating,
@@ -807,6 +814,7 @@ const State = struct {
             pane_type,
             null,
             null,
+            .{ .x = cursor.x, .y = cursor.y },
         ) catch {
             // Silently ignore errors - pane might not exist in ses
         };
@@ -1352,6 +1360,11 @@ fn handleInput(state: *State, inp: []const u8) void {
             const next = inp[i + 1];
             // Check for CSI sequences (ESC [)
             if (next == '[' and i + 2 < inp.len) {
+                // Handle Alt+Arrow for directional navigation: ESC [ 1 ; 3 <dir>
+                if (handleAltArrow(state, inp[i..])) |consumed| {
+                    i += consumed;
+                    continue;
+                }
                 // Handle scroll keys
                 if (handleScrollKeys(state, inp[i..])) |consumed| {
                     i += consumed;
@@ -1735,6 +1748,66 @@ fn handleIpcConnection(state: *State, buffer: []u8) void {
             state.needs_render = true;
         }
     }
+}
+
+/// Handle Alt+Arrow for directional pane navigation
+/// Sequence: ESC [ 1 ; 3 <A/B/C/D> (Alt+Up/Down/Right/Left)
+/// Returns number of bytes consumed, or null if not an Alt+Arrow sequence
+fn handleAltArrow(state: *State, inp: []const u8) ?usize {
+    // Check for ESC [ 1 ; 3 <dir> pattern (6 bytes)
+    if (inp.len >= 6 and inp[0] == 0x1b and inp[1] == '[' and
+        inp[2] == '1' and inp[3] == ';' and inp[4] == '3')
+    {
+        const dir: ?layout_mod.Layout.Direction = switch (inp[5]) {
+            'A' => .up,
+            'B' => .down,
+            'C' => .right,
+            'D' => .left,
+            else => null,
+        };
+
+        if (dir) |d| {
+            const old_uuid = state.getCurrentFocusedUuid();
+
+            // Get cursor position from current pane for smarter direction targeting
+            var cursor_x: u16 = 0;
+            var cursor_y: u16 = 0;
+            var have_cursor = false;
+            if (state.active_floating) |idx| {
+                const pos = state.floats.items[idx].getCursorPos();
+                cursor_x = pos.x;
+                cursor_y = pos.y;
+                have_cursor = true;
+            } else if (state.currentLayout().getFocusedPane()) |pane| {
+                const pos = pane.getCursorPos();
+                cursor_x = pos.x;
+                cursor_y = pos.y;
+                have_cursor = true;
+            }
+
+            // Unfocus current pane
+            if (state.active_floating) |idx| {
+                state.syncPaneUnfocus(state.floats.items[idx]);
+                state.active_floating = null;
+            } else if (state.currentLayout().getFocusedPane()) |old_pane| {
+                state.syncPaneUnfocus(old_pane);
+            }
+
+            // Navigate in direction using cursor position for alignment
+            const cursor_pos: ?layout_mod.CursorPos = if (have_cursor) .{ .x = cursor_x, .y = cursor_y } else null;
+            state.currentLayout().focusDirection(d, cursor_pos);
+
+            // Sync focus to new pane
+            if (state.currentLayout().getFocusedPane()) |new_pane| {
+                state.syncPaneFocus(new_pane, old_uuid);
+            }
+
+            state.needs_render = true;
+            return 6;
+        }
+    }
+
+    return null;
 }
 
 /// Handle scroll-related escape sequences

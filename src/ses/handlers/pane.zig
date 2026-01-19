@@ -306,6 +306,7 @@ pub fn handlePaneInfo(
     if (pane.focused_from) |focused_uuid| {
         try writer.print(",\"focused_from\":\"{s}\"", .{focused_uuid});
     }
+    try writer.print(",\"cursor_x\":{d},\"cursor_y\":{d}", .{ pane.cursor_x, pane.cursor_y });
 
     try writer.writeAll("}\n");
     try conn.send(stream.getWritten());
@@ -387,6 +388,20 @@ pub fn handleUpdatePaneAux(
                 }
             },
             else => {}, // null or other = don't update, preserve existing value
+        }
+    }
+
+    // Update cursor position
+    if (root.get("cursor_x")) |v| {
+        switch (v) {
+            .integer => |i| pane.cursor_x = @intCast(@max(0, i)),
+            else => {},
+        }
+    }
+    if (root.get("cursor_y")) |v| {
+        switch (v) {
+            .integer => |i| pane.cursor_y = @intCast(@max(0, i)),
+            else => {},
         }
     }
 

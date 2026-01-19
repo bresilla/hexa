@@ -44,6 +44,9 @@ pub const Pane = struct {
     pane_type: PaneType = .split,
     created_from: ?[32]u8 = null,
     focused_from: ?[32]u8 = null,
+    // Cursor position (synced from mux, screen coordinates)
+    cursor_x: u16 = 0,
+    cursor_y: u16 = 0,
 
     allocator: std.mem.Allocator,
 

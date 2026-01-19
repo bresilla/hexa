@@ -5,6 +5,9 @@ const pop = @import("pop");
 const Pane = @import("pane.zig").Pane;
 const SesClient = @import("ses_client.zig").SesClient;
 
+/// Cursor position for directional navigation
+pub const CursorPos = struct { x: u16, y: u16 };
+
 /// Direction of a split
 pub const SplitDir = enum {
     horizontal, // side by side (left | right)
@@ -344,6 +347,76 @@ pub const Layout = struct {
             new_focus.focused = true;
         }
     }
+
+    /// Focus pane in given direction (up/down/left/right)
+    /// If cursor_pos is provided, use it for alignment; otherwise use pane center
+    pub fn focusDirection(self: *Layout, dir: Direction, cursor_pos: ?CursorPos) void {
+        if (self.splits.count() <= 1) return;
+
+        const current = self.getFocusedPane() orelse return;
+        // Use cursor position if provided, otherwise fall back to pane center
+        const cur_cx = if (cursor_pos) |pos| pos.x else current.x + current.width / 2;
+        const cur_cy = if (cursor_pos) |pos| pos.y else current.y + current.height / 2;
+
+        var best_id: ?u16 = null;
+        var best_dist: i32 = std.math.maxInt(i32);
+
+        var it = self.splits.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const pane = entry.value_ptr.*;
+
+            if (id == self.focused_split_id) continue;
+
+            const pane_cx = pane.x + pane.width / 2;
+            const pane_cy = pane.y + pane.height / 2;
+
+            // Check if pane is in the right direction
+            const is_valid = switch (dir) {
+                .up => pane.y + pane.height <= current.y, // pane is above
+                .down => pane.y >= current.y + current.height, // pane is below
+                .left => pane.x + pane.width <= current.x, // pane is left
+                .right => pane.x >= current.x + current.width, // pane is right
+            };
+
+            if (!is_valid) continue;
+
+            // Calculate distance - primary axis (direction) + secondary axis (alignment)
+            const dist: i32 = switch (dir) {
+                .up, .down => blk: {
+                    const dy = @as(i32, @intCast(cur_cy)) - @as(i32, @intCast(pane_cy));
+                    const dx = @as(i32, @intCast(cur_cx)) - @as(i32, @intCast(pane_cx));
+                    // Primary: vertical distance, Secondary: horizontal alignment
+                    const abs_dy: i32 = @intCast(@abs(dy));
+                    const abs_dx: i32 = @intCast(@abs(dx));
+                    break :blk abs_dy + @divTrunc(abs_dx, 2);
+                },
+                .left, .right => blk: {
+                    const dx = @as(i32, @intCast(cur_cx)) - @as(i32, @intCast(pane_cx));
+                    const dy = @as(i32, @intCast(cur_cy)) - @as(i32, @intCast(pane_cy));
+                    // Primary: horizontal distance, Secondary: vertical alignment
+                    const abs_dx: i32 = @intCast(@abs(dx));
+                    const abs_dy: i32 = @intCast(@abs(dy));
+                    break :blk abs_dx + @divTrunc(abs_dy, 2);
+                },
+            };
+
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_id = id;
+            }
+        }
+
+        if (best_id) |new_id| {
+            current.focused = false;
+            self.focused_split_id = new_id;
+            if (self.getFocusedPane()) |new_focus| {
+                new_focus.focused = true;
+            }
+        }
+    }
+
+    pub const Direction = enum { up, down, left, right };
 
     /// Close the focused pane
     pub fn closeFocused(self: *Layout) bool {
