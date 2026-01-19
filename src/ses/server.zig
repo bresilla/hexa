@@ -477,12 +477,13 @@ pub const Server = struct {
         const message = (root.get("message") orelse return self.sendError(conn, "missing_message")).string;
         const uuid_str = (root.get("uuid") orelse return self.sendError(conn, "missing_uuid")).string;
 
-        // Try to find mux by session_id first (32 char hex)
+        // Try to find mux by session_id first
         var found_mux: ?*state.Client = null;
+
+        // Full 32-char match for mux session_id
         if (uuid_str.len == 32) {
             var session_id: [16]u8 = undefined;
             if (std.fmt.hexToBytes(&session_id, uuid_str)) |_| {
-                // Look for matching mux
                 for (self.ses_state.clients.items) |*client| {
                     if (client.session_id) |sid| {
                         if (std.mem.eql(u8, &sid, &session_id)) {
@@ -492,6 +493,19 @@ pub const Server = struct {
                     }
                 }
             } else |_| {}
+        }
+
+        // Partial prefix match for mux session_id (e.g., 8-char prefix from --list)
+        if (found_mux == null and uuid_str.len >= 4 and uuid_str.len < 32) {
+            for (self.ses_state.clients.items) |*client| {
+                if (client.session_id) |sid| {
+                    const hex_buf: [32]u8 = std.fmt.bytesToHex(&sid, .lower);
+                    if (std.mem.startsWith(u8, &hex_buf, uuid_str)) {
+                        found_mux = client;
+                        break;
+                    }
+                }
+            }
         }
 
         if (found_mux) |client| {
@@ -508,18 +522,15 @@ pub const Server = struct {
             return;
         }
 
-        // Not a mux UUID - check if it's a pane UUID (32 char)
+        // Check for pane UUID - full 32-char match first
         if (uuid_str.len == 32) {
             var pane_uuid: [32]u8 = undefined;
             @memcpy(&pane_uuid, uuid_str[0..32]);
 
-            // Check if this pane exists
             if (self.ses_state.panes.get(pane_uuid)) |pane| {
-                // Find the client that owns this pane
                 for (self.ses_state.clients.items) |*client| {
                     for (client.pane_uuids.items) |client_pane_uuid| {
                         if (std.mem.eql(u8, &client_pane_uuid, &pane_uuid)) {
-                            // PANE realm - send pane notification
                             var msg_buf: [4096]u8 = undefined;
                             const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ pane_uuid, message }) catch {
                                 return self.sendError(conn, "message_too_long");
@@ -533,10 +544,28 @@ pub const Server = struct {
                         }
                     }
                 }
-
-                // Pane exists but not attached to any client
                 _ = pane;
                 return self.sendError(conn, "pane_not_attached");
+            }
+        }
+
+        // Partial prefix match for pane UUID (e.g., 8-char prefix from --list)
+        if (uuid_str.len >= 4 and uuid_str.len < 32) {
+            for (self.ses_state.clients.items) |*client| {
+                for (client.pane_uuids.items) |pane_uuid| {
+                    if (std.mem.startsWith(u8, &pane_uuid, uuid_str)) {
+                        var msg_buf: [4096]u8 = undefined;
+                        const notify_msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"pane_notification\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}\n", .{ pane_uuid, message }) catch {
+                            return self.sendError(conn, "message_too_long");
+                        };
+                        var client_conn = ipc.Connection{ .fd = client.fd };
+                        client_conn.send(notify_msg) catch {
+                            return self.sendError(conn, "send_failed");
+                        };
+                        try conn.sendLine("{\"type\":\"ok\",\"realm\":\"pane\"}");
+                        return;
+                    }
+                }
             }
         }
 

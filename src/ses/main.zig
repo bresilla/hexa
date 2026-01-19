@@ -197,12 +197,9 @@ fn listStatus(allocator: std.mem.Allocator, full_mode: bool) !void {
 
     var conn = client.toConnection();
 
-    // Send status request (with full flag if requested)
-    if (full_mode) {
-        try conn.sendLine("{\"type\":\"status\",\"full\":true}");
-    } else {
-        try conn.sendLine("{\"type\":\"status\"}");
-    }
+    // Always request full status to get the tree
+    _ = full_mode;
+    try conn.sendLine("{\"type\":\"status\",\"full\":true}");
 
     // Receive response - use larger buffer for full mode
     var buf: [65536]u8 = undefined;
@@ -221,28 +218,28 @@ fn listStatus(allocator: std.mem.Allocator, full_mode: bool) !void {
 
     const root = parsed.value.object;
 
-    // Print clients (connected muxes)
+    // Print clients (connected muxes) - only if there are any
     if (root.get("clients")) |clients_val| {
         const clients = clients_val.array;
-        print("Connected muxes: {d}\n", .{clients.items.len});
+        if (clients.items.len > 0) {
+            print("Connected muxes: {d}\n", .{clients.items.len});
 
-        for (clients.items) |client_val| {
-            const c = client_val.object;
-            const id = c.get("id").?.integer;
-            const panes = c.get("panes").?.array;
+            for (clients.items) |client_val| {
+                const c = client_val.object;
+                const id = c.get("id").?.integer;
+                const panes = c.get("panes").?.array;
 
-            // Get session name and id if available
-            const name = if (c.get("session_name")) |n| n.string else "unknown";
-            const sid = if (c.get("session_id")) |s| s.string else null;
+                // Get session name and id if available
+                const name = if (c.get("session_name")) |n| n.string else "unknown";
+                const sid = if (c.get("session_id")) |s| s.string else null;
 
-            if (sid) |session_id| {
-                print("  {s} [{s}] (mux #{d}, {d} panes)\n", .{ name, session_id[0..8], id, panes.items.len });
-            } else {
-                print("  {s} (mux #{d}, {d} panes)\n", .{ name, id, panes.items.len });
-            }
+                if (sid) |session_id| {
+                    print("  {s} [{s}] (mux #{d}, {d} panes)\n", .{ name, session_id[0..8], id, panes.items.len });
+                } else {
+                    print("  {s} (mux #{d}, {d} panes)\n", .{ name, id, panes.items.len });
+                }
 
-            if (full_mode) {
-                // Show full mux state tree if available
+                // Always show full mux state tree if available
                 if (c.get("mux_state")) |mux_state_val| {
                     printMuxStateTree(allocator, mux_state_val.string, "    ");
                 } else {
@@ -277,11 +274,9 @@ fn listStatus(allocator: std.mem.Allocator, full_mode: bool) !void {
 
                 print("  {s} [{s}] {d} panes - reattach: hexa-mux -a {s}\n", .{ name, sid[0..8], pane_count, name });
 
-                if (full_mode) {
-                    // Show full mux state tree if available
-                    if (s.get("mux_state")) |mux_state_val| {
-                        printMuxStateTree(allocator, mux_state_val.string, "    ");
-                    }
+                // Always show full mux state tree if available
+                if (s.get("mux_state")) |mux_state_val| {
+                    printMuxStateTree(allocator, mux_state_val.string, "    ");
                 }
             }
         }
