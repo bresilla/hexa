@@ -32,6 +32,8 @@ const PendingAction = enum {
     detach,
     disown,
     close,
+    adopt_choose, // Choosing which orphaned pane to adopt
+    adopt_confirm, // Confirming destroy vs swap
 };
 
 /// A tab contains a layout with splits (splits)
@@ -84,6 +86,10 @@ const State = struct {
     popups: pop.PopupManager, // For blocking popups (confirm, choose)
     pending_action: ?PendingAction, // Action waiting for confirmation (exit/detach)
     exit_from_shell_death: bool, // True if exit confirmation was triggered by shell death
+    // Adopt flow state
+    adopt_orphans: [32]OrphanedPaneInfo = undefined, // Cached orphaned panes for picker
+    adopt_orphan_count: usize = 0, // Number of orphaned panes
+    adopt_selected_uuid: ?[32]u8 = null, // Selected orphan UUID after picker
     skip_dead_check: bool, // Skip dead pane processing this iteration (after respawn)
     pending_pop_response: bool, // True if waiting to send pop response
     pending_pop_scope: pop.Scope, // Which scope the pending popup belongs to
@@ -821,6 +827,9 @@ const State = struct {
         ) catch {
             // Silently ignore errors - pane might not exist in ses
         };
+
+        // Sync full state so hexa com list shows updated focus
+        self.syncStateToSes();
     }
 
     /// Sync that a pane lost focus
@@ -1419,29 +1428,63 @@ fn handleInput(state: *State, inp: []const u8) void {
     // ==========================================================================
     if (state.popups.isBlocked()) {
         if (input.handlePopupInput(&state.popups, inp)) {
-            // Check if this was a confirm dialog for exit/detach
+            // Check if this was a confirm/picker dialog for pending action
             if (state.pending_action) |action| {
-                if (state.popups.getConfirmResult()) |confirmed| {
-                    if (confirmed) {
-                        switch (action) {
-                            .exit => state.running = false,
-                            .detach => performDetach(state),
-                            .disown => performDisown(state),
-                            .close => performClose(state),
+                switch (action) {
+                    .adopt_choose => {
+                        // Handle picker result for selecting orphaned pane
+                        if (state.popups.getPickerResult()) |selected| {
+                            if (selected < state.adopt_orphan_count) {
+                                state.adopt_selected_uuid = state.adopt_orphans[selected].uuid;
+                                // Now show confirm dialog
+                                state.pending_action = .adopt_confirm;
+                                state.popups.clearResults();
+                                state.popups.showConfirm("Destroy current pane?", .{}) catch {};
+                            } else {
+                                state.pending_action = null;
+                            }
+                        } else if (state.popups.wasPickerCancelled()) {
+                            state.pending_action = null;
+                            state.popups.clearResults();
                         }
-                    } else {
-                        // User cancelled - if exit was from shell death, spawn new shell
-                        if (action == .exit and state.exit_from_shell_death) {
-                            if (state.currentLayout().getFocusedPane()) |pane| {
-                                pane.respawn() catch {};
-                                state.skip_dead_check = true; // Skip dead check this iteration
+                    },
+                    .adopt_confirm => {
+                        // Handle confirm result for adopt action
+                        if (state.popups.getConfirmResult()) |destroy_current| {
+                            if (state.adopt_selected_uuid) |uuid| {
+                                performAdopt(state, uuid, destroy_current);
                             }
                         }
-                    }
+                        state.pending_action = null;
+                        state.adopt_selected_uuid = null;
+                        state.popups.clearResults();
+                    },
+                    else => {
+                        // Handle other confirm dialogs (exit/detach/disown/close)
+                        if (state.popups.getConfirmResult()) |confirmed| {
+                            if (confirmed) {
+                                switch (action) {
+                                    .exit => state.running = false,
+                                    .detach => performDetach(state),
+                                    .disown => performDisown(state),
+                                    .close => performClose(state),
+                                    else => {},
+                                }
+                            } else {
+                                // User cancelled - if exit was from shell death, spawn new shell
+                                if (action == .exit and state.exit_from_shell_death) {
+                                    if (state.currentLayout().getFocusedPane()) |pane| {
+                                        pane.respawn() catch {};
+                                        state.skip_dead_check = true; // Skip dead check this iteration
+                                    }
+                                }
+                            }
+                        }
+                        state.pending_action = null;
+                        state.exit_from_shell_death = false;
+                        state.popups.clearResults();
+                    },
                 }
-                state.pending_action = null;
-                state.exit_from_shell_death = false;
-                state.popups.clearResults();
             } else {
                 sendPopResponse(state);
             }
@@ -2250,6 +2293,98 @@ fn performClose(state: *State) void {
     state.needs_render = true;
 }
 
+/// Start the adopt orphaned pane flow
+fn startAdoptFlow(state: *State) void {
+    if (!state.ses_client.isConnected()) {
+        state.notifications.show("Not connected to ses");
+        return;
+    }
+
+    // Get list of orphaned panes
+    const count = state.ses_client.listOrphanedPanes(&state.adopt_orphans) catch {
+        state.notifications.show("Failed to list orphaned panes");
+        return;
+    };
+
+    if (count == 0) {
+        state.notifications.show("No orphaned panes");
+        return;
+    }
+
+    state.adopt_orphan_count = count;
+
+    if (count == 1) {
+        // Only one orphan - skip picker, go directly to confirm
+        state.adopt_selected_uuid = state.adopt_orphans[0].uuid;
+        state.pending_action = .adopt_confirm;
+        state.popups.showConfirm("Destroy current pane?", .{}) catch {};
+    } else {
+        // Multiple orphans - show picker
+        // Build items list for picker
+        var items: [32][]const u8 = undefined;
+        for (0..count) |i| {
+            items[i] = &state.adopt_orphans[i].uuid;
+        }
+        state.pending_action = .adopt_choose;
+        state.popups.showPicker(items[0..count], .{ .title = "Select pane to adopt" }) catch {
+            state.notifications.show("Failed to show picker");
+            state.pending_action = null;
+        };
+    }
+    state.needs_render = true;
+}
+
+/// Perform the actual adopt action
+/// If destroy_current is true, kills the current pane; otherwise orphans it (swap)
+fn performAdopt(state: *State, orphan_uuid: [32]u8, destroy_current: bool) void {
+    // Adopt the selected orphan from ses
+    const result = state.ses_client.adoptPane(orphan_uuid) catch {
+        state.notifications.show("Failed to adopt pane");
+        return;
+    };
+
+    // Get the current focused pane
+    const current_pane: ?*Pane = if (state.active_floating) |idx|
+        state.floats.items[idx]
+    else
+        state.currentLayout().getFocusedPane();
+
+    if (current_pane) |pane| {
+        if (destroy_current) {
+            // Kill current pane in ses, then replace with adopted
+            if (pane.pty.external_process) {
+                state.ses_client.killPane(pane.uuid) catch {};
+            }
+        } else {
+            // Orphan current pane (swap mode)
+            if (pane.pty.external_process) {
+                state.ses_client.orphanPane(pane.uuid) catch {};
+                state.notifications.show("Swapped panes (old pane orphaned)");
+            }
+        }
+
+        // Replace with adopted pane
+        pane.replaceWithFd(result.fd, result.pid, result.uuid) catch {
+            state.notifications.show("Failed to replace pane");
+            return;
+        };
+
+        // Sync the new pane info
+        state.syncPaneAux(pane, null);
+        state.syncStateToSes();
+
+        if (destroy_current) {
+            state.notifications.show("Adopted pane (old destroyed)");
+        }
+    } else {
+        state.notifications.show("No focused pane");
+    }
+
+    state.renderer.invalidate();
+    state.force_full_render = true;
+    state.needs_render = true;
+}
+
 fn handleAltKey(state: *State, key: u8) bool {
     const cfg = &state.config;
 
@@ -2266,6 +2401,21 @@ fn handleAltKey(state: *State, key: u8) bool {
 
     // Disown pane - orphans current pane in ses, spawns new shell in same place
     if (key == cfg.key_disown) {
+        // Get the current pane (float or tiled)
+        const current_pane: ?*Pane = if (state.active_floating) |idx|
+            state.floats.items[idx]
+        else
+            state.currentLayout().getFocusedPane();
+
+        // Block disown for sticky floats only
+        if (current_pane) |p| {
+            if (p.sticky) {
+                state.notifications.show("Cannot disown sticky float");
+                state.needs_render = true;
+                return true;
+            }
+        }
+
         if (cfg.confirm_on_disown) {
             state.pending_action = .disown;
             state.popups.showConfirm("Disown pane?", .{}) catch {};
@@ -2276,14 +2426,9 @@ fn handleAltKey(state: *State, key: u8) bool {
         return true;
     }
 
-    // Adopt first orphaned pane, replace current pane
+    // Adopt orphaned pane - interactive flow with picker and confirm
     if (key == cfg.key_adopt) {
-        if (state.adoptOrphanedPane()) {
-            state.notifications.show("Adopted orphaned pane");
-            state.needs_render = true;
-        } else {
-            state.notifications.show("No orphaned panes");
-        }
+        startAdoptFlow(state);
         return true;
     }
 
@@ -2670,6 +2815,9 @@ fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir:
             pane.pwd_dir = state.allocator.dupe(u8, dir) catch null;
         }
     }
+
+    // Set sticky flag from config
+    pane.sticky = float_def.sticky;
 
     // For tab-bound floats (special=false and not pwd), set parent tab
     // pwd floats are always global since they're directory-specific

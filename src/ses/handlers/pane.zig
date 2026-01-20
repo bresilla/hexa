@@ -162,7 +162,7 @@ pub fn handleListOrphaned(
     try writer.writeAll("{\"type\":\"orphaned_panes\",\"panes\":[");
     for (orphaned, 0..) |pane, i| {
         if (i > 0) try writer.writeAll(",");
-        try writer.print("{{\"uuid\":\"{s}\"", .{pane.uuid});
+        try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d}", .{ pane.uuid, pane.child_pid });
         if (pane.sticky_pwd) |pwd| {
             try writer.print(",\"sticky_pwd\":\"{s}\"", .{pwd});
         }
