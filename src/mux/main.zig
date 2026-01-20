@@ -2127,11 +2127,17 @@ fn handleScrollKeys(state: *State, inp: []const u8) ?usize {
     // Must start with ESC [
     if (inp.len < 3 or inp[0] != 0x1b or inp[1] != '[') return null;
 
-    // Get the focused pane
+    // Get focused pane
     const pane = if (state.active_floating) |idx|
         state.floats.items[idx]
     else
         state.currentLayout().getFocusedPane() orelse return null;
+
+    // If app is in alternate screen (nvim, htop, etc.), pass scroll to it
+    if (pane.vt.inAltScreen()) {
+        pane.write(inp) catch {};
+        return inp.len;
+    }
 
     // SGR mouse format: ESC [ < btn ; x ; y M (press) or m (release)
     if (inp.len >= 4 and inp[2] == '<') {
