@@ -97,6 +97,27 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
             }
         }
     }
+
+    // Sticky panes
+    if (root.get("sticky")) |sticky_val| {
+        const sticky = sticky_val.array;
+        if (sticky.items.len > 0) {
+            print("\nSticky panes: {d}\n", .{sticky.items.len});
+            for (sticky.items) |pane_val| {
+                const p = pane_val.object;
+                const uuid = p.get("uuid").?.string;
+                const pid = p.get("pid").?.integer;
+                print("  [{s}] pid={d}", .{ uuid[0..8], pid });
+                if (p.get("pwd")) |pwd| {
+                    print(" pwd={s}", .{pwd.string});
+                }
+                if (p.get("key")) |key| {
+                    print(" key={s}", .{key.string});
+                }
+                print("\n", .{});
+            }
+        }
+    }
 }
 
 pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator: bool, show_last: bool) !void {

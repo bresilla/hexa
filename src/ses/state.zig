@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
 const ipc = core.ipc;
+const ses = @import("main.zig");
 
 /// Pane state - minimal, just keeps process alive
 pub const PaneState = enum {
@@ -549,8 +550,14 @@ pub const SesState = struct {
             }
         }
 
-        // Manual suspend = fully orphaned (even if sticky)
-        pane.state = .orphaned;
+        // Check if sticky info is set - becomes sticky, otherwise orphaned
+        if (pane.sticky_pwd != null and pane.sticky_key != null) {
+            pane.state = .sticky;
+            ses.debugLog("suspendPane: {s} -> sticky (pwd={s}, key={c})", .{ uuid[0..8], pane.sticky_pwd.?, pane.sticky_key.? });
+        } else {
+            pane.state = .orphaned;
+            ses.debugLog("suspendPane: {s} -> orphaned (pwd={any}, key={any})", .{ uuid[0..8], pane.sticky_pwd != null, pane.sticky_key != null });
+        }
         pane.attached_to = null;
         pane.orphaned_at = std.time.timestamp();
     }

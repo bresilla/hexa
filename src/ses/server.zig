@@ -217,6 +217,8 @@ pub const Server = struct {
             try pane_handlers.handleAdoptPane(self.ses_state, conn, cid, root, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "kill_pane")) {
             try pane_handlers.handleKillPane(self.ses_state, conn, root, sendErrorFn);
+        } else if (std.mem.eql(u8, type_str, "set_sticky")) {
+            try pane_handlers.handleSetSticky(self.ses_state, conn, root, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "broadcast_notify")) {
             try notify_handlers.handleBroadcastNotify(self.ses_state, conn, root, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "targeted_notify") or std.mem.eql(u8, type_str, "pop_notify")) {

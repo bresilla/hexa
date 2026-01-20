@@ -278,6 +278,20 @@ pub const SesClient = struct {
         if (line == null) return error.ConnectionClosed;
     }
 
+    /// Set sticky info on a pane (for sticky floats before orphaning)
+    pub fn setSticky(self: *SesClient, uuid: [32]u8, pwd: []const u8, key: u8) !void {
+        const conn = &(self.conn orelse return error.NotConnected);
+
+        var buf: [512]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"set_sticky\",\"uuid\":\"{s}\",\"pwd\":\"{s}\",\"key\":\"{c}\"}}", .{ uuid, pwd, key });
+        try conn.sendLine(msg);
+
+        // Wait for OK response
+        var resp_buf: [256]u8 = undefined;
+        const line = try conn.recvLine(&resp_buf);
+        if (line == null) return error.ConnectionClosed;
+    }
+
     /// Kill a pane
     pub fn killPane(self: *SesClient, uuid: [32]u8) !void {
         const conn = &(self.conn orelse return error.NotConnected);

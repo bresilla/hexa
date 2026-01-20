@@ -225,6 +225,47 @@ pub fn handleKillPane(
     try conn.sendLine("{\"type\":\"ok\"}");
 }
 
+/// Handle set_sticky request - sets sticky_pwd and sticky_key on a pane
+pub fn handleSetSticky(
+    ses_state: *state.SesState,
+    conn: *ipc.Connection,
+    root: std.json.ObjectMap,
+    sendError: *const fn (*ipc.Connection, []const u8) anyerror!void,
+) !void {
+    const uuid_str = (root.get("uuid") orelse return sendError(conn, "missing_uuid")).string;
+    if (uuid_str.len != 32) return sendError(conn, "invalid_uuid");
+
+    var uuid: [32]u8 = undefined;
+    @memcpy(&uuid, uuid_str[0..32]);
+
+    const pane = ses_state.panes.getPtr(uuid) orelse {
+        ses.debugLog("set_sticky: pane not found {s}", .{uuid[0..8]});
+        return sendError(conn, "pane_not_found");
+    };
+
+    // Set sticky_pwd if provided
+    if (root.get("pwd")) |pwd_val| {
+        const pwd = pwd_val.string;
+        // Free old pwd if present
+        if (pane.sticky_pwd) |old| {
+            ses_state.allocator.free(old);
+        }
+        pane.sticky_pwd = ses_state.allocator.dupe(u8, pwd) catch null;
+        ses.debugLog("set_sticky: {s} pwd={s}", .{ uuid[0..8], pwd });
+    }
+
+    // Set sticky_key if provided
+    if (root.get("key")) |key_val| {
+        const key_str = key_val.string;
+        if (key_str.len > 0) {
+            pane.sticky_key = key_str[0];
+            ses.debugLog("set_sticky: {s} key={c}", .{ uuid[0..8], key_str[0] });
+        }
+    }
+
+    try conn.sendLine("{\"type\":\"ok\"}");
+}
+
 /// Handle pane_info request
 pub fn handlePaneInfo(
     ses_state: *state.SesState,

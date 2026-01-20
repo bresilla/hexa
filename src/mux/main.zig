@@ -162,6 +162,12 @@ const State = struct {
             if (!self.detach_mode and self.ses_client.isConnected()) {
                 if (pane.sticky) {
                     // Sticky floats persist as sticky panes in ses
+                    // Set sticky info (directory + float key) before orphaning
+                    if (pane.float_key != 0) {
+                        if (pane.getRealCwd()) |cwd| {
+                            self.ses_client.setSticky(pane.uuid, cwd, pane.float_key) catch {};
+                        }
+                    }
                     self.ses_client.orphanPane(pane.uuid) catch {};
                 } else {
                     self.ses_client.killPane(pane.uuid) catch {};
@@ -277,6 +283,119 @@ const State = struct {
         self.force_full_render = true;
         self.syncStateToSes();
         return true;
+    }
+
+    /// Adopt sticky panes from ses on startup
+    /// Finds sticky panes matching current directory and configured sticky floats
+    fn adoptStickyPanes(self: *State) void {
+        if (!self.ses_client.isConnected()) return;
+
+        // Get current working directory
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch return;
+
+        // Check each float definition for sticky floats
+        for (self.config.floats) |*float_def| {
+            if (!float_def.sticky) continue;
+
+            // Try to find a sticky pane in ses matching this directory + key
+            const result = self.ses_client.findStickyPane(cwd, float_def.key) catch continue;
+            if (result) |r| {
+                // Found a sticky pane - adopt it as a float
+                self.adoptAsFloat(r.uuid, r.fd, r.pid, float_def, cwd) catch continue;
+                self.notifications.showFor("Sticky float restored", 2000);
+            }
+        }
+    }
+
+    /// Adopt a pane from ses as a float with given float definition
+    fn adoptAsFloat(self: *State, uuid: [32]u8, fd: std.posix.fd_t, pid: std.posix.pid_t, float_def: *const core.FloatDef, cwd: []const u8) !void {
+        const pane = try self.allocator.create(Pane);
+        errdefer self.allocator.destroy(pane);
+
+        const cfg = &self.config;
+
+        // Use per-float settings or fall back to defaults
+        const width_pct: u16 = float_def.width_percent orelse cfg.float_width_percent;
+        const height_pct: u16 = float_def.height_percent orelse cfg.float_height_percent;
+        const pos_x_pct: u16 = float_def.pos_x orelse 50;
+        const pos_y_pct: u16 = float_def.pos_y orelse 50;
+        const pad_x_cfg: u16 = float_def.padding_x orelse cfg.float_padding_x;
+        const pad_y_cfg: u16 = float_def.padding_y orelse cfg.float_padding_y;
+        const border_color = float_def.color orelse cfg.float_color;
+
+        // Calculate outer frame size
+        const avail_h = self.term_height - self.status_height;
+        const outer_w = self.term_width * width_pct / 100;
+        const outer_h = avail_h * height_pct / 100;
+
+        // Calculate position based on percentage
+        const max_x = if (self.term_width > outer_w) self.term_width - outer_w else 0;
+        const max_y = if (avail_h > outer_h) avail_h - outer_h else 0;
+        const outer_x = max_x * pos_x_pct / 100;
+        const outer_y = max_y * pos_y_pct / 100;
+
+        // Apply padding
+        const pad_x: u16 = @intCast(@min(pad_x_cfg, outer_w / 4));
+        const pad_y: u16 = @intCast(@min(pad_y_cfg, outer_h / 4));
+        const content_x = outer_x + 1 + pad_x;
+        const content_y = outer_y + 1 + pad_y;
+        const content_w = if (outer_w > 2 + 2 * pad_x) outer_w - 2 - 2 * pad_x else 1;
+        const content_h = if (outer_h > 2 + 2 * pad_y) outer_h - 2 - 2 * pad_y else 1;
+
+        // Generate pane ID (floats use 100+ offset)
+        const id: u16 = @intCast(100 + self.floats.items.len);
+
+        // Initialize pane with the adopted fd
+        try pane.initWithFd(self.allocator, id, content_x, content_y, content_w, content_h, fd, pid, uuid);
+
+        pane.floating = true;
+        pane.focused = true;
+        pane.float_key = float_def.key;
+        pane.sticky = float_def.sticky;
+
+        // For global floats (special or pwd), set per-tab visibility
+        if (float_def.special or float_def.pwd) {
+            pane.setVisibleOnTab(self.active_tab, true);
+        } else {
+            pane.visible = true;
+        }
+
+        // Store outer dimensions and style for border rendering
+        pane.border_x = outer_x;
+        pane.border_y = outer_y;
+        pane.border_w = outer_w;
+        pane.border_h = outer_h;
+        pane.border_color = border_color;
+        // Store percentages for resize recalculation
+        pane.float_width_pct = @intCast(width_pct);
+        pane.float_height_pct = @intCast(height_pct);
+        pane.float_pos_x_pct = @intCast(pos_x_pct);
+        pane.float_pos_y_pct = @intCast(pos_y_pct);
+        pane.float_pad_x = @intCast(pad_x_cfg);
+        pane.float_pad_y = @intCast(pad_y_cfg);
+
+        // Store pwd for pwd floats
+        if (float_def.pwd) {
+            pane.is_pwd = true;
+            pane.pwd_dir = self.allocator.dupe(u8, cwd) catch null;
+        }
+
+        // For tab-bound floats, set parent tab
+        if (!float_def.special and !float_def.pwd) {
+            pane.parent_tab = self.active_tab;
+        }
+
+        // Store style reference
+        if (float_def.style) |*style| {
+            pane.float_style = style;
+        }
+
+        // Configure pane notifications
+        pane.configureNotificationsFromPop(&self.pop_config.pane.notification);
+
+        try self.floats.append(self.allocator, pane);
+        // Don't set active_floating here - let user toggle it manually
     }
 
     /// Switch to next tab
@@ -1011,6 +1130,9 @@ pub fn run(mux_args: MuxArgs) !void {
         // Create first tab with one pane (will use ses if connected)
         try state.createTab();
     }
+
+    // Auto-adopt sticky panes from ses for this directory
+    state.adoptStickyPanes();
 
     // Continue with main loop
     try runMainLoop(&state);
