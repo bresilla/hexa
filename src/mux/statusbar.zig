@@ -135,7 +135,10 @@ pub fn draw(
             if (use_basename) {
                 if (tab.layout.getFocusedPane()) |pane| {
                     const pwd = pane.getRealCwd();
-                    tab_names[tab_count] = if (pwd) |p| std.fs.path.basename(p) else tab.name;
+                    tab_names[tab_count] = if (pwd) |p| blk: {
+                        const base = std.fs.path.basename(p);
+                        break :blk if (base.len == 0) "/" else base;
+                    } else tab.name;
                 } else {
                     tab_names[tab_count] = tab.name;
                 }
